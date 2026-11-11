@@ -772,6 +772,71 @@ def get_live_btc_market():
     return active[0][1]
 
 
+
+def get_contract_target(market):
+    """Return Kalshi's BTC threshold/target for this market.
+
+    Prefer structured strike fields from the API. Fall back to parsing
+    human-readable market text only if Kalshi does not populate them.
+    """
+    candidates = [
+        market.get("floor_strike"),
+        market.get("functional_strike"),
+    ]
+
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return float(str(value).replace(",", "").replace("$", "").strip())
+        except (TypeError, ValueError):
+            pass
+
+    # Defensive fallback for markets where the threshold is only present
+    # in the title/subtitle. We do NOT infer it from the ticker.
+    import re
+    for field in ("title", "subtitle", "yes_sub_title", "no_sub_title"):
+        text = str(market.get(field) or "")
+        matches = re.findall(r"\$?([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]{4,6}(?:\.[0-9]+)?)", text)
+        for match in matches:
+            try:
+                value = float(match.replace(",", ""))
+                if 10000 <= value <= 1000000:
+                    return value
+            except ValueError:
+                continue
+
+    return None
+
+
+def target_context(btc_price, target, direction=None):
+    if target is None or btc_price is None:
+        return {
+            "target": target,
+            "distance": None,
+            "distance_pct": None,
+            "position": "UNKNOWN",
+            "side_status": "UNKNOWN"
+        }
+
+    distance = float(btc_price) - float(target)
+    distance_pct = (distance / float(target)) * 100 if target else None
+    position = "ABOVE" if distance > 0 else "BELOW" if distance < 0 else "AT"
+
+    side_status = "UNKNOWN"
+    if direction == "UP":
+        side_status = "AHEAD" if distance >= 0 else "BEHIND"
+    elif direction == "DOWN":
+        side_status = "AHEAD" if distance < 0 else "BEHIND"
+
+    return {
+        "target": float(target),
+        "distance": distance,
+        "distance_pct": distance_pct,
+        "position": position,
+        "side_status": side_status
+    }
+
 # =========================================================
 # BTC DATA
 # =========================================================
@@ -1150,6 +1215,8 @@ def analyze_market(market):
     if not pa:
         return None
 
+    contract_target = get_contract_target(market)
+
     action = "🗣️ WAIT 🟡"
     setup = "NONE"
     reason = "BTC is between key levels."
@@ -1292,6 +1359,26 @@ def analyze_market(market):
     elif direction == "DOWN":
         entry_price = no_ask
 
+    target_read = target_context(pa["price"], contract_target, direction)
+
+    # The target is core contract context. A confirmed BTC setup can still
+    # be useful for a scalp on either side, so V4.1 does not invent an
+    # arbitrary distance cutoff. Instead it explicitly tells us whether
+    # the suggested side is currently ahead or still has to cross the target.
+    if confirmed and contract_target is not None:
+        gap = abs(target_read["distance"])
+        if target_read["side_status"] == "AHEAD":
+            reason += (
+                f" 🎯 {direction} is currently AHEAD of the "
+                f"${contract_target:,.2f} target by ${gap:,.2f}."
+            )
+        else:
+            reason += (
+                f" 🎯 {direction} is currently BEHIND the "
+                f"${contract_target:,.2f} target by ${gap:,.2f}; "
+                "BTC still needs to move toward/cross the target."
+            )
+
     if confirmed:
         if entry_price is None:
             action = "🗣️ DON'T TOUCH THIS SHIT 🚫"
@@ -1365,6 +1452,11 @@ def analyze_market(market):
         "scalp": scalp,
 
         "btc_price": pa["price"],
+        "contract_target": contract_target,
+        "target_distance": target_read["distance"],
+        "target_distance_pct": target_read["distance_pct"],
+        "target_position": target_read["position"],
+        "target_side_status": target_read["side_status"],
 
         "support": structure["support"],
         "resistance": structure["resistance"],
@@ -1385,6 +1477,27 @@ def analyze_market(market):
 # =========================================================
 # MESSAGE
 # =========================================================
+
+def target_line(analysis):
+    target = analysis.get("contract_target")
+    distance = analysis.get("target_distance")
+    position = analysis.get("target_position", "UNKNOWN")
+    side_status = analysis.get("target_side_status", "UNKNOWN")
+
+    if target is None or distance is None:
+        return "Target: unavailable from Kalshi API ⚠️"
+
+    signed = f"{distance:+,.2f}"
+    status = ""
+    if analysis.get("direction"):
+        status = f" | {analysis['direction']} is {side_status}"
+
+    return (
+        f"Target: ${target:,.2f}\n"
+        f"BTC is {position} target by ${abs(distance):,.2f} "
+        f"({signed} vs target){status}"
+    )
+
 
 def build_message(market, analysis):
     seconds = analysis["seconds_left"]
@@ -1421,6 +1534,9 @@ Setup: {analysis['setup']}
 
 BTC: ${analysis['btc_price']:,.2f}
 
+🎯 CONTRACT TARGET
+{target_line(analysis)}
+
 📊 15M STRUCTURE
 Support: ${analysis['support']:,.2f}
 Resistance: ${analysis['resistance']:,.2f}
@@ -1449,7 +1565,7 @@ def main():
     global last_market
     global last_analysis
 
-    print("Kate's BTC Watcher V4 starting...")
+    print("Kate's BTC Watcher V4.1 starting...")
     print("Stats database:", DB_PATH)
 
     init_db()
@@ -1457,14 +1573,14 @@ def main():
     initialize_telegram_offset()
 
     send_telegram(
-        "🔥 KATE'S BTC WATCHER V4 IS ONLINE.\n\n"
+        "🔥 KATE'S BTC WATCHER V4.1 IS ONLINE.\n\n"
         "Commands:\n"
         "/start — turn alerts ON\n"
         "/stop — turn alerts OFF\n"
         "/status — current read\n"
         "/last — last ENTER call\n"
         "/stats — performance stats\n\n"
-        "📊 ENTER calls are now being tracked.\n"
+        "📊 ENTER calls are being tracked.\n🎯 Contract target is now being read.\n"
         "I'm ready 👀"
     )
 

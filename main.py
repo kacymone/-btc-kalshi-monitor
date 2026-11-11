@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = "KXBTC15M"
 
-# Kraken BTC/USD candle feed
 KRAKEN_OHLC = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_PAIR = "XBTUSD"
 
@@ -19,33 +18,49 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 CHECK_EVERY = 15
 
-# ---- Strategy settings ----
-
-# Number of completed 15m candles used for recent structure
 STRUCTURE_CANDLES = 8
-
-# BTC can be this close to support/resistance and count as "testing"
 LEVEL_TOLERANCE_PCT = 0.15
-
-# Minimum distance through a level to help confirm a breakout
 BREAKOUT_BUFFER_PCT = 0.05
 
-# Don't chase Kalshi contracts above this ask price
-MAX_ENTRY_PRICE = 0.88
+# Entry classifications
+SCALP_PRICE = 0.88
+HARD_SKIP_PRICE = 0.97
 
-# We want enough time to actually act
-MIN_SECONDS_FOR_ENTRY = 120
-
-# Avoid calling something an entry immediately after a contract opens
+# Timing
+MIN_SECONDS_FOR_ENTRY = 60
 MAX_SECONDS_FOR_ENTRY = 13 * 60
+
+# Retest can remain armed this many completed 3m candles
+RETEST_MAX_CANDLES = 4
+
+# =========================================================
+# STATE
+# =========================================================
 
 last_alert = None
 last_market = None
+last_analysis = None
+
+watcher_enabled = True
+telegram_offset = None
+
+retest_state = {
+    "direction": None,
+    "level": None,
+    "armed_at": None
+}
 
 
 # =========================================================
 # TELEGRAM
 # =========================================================
+
+def telegram_url(method):
+    return (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/{method}"
+    )
+
 
 def send_telegram(message):
 
@@ -53,11 +68,10 @@ def send_telegram(message):
         print("Telegram variables missing.")
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     try:
+
         response = requests.post(
-            url,
+            telegram_url("sendMessage"),
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message
@@ -68,7 +82,180 @@ def send_telegram(message):
         response.raise_for_status()
 
     except Exception as e:
-        print("Telegram error:", e)
+        print("Telegram send error:", e)
+
+
+def initialize_telegram_offset():
+    """
+    Ignore old Telegram commands that were sent before
+    this deployment started.
+    """
+
+    global telegram_offset
+
+    if not TELEGRAM_TOKEN:
+        return
+
+    try:
+
+        response = requests.get(
+            telegram_url("getUpdates"),
+            params={
+                "timeout": 0,
+                "limit": 100
+            },
+            timeout=10
+        )
+
+        response.raise_for_status()
+
+        updates = response.json().get(
+            "result",
+            []
+        )
+
+        if updates:
+            telegram_offset = (
+                updates[-1]["update_id"] + 1
+            )
+
+    except Exception as e:
+        print(
+            "Telegram initialization error:",
+            e
+        )
+
+
+def check_telegram_commands():
+
+    global telegram_offset
+    global watcher_enabled
+    global last_alert
+
+    if not TELEGRAM_TOKEN:
+        return
+
+    try:
+
+        params = {
+            "timeout": 0,
+            "limit": 20
+        }
+
+        if telegram_offset is not None:
+            params["offset"] = telegram_offset
+
+        response = requests.get(
+            telegram_url("getUpdates"),
+            params=params,
+            timeout=10
+        )
+
+        response.raise_for_status()
+
+        updates = response.json().get(
+            "result",
+            []
+        )
+
+        for update in updates:
+
+            telegram_offset = (
+                update["update_id"] + 1
+            )
+
+            message = update.get(
+                "message",
+                {}
+            )
+
+            chat_id = str(
+                message.get(
+                    "chat",
+                    {}
+                ).get("id", "")
+            )
+
+            # Only YOU control this bot
+            if chat_id != str(
+                TELEGRAM_CHAT_ID
+            ):
+                continue
+
+            text = (
+                message.get("text", "")
+                .strip()
+                .lower()
+            )
+
+            if text.startswith("/stop"):
+
+                watcher_enabled = False
+
+                send_telegram(
+                    "💤 KATE'S BTC WATCHER IS OFF.\n\n"
+                    "No trading alerts until you send /start."
+                )
+
+            elif text.startswith("/start"):
+
+                watcher_enabled = True
+                last_alert = None
+
+                send_telegram(
+                    "🟢 KATE'S BTC WATCHER IS ON.\n\n"
+                    "I'm watching BTC again 👀"
+                )
+
+            elif text.startswith("/status"):
+
+                send_status()
+
+    except Exception as e:
+        print(
+            "Telegram command error:",
+            e
+        )
+
+
+def send_status():
+
+    if not watcher_enabled:
+
+        send_telegram(
+            "💤 WATCHER STATUS: OFF\n\n"
+            "Send /start when you're ready."
+        )
+
+        return
+
+    if not last_analysis:
+
+        send_telegram(
+            "🟢 WATCHER STATUS: ON\n\n"
+            "I'm monitoring BTC...no current "
+            "analysis available yet."
+        )
+
+        return
+
+    analysis = last_analysis
+
+    seconds = analysis["seconds_left"]
+
+    minutes = seconds // 60
+    secs = seconds % 60
+
+    send_telegram(
+        "🟢 WATCHER STATUS: ON\n\n"
+        f"{analysis['action']}\n\n"
+        f"BTC: ${analysis['btc_price']:,.2f}\n"
+        f"Trend: {analysis['trend']}\n"
+        f"UP ask: {analysis['yes_ask']}\n"
+        f"DOWN ask: {analysis['no_ask']}\n"
+        f"Time left: {minutes}:{secs:02d}\n\n"
+        f"{analysis['reason']}"
+    )
 
 
 # =========================================================
@@ -77,40 +264,44 @@ def send_telegram(message):
 
 def get_live_btc_market():
 
-    url = f"{KALSHI_BASE}/markets"
-
-    params = {
-        "series_ticker": SERIES,
-        "status": "open",
-        "limit": 100
-    }
-
     response = requests.get(
-        url,
-        params=params,
+        f"{KALSHI_BASE}/markets",
+        params={
+            "series_ticker": SERIES,
+            "status": "open",
+            "limit": 100
+        },
         timeout=10
     )
 
     response.raise_for_status()
 
-    markets = response.json().get("markets", [])
+    markets = response.json().get(
+        "markets",
+        []
+    )
 
     if not markets:
         return None
 
     now = datetime.now(timezone.utc)
-
     active = []
 
     for market in markets:
 
         try:
+
             close_time = datetime.fromisoformat(
-                market["close_time"].replace("Z", "+00:00")
+                market["close_time"].replace(
+                    "Z",
+                    "+00:00"
+                )
             )
 
             if close_time > now:
-                active.append((close_time, market))
+                active.append(
+                    (close_time, market)
+                )
 
         except Exception:
             continue
@@ -118,25 +309,25 @@ def get_live_btc_market():
     if not active:
         return None
 
-    active.sort(key=lambda x: x[0])
+    active.sort(
+        key=lambda item: item[0]
+    )
 
     return active[0][1]
 
 
 # =========================================================
-# BTC PRICE DATA
+# BTC DATA
 # =========================================================
 
 def get_kraken_candles(interval):
 
-    params = {
-        "pair": KRAKEN_PAIR,
-        "interval": interval
-    }
-
     response = requests.get(
         KRAKEN_OHLC,
-        params=params,
+        params={
+            "pair": KRAKEN_PAIR,
+            "interval": interval
+        },
         timeout=10
     )
 
@@ -149,7 +340,10 @@ def get_kraken_candles(interval):
             f"Kraken error: {data['error']}"
         )
 
-    result = data.get("result", {})
+    result = data.get(
+        "result",
+        {}
+    )
 
     candle_key = None
 
@@ -162,16 +356,16 @@ def get_kraken_candles(interval):
     if not candle_key:
         return []
 
-    raw_candles = result[candle_key]
-
     candles = []
 
-    for candle in raw_candles:
+    for candle in result[candle_key]:
 
         try:
 
             candles.append({
-                "time": int(float(candle[0])),
+                "time": int(
+                    float(candle[0])
+                ),
                 "open": float(candle[1]),
                 "high": float(candle[2]),
                 "low": float(candle[3]),
@@ -186,7 +380,7 @@ def get_kraken_candles(interval):
 
 
 # =========================================================
-# BUILD 3-MIN CANDLES FROM 1-MIN DATA
+# BUILD COMPLETED 3M CANDLES
 # =========================================================
 
 def build_3m_candles(one_minute):
@@ -195,8 +389,9 @@ def build_3m_candles(one_minute):
 
     for candle in one_minute:
 
-        bucket = candle["time"] - (
-            candle["time"] % 180
+        bucket = (
+            candle["time"]
+            - candle["time"] % 180
         )
 
         if bucket not in grouped:
@@ -222,24 +417,26 @@ def build_3m_candles(one_minute):
                 candle["low"]
             )
 
-            grouped[bucket]["close"] = candle["close"]
+            grouped[bucket]["close"] = (
+                candle["close"]
+            )
 
-            grouped[bucket]["volume"] += candle["volume"]
+            grouped[bucket]["volume"] += (
+                candle["volume"]
+            )
 
     candles = [
         grouped[key]
-        for key in sorted(grouped.keys())
+        for key in sorted(grouped)
     ]
 
-    # Remove currently-forming 3m candle
     now = int(time.time())
 
-    completed = [
-        c for c in candles
-        if c["time"] + 180 <= now
+    return [
+        candle
+        for candle in candles
+        if candle["time"] + 180 <= now
     ]
-
-    return completed
 
 
 # =========================================================
@@ -264,12 +461,15 @@ def seconds_left(market):
         )
     )
 
-    now = datetime.now(timezone.utc)
-
     return max(
         0,
         int(
-            (close_time - now).total_seconds()
+            (
+                close_time
+                - datetime.now(
+                    timezone.utc
+                )
+            ).total_seconds()
         )
     )
 
@@ -279,23 +479,44 @@ def pct_distance(price, level):
     if not level:
         return 999
 
-    return abs(
-        (price - level) / level
-    ) * 100
+    return (
+        abs(price - level)
+        / level
+        * 100
+    )
+
+
+def clear_retest():
+
+    retest_state["direction"] = None
+    retest_state["level"] = None
+    retest_state["armed_at"] = None
+
+
+def arm_retest(
+    direction,
+    level,
+    candle_time
+):
+
+    retest_state["direction"] = direction
+    retest_state["level"] = level
+    retest_state["armed_at"] = candle_time
 
 
 # =========================================================
-# 15-MIN STRUCTURE
+# 15M STRUCTURE
 # =========================================================
 
 def get_structure():
 
     candles = get_kraken_candles(15)
 
-    if len(candles) < STRUCTURE_CANDLES + 2:
+    if len(candles) < (
+        STRUCTURE_CANDLES + 2
+    ):
         return None
 
-    # Last Kraken candle may still be forming
     completed = candles[:-1]
 
     recent = completed[
@@ -317,17 +538,28 @@ def get_structure():
         for candle in recent
     ]
 
-    # Simple directional context
-    first_half = closes[:4]
-    second_half = closes[4:]
+    midpoint = len(closes) // 2
 
-    first_avg = sum(first_half) / len(first_half)
-    second_avg = sum(second_half) / len(second_half)
+    first_avg = (
+        sum(closes[:midpoint])
+        / len(closes[:midpoint])
+    )
 
-    if second_avg > first_avg * 1.001:
+    second_avg = (
+        sum(closes[midpoint:])
+        / len(closes[midpoint:])
+    )
+
+    if second_avg > (
+        first_avg * 1.001
+    ):
+
         trend = "BULLISH"
 
-    elif second_avg < first_avg * 0.999:
+    elif second_avg < (
+        first_avg * 0.999
+    ):
+
         trend = "BEARISH"
 
     else:
@@ -341,7 +573,7 @@ def get_structure():
 
 
 # =========================================================
-# 3-MIN PRICE ACTION
+# 3M PRICE ACTION + STATEFUL RETEST
 # =========================================================
 
 def analyze_price_action(
@@ -351,17 +583,27 @@ def analyze_price_action(
 
     one_minute = get_kraken_candles(1)
 
-    three_minute = build_3m_candles(
+    candles = build_3m_candles(
         one_minute
     )
 
-    if len(three_minute) < 3:
+    if len(candles) < 3:
         return None
 
-    previous = three_minute[-2]
-    current = three_minute[-1]
+    previous = candles[-2]
+    current = candles[-1]
 
     price = current["close"]
+
+    green = (
+        current["close"]
+        > current["open"]
+    )
+
+    red = (
+        current["close"]
+        < current["open"]
+    )
 
     near_support = (
         pct_distance(
@@ -379,110 +621,192 @@ def analyze_price_action(
         <= LEVEL_TOLERANCE_PCT
     )
 
-    current_green = (
-        current["close"] >
-        current["open"]
-    )
-
-    current_red = (
-        current["close"] <
-        current["open"]
-    )
-
-    # -----------------------------------------
-    # SUPPORT HOLD / REJECTION
-    # -----------------------------------------
-
     support_rejection = (
         current["low"]
-        <= support * (
-            1 + LEVEL_TOLERANCE_PCT / 100
+        <= support
+        * (
+            1
+            + LEVEL_TOLERANCE_PCT
+            / 100
         )
-        and
-        current["close"] > support
-        and
-        current_green
+        and current["close"] > support
+        and green
     )
-
-    # -----------------------------------------
-    # RESISTANCE REJECTION
-    # -----------------------------------------
 
     resistance_rejection = (
         current["high"]
-        >= resistance * (
-            1 - LEVEL_TOLERANCE_PCT / 100
+        >= resistance
+        * (
+            1
+            - LEVEL_TOLERANCE_PCT
+            / 100
         )
-        and
-        current["close"] < resistance
-        and
-        current_red
+        and current["close"] < resistance
+        and red
     )
-
-    # -----------------------------------------
-    # BREAKOUT ABOVE RESISTANCE
-    # -----------------------------------------
 
     breakout_up = (
-        previous["close"] <= resistance
-        and
-        current["close"]
+        previous["close"]
+        <= resistance
+        and current["close"]
         >
-        resistance * (
-            1 + BREAKOUT_BUFFER_PCT / 100
+        resistance
+        * (
+            1
+            + BREAKOUT_BUFFER_PCT
+            / 100
         )
     )
-
-    # -----------------------------------------
-    # BREAKDOWN BELOW SUPPORT
-    # -----------------------------------------
 
     breakout_down = (
-        previous["close"] >= support
-        and
-        current["close"]
+        previous["close"]
+        >= support
+        and current["close"]
         <
-        support * (
-            1 - BREAKOUT_BUFFER_PCT / 100
+        support
+        * (
+            1
+            - BREAKOUT_BUFFER_PCT
+            / 100
         )
     )
 
-    # -----------------------------------------
-    # RETEST AFTER BREAK ABOVE
-    # -----------------------------------------
+    # Arm a persistent retest
+    if breakout_up:
 
-    retest_up = (
-        previous["close"] > resistance
-        and
-        current["low"] <=
-        resistance * (
-            1 + LEVEL_TOLERANCE_PCT / 100
+        arm_retest(
+            "UP",
+            resistance,
+            current["time"]
         )
-        and
-        current["close"] > resistance
-        and
-        current_green
+
+    elif breakout_down:
+
+        arm_retest(
+            "DOWN",
+            support,
+            current["time"]
+        )
+
+    retest_up = False
+    retest_down = False
+
+    armed_direction = (
+        retest_state["direction"]
     )
 
-    # -----------------------------------------
-    # RETEST AFTER BREAK BELOW
-    # -----------------------------------------
-
-    retest_down = (
-        previous["close"] < support
-        and
-        current["high"] >=
-        support * (
-            1 - LEVEL_TOLERANCE_PCT / 100
-        )
-        and
-        current["close"] < support
-        and
-        current_red
+    armed_level = (
+        retest_state["level"]
     )
+
+    armed_at = (
+        retest_state["armed_at"]
+    )
+
+    if (
+        armed_direction
+        and armed_level
+        and armed_at
+    ):
+
+        candles_since = int(
+            (
+                current["time"]
+                - armed_at
+            )
+            / 180
+        )
+
+        if (
+            candles_since
+            > RETEST_MAX_CANDLES
+        ):
+
+            clear_retest()
+
+        elif (
+            candles_since >= 1
+            and armed_direction == "UP"
+        ):
+
+            touched = (
+                current["low"]
+                <= armed_level
+                * (
+                    1
+                    + LEVEL_TOLERANCE_PCT
+                    / 100
+                )
+            )
+
+            held = (
+                current["close"]
+                > armed_level
+                and green
+            )
+
+            if touched and held:
+
+                retest_up = True
+                clear_retest()
+
+            # Breakout completely failed
+            elif (
+                current["close"]
+                <
+                armed_level
+                * (
+                    1
+                    - BREAKOUT_BUFFER_PCT
+                    / 100
+                )
+            ):
+
+                clear_retest()
+
+        elif (
+            candles_since >= 1
+            and armed_direction == "DOWN"
+        ):
+
+            touched = (
+                current["high"]
+                >= armed_level
+                * (
+                    1
+                    - LEVEL_TOLERANCE_PCT
+                    / 100
+                )
+            )
+
+            failed = (
+                current["close"]
+                < armed_level
+                and red
+            )
+
+            if touched and failed:
+
+                retest_down = True
+                clear_retest()
+
+            # Breakdown completely failed
+            elif (
+                current["close"]
+                >
+                armed_level
+                * (
+                    1
+                    + BREAKOUT_BUFFER_PCT
+                    / 100
+                )
+            ):
+
+                clear_retest()
 
     return {
         "price": price,
+        "candle_time": current["time"],
 
         "near_support": near_support,
         "near_resistance": near_resistance,
@@ -503,148 +827,197 @@ def analyze_price_action(
             retest_up,
 
         "retest_down":
-            retest_down
+            retest_down,
+
+        "armed_direction":
+            retest_state["direction"]
     }
 
 
 # =========================================================
-# FULL ANALYSIS
+# FINAL ACTION DECISION
 # =========================================================
 
 def analyze_market(market):
 
     yes_bid = money(
-        market.get("yes_bid_dollars")
+        market.get(
+            "yes_bid_dollars"
+        )
     )
 
     yes_ask = money(
-        market.get("yes_ask_dollars")
+        market.get(
+            "yes_ask_dollars"
+        )
     )
 
     no_bid = money(
-        market.get("no_bid_dollars")
+        market.get(
+            "no_bid_dollars"
+        )
     )
 
     no_ask = money(
-        market.get("no_ask_dollars")
+        market.get(
+            "no_ask_dollars"
+        )
     )
 
-    remaining = seconds_left(market)
+    remaining = seconds_left(
+        market
+    )
 
     structure = get_structure()
 
     if not structure:
         return None
 
-    price_action = analyze_price_action(
+    pa = analyze_price_action(
         structure["support"],
         structure["resistance"]
     )
 
-    if not price_action:
+    if not pa:
         return None
 
-    signal = "WAIT"
-    strength = "NO EDGE"
-    reason = "BTC is between key levels."
+    action = "🗣️ WAIT 🟡"
+
+    setup = "NONE"
+
+    reason = (
+        "BTC is between key levels."
+    )
 
     direction = None
+    confirmed = False
 
     # -----------------------------------------
-    # CONFIRMED UP SETUPS
+    # STRONG CONFIRMATIONS
     # -----------------------------------------
 
-    if price_action["retest_up"]:
+    if pa["retest_up"]:
 
-        signal = "🟢 BUY UP"
-        strength = "CONFIRMED"
-        reason = (
-            "Resistance broke and the "
-            "3m retest held above it."
-        )
         direction = "UP"
+        confirmed = True
+        setup = "RETEST HOLD"
 
-    elif price_action["support_rejection"]:
-
-        signal = "🟢 BUY UP"
-        strength = "CONFIRMED"
         reason = (
-            "BTC tested 15m support "
-            "and the 3m candle rejected it."
+            "Resistance broke...BTC came "
+            "back to retest it and the 3m "
+            "candle held above the level."
         )
+
+    elif pa["retest_down"]:
+
+        direction = "DOWN"
+        confirmed = True
+        setup = "RETEST REJECTION"
+
+        reason = (
+            "Support broke...BTC came "
+            "back to retest it and the 3m "
+            "candle rejected the old support."
+        )
+
+    elif pa["support_rejection"]:
+
         direction = "UP"
+        confirmed = True
+        setup = "SUPPORT REJECTION"
 
-    elif price_action["breakout_up"]:
-
-        signal = "👀 UP BREAKOUT"
-        strength = "WATCH RETEST"
         reason = (
-            "BTC broke above 15m resistance. "
-            "Watching for the retest to hold."
+            "BTC tested 15m support and "
+            "the completed 3m candle "
+            "rejected the level upward."
         )
-        direction = "UP"
 
-    # -----------------------------------------
-    # CONFIRMED DOWN SETUPS
-    # -----------------------------------------
+    elif pa["resistance_rejection"]:
 
-    elif price_action["retest_down"]:
-
-        signal = "🔴 BUY DOWN"
-        strength = "CONFIRMED"
-        reason = (
-            "Support broke and the "
-            "3m retest failed below it."
-        )
         direction = "DOWN"
+        confirmed = True
+        setup = "RESISTANCE REJECTION"
 
-    elif price_action["resistance_rejection"]:
-
-        signal = "🔴 BUY DOWN"
-        strength = "CONFIRMED"
         reason = (
-            "BTC tested 15m resistance "
-            "and the 3m candle rejected it."
-        )
-        direction = "DOWN"
-
-    elif price_action["breakout_down"]:
-
-        signal = "👀 DOWN BREAK"
-        strength = "WATCH RETEST"
-        reason = (
-            "BTC broke below 15m support. "
-            "Watching for the retest to fail."
-        )
-        direction = "DOWN"
-
-    # -----------------------------------------
-    # APPROACHING LEVELS
-    # -----------------------------------------
-
-    elif price_action["near_support"]:
-
-        signal = "👀 WATCHING SUPPORT"
-        strength = "SETUP FORMING"
-        reason = (
-            "BTC is testing 15m support. "
-            "Waiting for 3m confirmation."
-        )
-
-    elif price_action["near_resistance"]:
-
-        signal = "👀 WATCHING RESISTANCE"
-        strength = "SETUP FORMING"
-        reason = (
-            "BTC is testing 15m resistance. "
-            "Waiting for 3m confirmation."
+            "BTC tested 15m resistance and "
+            "the completed 3m candle "
+            "rejected the level downward."
         )
 
     # -----------------------------------------
-    # KALSHI ENTRY FILTER
+    # DEVELOPING SETUPS
+    # -----------------------------------------
+
+    elif pa["breakout_up"]:
+
+        setup = "UP BREAKOUT"
+
+        reason = (
+            "BTC broke resistance...waiting "
+            "for a 3m retest before entering."
+        )
+
+    elif pa["breakout_down"]:
+
+        setup = "DOWN BREAK"
+
+        reason = (
+            "BTC broke support...waiting "
+            "for a 3m retest before entering."
+        )
+
+    elif (
+        pa["armed_direction"]
+        == "UP"
+    ):
+
+        setup = "UP RETEST ARMED"
+
+        reason = (
+            "The resistance breakout is "
+            "still armed...waiting for BTC "
+            "to retest and hold the level."
+        )
+
+    elif (
+        pa["armed_direction"]
+        == "DOWN"
+    ):
+
+        setup = "DOWN RETEST ARMED"
+
+        reason = (
+            "The support breakdown is "
+            "still armed...waiting for BTC "
+            "to retest and reject the level."
+        )
+
+    elif pa["near_support"]:
+
+        setup = "WATCH SUPPORT"
+
+        reason = (
+            "BTC is near 15m support..."
+            "waiting for the completed 3m "
+            "candle to show its hand."
+        )
+
+    elif pa["near_resistance"]:
+
+        setup = "WATCH RESISTANCE"
+
+        reason = (
+            "BTC is near 15m resistance..."
+            "waiting for the completed 3m "
+            "candle to show its hand."
+        )
+
+    # -----------------------------------------
+    # KALSHI ENTRY DECISION
     # -----------------------------------------
 
     entry_price = None
+    scalp = False
 
     if direction == "UP":
         entry_price = yes_ask
@@ -652,43 +1025,113 @@ def analyze_market(market):
     elif direction == "DOWN":
         entry_price = no_ask
 
-    if direction and entry_price is not None:
+    if confirmed:
 
-        if entry_price > MAX_ENTRY_PRICE:
+        if entry_price is None:
 
-            strength = "LATE / EXPENSIVE"
-
-            reason += (
-                f" Kalshi {direction} is already "
-                f"${entry_price:.2f}."
+            action = (
+                "🗣️ DON'T TOUCH THIS SHIT 🚫"
             )
 
-        elif remaining < MIN_SECONDS_FOR_ENTRY:
-
-            strength = "TOO LATE"
-
             reason += (
-                " Not enough time remains "
-                "for a fresh entry."
+                " Kalshi doesn't currently "
+                "have a usable ask price."
             )
 
-        elif remaining > MAX_SECONDS_FOR_ENTRY:
+        elif remaining < (
+            MIN_SECONDS_FOR_ENTRY
+        ):
 
-            strength = "EARLY"
+            action = (
+                "🗣️ DON'T TOUCH THIS SHIT 🚫"
+            )
 
             reason += (
-                " Contract is still early."
+                " There's less than a minute "
+                "left...too late for a fresh "
+                "entry signal."
             )
+
+        elif entry_price >= (
+            HARD_SKIP_PRICE
+        ):
+
+            action = (
+                "🗣️ DON'T TOUCH THIS SHIT 🚫"
+            )
+
+            reason += (
+                f" {direction} is already "
+                f"${entry_price:.2f}...almost "
+                "all the contract value is "
+                "already priced in."
+            )
+
+        else:
+
+            if direction == "UP":
+                action = (
+                    "🗣️ ENTER UP 🟢"
+                )
+
+            else:
+                action = (
+                    "🗣️ ENTER DOWN 🔴"
+                )
+
+            if entry_price >= (
+                SCALP_PRICE
+            ):
+
+                scalp = True
+
+                reason += (
+                    f" 💰 SCALP: {direction} "
+                    f"is ${entry_price:.2f}, "
+                    "so the remaining room "
+                    "is smaller."
+                )
+
+            elif remaining > (
+                MAX_SECONDS_FOR_ENTRY
+            ):
+
+                reason += (
+                    " Contract is still early..."
+                    "expect more movement."
+                )
+
+    # -----------------------------------------
+    # RANGE / CHOP
+    # -----------------------------------------
+
+    if (
+        not confirmed
+        and setup == "NONE"
+        and structure["trend"] == "RANGE"
+    ):
+
+        action = (
+            "🗣️ DON'T TOUCH THIS SHIT 🚫"
+        )
+
+        reason = (
+            "BTC is ranging in the middle "
+            "of the structure with no clean "
+            "3m setup."
+        )
 
     return {
-        "signal": signal,
-        "strength": strength,
+        "action": action,
+        "setup": setup,
         "reason": reason,
 
         "direction": direction,
+        "confirmed": confirmed,
+        "scalp": scalp,
 
         "btc_price":
-            price_action["price"],
+            pa["price"],
 
         "support":
             structure["support"],
@@ -705,9 +1148,14 @@ def analyze_market(market):
         "no_bid": no_bid,
         "no_ask": no_ask,
 
-        "entry_price": entry_price,
+        "entry_price":
+            entry_price,
 
-        "seconds_left": remaining
+        "seconds_left":
+            remaining,
+
+        "candle_time":
+            pa["candle_time"]
     }
 
 
@@ -720,7 +1168,9 @@ def build_message(
     analysis
 ):
 
-    seconds = analysis["seconds_left"]
+    seconds = (
+        analysis["seconds_left"]
+    )
 
     minutes = seconds // 60
     secs = seconds % 60
@@ -730,25 +1180,48 @@ def build_message(
         "Unknown"
     )
 
-    message = f"""
-🚨 KATE'S BTC WATCHER
+    scalp_line = ""
 
-{analysis['signal']}
-Strength: {analysis['strength']}
+    if analysis["scalp"]:
+
+        scalp_line = (
+            "\n💰 SCALP SETUP — "
+            "smaller profit window"
+        )
+
+    entry_line = ""
+
+    if (
+        analysis["direction"]
+        and analysis["entry_price"]
+        is not None
+    ):
+
+        entry_line = (
+            f"\nSuggested side: "
+            f"{analysis['direction']}"
+            f"\nCurrent ask: "
+            f"${analysis['entry_price']:.2f}"
+        )
+
+    return f"""
+{analysis['action']}
+
+Setup: {analysis['setup']}
+{analysis['reason']}
+{scalp_line}
 
 BTC: ${analysis['btc_price']:,.2f}
 
-15M STRUCTURE
+📊 15M STRUCTURE
 Support: ${analysis['support']:,.2f}
 Resistance: ${analysis['resistance']:,.2f}
 Trend: {analysis['trend']}
 
-3M READ
-{analysis['reason']}
-
-KALSHI
+🎯 KALSHI
 🟢 UP ask: {analysis['yes_ask']}
 🔴 DOWN ask: {analysis['no_ask']}
+{entry_line}
 
 ⏱ Time left: {minutes}:{secs:02d}
 
@@ -756,9 +1229,7 @@ Contract:
 {ticker}
 
 ⚠️ Signal only — no automatic trade.
-"""
-
-    return message.strip()
+""".strip()
 
 
 # =========================================================
@@ -769,43 +1240,72 @@ def main():
 
     global last_alert
     global last_market
+    global last_analysis
 
     print(
-        "Kate's BTC Watcher V2 starting..."
+        "Kate's BTC Watcher V3 starting..."
     )
 
+    initialize_telegram_offset()
+
     send_telegram(
-        "🟢 KATE'S BTC WATCHER V2 IS ONLINE.\n\n"
-        "15M structure + 3M confirmation enabled."
+        "🔥 KATE'S BTC WATCHER V3 IS ONLINE.\n\n"
+        "Commands:\n"
+        "/start — turn alerts ON\n"
+        "/stop — turn alerts OFF\n"
+        "/status — current read\n\n"
+        "I'm ready 👀"
     )
 
     while True:
 
         try:
 
-            market = get_live_btc_market()
+            # Always check commands,
+            # even while watcher is OFF.
+            check_telegram_commands()
+
+            if not watcher_enabled:
+
+                time.sleep(CHECK_EVERY)
+                continue
+
+            market = (
+                get_live_btc_market()
+            )
 
             if not market:
 
                 print(
-                    "No open BTC 15-minute market."
+                    "No open BTC "
+                    "15-minute market."
                 )
 
-                time.sleep(CHECK_EVERY)
+                time.sleep(
+                    CHECK_EVERY
+                )
 
                 continue
 
-            ticker = market.get("ticker")
+            ticker = market.get(
+                "ticker"
+            )
 
-            analysis = analyze_market(
-                market
+            analysis = (
+                analyze_market(
+                    market
+                )
             )
 
             if not analysis:
 
-                time.sleep(CHECK_EVERY)
+                time.sleep(
+                    CHECK_EVERY
+                )
 
                 continue
+
+            last_analysis = analysis
 
             # ---------------------------------
             # NEW CONTRACT
@@ -816,35 +1316,56 @@ def main():
                 last_market = ticker
                 last_alert = None
 
+                # Don't carry a retest setup
+                # into another Kalshi contract.
+                clear_retest()
+
                 send_telegram(
                     "🆕 NEW BTC 15-MIN CONTRACT\n\n"
-                    f"{ticker}"
+                    f"{ticker}\n\n"
+                    "I'm watching 👀"
                 )
 
             # ---------------------------------
-            # PREVENT DUPLICATE ALERTS
+            # ALERT WHEN THE MEANINGFUL
+            # DECISION STATE CHANGES
             # ---------------------------------
 
             signal_key = (
                 ticker,
-                analysis["signal"],
-                analysis["strength"]
+                analysis["action"],
+                analysis["setup"],
+                analysis["scalp"],
+                analysis["candle_time"]
+                if analysis["confirmed"]
+                else None
             )
 
-            if signal_key != last_alert:
+            if (
+                signal_key
+                != last_alert
+            ):
 
-                last_alert = signal_key
-
-                message = build_message(
-                    market,
-                    analysis
+                last_alert = (
+                    signal_key
                 )
 
-                send_telegram(message)
+                message = (
+                    build_message(
+                        market,
+                        analysis
+                    )
+                )
+
+                send_telegram(
+                    message
+                )
 
                 print(message)
 
-            time.sleep(CHECK_EVERY)
+            time.sleep(
+                CHECK_EVERY
+            )
 
         except Exception as e:
 
@@ -853,7 +1374,10 @@ def main():
                 e
             )
 
-            time.sleep(30)
+            # Still periodically wake up
+            # so Telegram commands aren't
+            # ignored forever after an error.
+            time.sleep(15)
 
 
 if __name__ == "__main__":

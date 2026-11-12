@@ -1714,6 +1714,14 @@ def analyze_shadow_setup(market, analysis):
     up_score = down_score = 0
     up_reasons, down_reasons = [], []
 
+    memory = contract_case_file(ticker, analysis)
+    if memory.get("thesis") == "UP":
+        bonus = 2 if memory.get("strength") == "STRONG" else 1
+        up_score += bonus; up_reasons.append(f"contract memory {memory.get('strength','').lower()} UP")
+    elif memory.get("thesis") == "DOWN":
+        bonus = 2 if memory.get("strength") == "STRONG" else 1
+        down_score += bonus; down_reasons.append(f"contract memory {memory.get('strength','').lower()} DOWN")
+
     if analysis.get("rising_closes_1m"):
         up_score += 2; up_reasons.append("1m closes rising")
     if analysis.get("falling_closes_1m"):
@@ -1946,6 +1954,85 @@ def build_shadow_message(analysis, shadow):
 
 
 # =========================================================
+# V4.5 CONTRACT MEMORY — CURRENT CONTRACT CASE FILE
+# =========================================================
+
+def contract_case_file(ticker, analysis=None):
+    """Build an evolving case file from every snapshot in the active 15m contract."""
+    if not ticker:
+        return {}
+    try:
+        with db_connect() as conn:
+            rows = conn.execute("""
+                SELECT captured_at, seconds_left, btc_price, target_distance,
+                       yes_bid, no_bid, target_cross, target_velocity
+                FROM market_snapshots WHERE ticker=?
+                ORDER BY captured_at ASC, id ASC
+            """, (ticker,)).fetchall()
+    except Exception as e:
+        print("Contract memory error:", e); rows=[]
+    if not rows:
+        return {"samples":0,"thesis":"NEUTRAL","strength":"WEAK","trajectory":"FLAT"}
+    now=int(time.time())
+    def window(sec):
+        rr=[r for r in rows if now-int(r["captured_at"])<=sec]
+        if not rr: return {"btc_delta":0.0,"distance_delta":0.0,"yes_bid_delta":0.0,"no_bid_delta":0.0,"samples":0}
+        a,b=rr[0],rr[-1]
+        def d(k): return float(b[k])-float(a[k]) if a[k] is not None and b[k] is not None else 0.0
+        return {"btc_delta":d("btc_price"),"distance_delta":d("target_distance"),"yes_bid_delta":d("yes_bid"),"no_bid_delta":d("no_bid"),"samples":len(rr)}
+    w30,w60,w120,w180=window(30),window(60),window(120),window(180)
+    ds=[float(r["target_distance"]) for r in rows if r["target_distance"] is not None]
+    bs=[float(r["btc_price"]) for r in rows if r["btc_price"] is not None]
+    current=ds[-1] if ds else None
+    points=0
+    for w,weight in ((w30,3),(w60,3),(w120,2),(w180,1)):
+        if w["samples"]>=2:
+            if w["btc_delta"]>12: points+=weight
+            elif w["btc_delta"]<-12: points-=weight
+            if w["yes_bid_delta"]>=.02: points+=max(1,weight//2)
+            if w["no_bid_delta"]>=.02: points-=max(1,weight//2)
+    if current is not None:
+        points += 2 if current>50 else (-2 if current<-50 else (1 if current>0 else -1 if current<0 else 0))
+    contract_move=(bs[-1]-bs[0]) if len(bs)>=2 else 0.0
+    if contract_move>40: points+=1
+    elif contract_move<-40: points-=1
+    if points>=5: thesis,strength="UP","STRONG"
+    elif points>=2: thesis,strength="UP","MODERATE"
+    elif points<=-5: thesis,strength="DOWN","STRONG"
+    elif points<=-2: thesis,strength="DOWN","MODERATE"
+    else: thesis,strength="NEUTRAL","WEAK"
+    trajectory="FLAT"
+    if w60["distance_delta"]>15: trajectory="WIDENING UP"
+    elif w60["distance_delta"]<-15: trajectory="WIDENING DOWN"
+    elif w120["distance_delta"]>20: trajectory="DRIFTING UP"
+    elif w120["distance_delta"]<-20: trajectory="DRIFTING DOWN"
+    return {"samples":len(rows),"thesis":thesis,"strength":strength,"points":points,"current_distance":current,
+            "max_above":max(ds) if ds else None,"max_below":min(ds) if ds else None,
+            "crosses_up":sum(1 for r in rows if r["target_cross"]=="UP"),
+            "crosses_down":sum(1 for r in rows if r["target_cross"]=="DOWN"),
+            "contract_btc_move":contract_move,"contract_range":max(bs)-min(bs) if bs else 0.0,
+            "trajectory":trajectory,"w30":w30,"w60":w60,"w120":w120,"w180":w180}
+
+def settlement_outlook(market, analysis, memory=None):
+    """Evidence-based expiration read: cushion + time + movement actually observed this contract."""
+    memory=memory or contract_case_file(market.get("ticker"),analysis)
+    seconds=int(analysis.get("seconds_left") or 0); distance=analysis.get("target_distance")
+    if distance is None: return {"side":"UNKNOWN","strength":"UNKNOWN","reversal_difficulty":"UNKNOWN"}
+    distance=float(distance); side="UP" if distance>=0 else "DOWN"; cushion=abs(distance)
+    req_per_min=cushion/max(seconds/60.0,1/60)
+    recent=max(abs(memory.get("w30",{}).get("btc_delta",0))*2,abs(memory.get("w60",{}).get("btc_delta",0)),abs(memory.get("w120",{}).get("btc_delta",0))/2,1.0)
+    ratio=req_per_min/recent; traj=memory.get("trajectory","FLAT")
+    helping=(side=="UP" and "UP" in traj) or (side=="DOWN" and "DOWN" in traj)
+    hurting=(side=="UP" and "DOWN" in traj) or (side=="DOWN" and "UP" in traj)
+    if seconds<=60 and cushion>=recent*1.5 and not hurting: strength="VERY STRONG"
+    elif ratio>=1.4 and not hurting: strength="STRONG"
+    elif ratio>=.75 or helping: strength="MODERATE"
+    else: strength="WEAK"
+    difficulty="HIGH" if ratio>=1.5 else "MODERATE" if ratio>=.75 else "LOW"
+    return {"side":side,"strength":strength,"cushion":cushion,"required_per_min":req_per_min,
+            "recent_move_per_min":recent,"reversal_difficulty":difficulty,"trajectory":traj}
+
+# =========================================================
 # V4.4 TRADER MODE — USE HISTORY, DON'T JUST STORE IT
 # =========================================================
 
@@ -2014,6 +2101,8 @@ def trader_position_read(market, analysis, shadow):
         active_position["best_bid"] = b if old_best is None else max(float(old_best), b)
 
     hist = recent_market_history(market.get("ticker"))
+    memory = contract_case_file(market.get("ticker"), analysis)
+    settlement_market = settlement_outlook(market, analysis, memory)
     btc_delta = 0.0
     cushion_delta = 0.0
     elapsed = 0
@@ -2043,6 +2132,10 @@ def trader_position_read(market, analysis, shadow):
     lean_points += 1 if own_score >= opp_score + 2 else (-1 if opp_score >= own_score + 2 else 0)
     if side == "UP" and analysis.get("near_support"): lean_points += 1
     if side == "DOWN" and analysis.get("near_resistance"): lean_points += 1
+    if memory.get("thesis") == side:
+        lean_points += 2 if memory.get("strength") == "STRONG" else 1
+    elif memory.get("thesis") not in (None, "NEUTRAL", side):
+        lean_points -= 2 if memory.get("strength") == "STRONG" else 1
 
     if lean_points >= 3:
         overall = f"{side} LEAN — STRONG"
@@ -2053,19 +2146,10 @@ def trader_position_read(market, analysis, shadow):
     else:
         overall = f"{'DOWN' if side == 'UP' else 'UP'} LEAN"
 
-    # Settlement strength is a time-aware risk read, NOT a calibrated probability.
-    if signed_cushion is None:
-        settlement = "UNKNOWN"
-    elif signed_cushion <= 0:
-        settlement = "WEAK"
-    else:
-        threat_ratio = projected_adverse / max(1.0, signed_cushion)
-        if seconds_left <= 90 and threat_ratio < 0.45 and signed_cushion >= 35:
-            settlement = "STRONG"
-        elif threat_ratio < 0.8 and signed_cushion >= 25:
-            settlement = "MODERATE"
-        else:
-            settlement = "WEAK"
+    # V4.5 settlement brain is contract-wide and independent of entry/scalp quality.
+    settle_side = settlement_market.get("side", "UNKNOWN")
+    settle_strength = settlement_market.get("strength", "UNKNOWN")
+    settlement = f"{settle_side} — {settle_strength}"
 
     entry = active_position.get("entry_price")
     scalp_cents = None
@@ -2080,7 +2164,7 @@ def trader_position_read(market, analysis, shadow):
 
     if (target_lost and (hard_opposition or sustained_against)) or structure_broken:
         status = "EXIT"
-    elif hard_opposition or sustained_against or settlement == "WEAK" and side_momentum < -15:
+    elif hard_opposition or sustained_against or settle_side != side and settle_strength in ("STRONG", "VERY STRONG") and side_momentum < -15:
         status = "PROTECT"
     else:
         status = "HOLD"
@@ -2124,7 +2208,8 @@ def trader_position_read(market, analysis, shadow):
             f"🎯 Target cushion: {cushion_text}\n"
             f"📈 Momentum: {momentum_text}\n\n"
             f"💰 Scalp read: {scalp_read}\n"
-            f"⏳ Settlement read: {settlement}\n\n"
+            f"⏳ Settlement read: {settlement} | reversal difficulty {settlement_market.get('reversal_difficulty','UNKNOWN')}\n"
+            f"🧠 Contract thesis: {memory.get('thesis','NEUTRAL')} — {memory.get('strength','WEAK')} | {memory.get('trajectory','FLAT')}\n\n"
             f"{action}"
         )
     }
@@ -2311,7 +2396,7 @@ def main():
     global last_market
     global last_analysis
 
-    print("Kate's BTC Watcher V4.4 Trader Mode starting...")
+    print("Kate's BTC Watcher V4.5 Contract Memory starting...")
     print("Stats database:", DB_PATH)
 
     init_db()
@@ -2319,7 +2404,7 @@ def main():
     initialize_telegram_offset()
 
     send_telegram(
-        "📡 KATE'S BTC WATCHER V4.4 TRADER MODE IS ONLINE.\n\n"
+        "🧠 KATE'S BTC WATCHER V4.5 CONTRACT MEMORY IS ONLINE.\n\n"
         "Commands:\n"
         "/start — turn alerts ON\n"
         "/stop — turn alerts OFF\n"
@@ -2332,6 +2417,8 @@ def main():
         "👀 Shadow evidence is used internally and tracked separately.\n"
         "📡 Bot-issued ENTERs automatically switch into HOLD / PROTECT / EXIT mode.\n"
         "⏱ Time + target cushion + recent momentum feed the position read.\n"
+        "🧠 Every 15m contract keeps an active case file; recent history strengthens or weakens the thesis.\n"
+        "🏁 Settlement brain uses cushion + time + movement actually observed this contract.\n"
         "📈 1m price action is now part of the early read.\n"
         "💵 Scalp exits are measured from the sellable bid.\n"
         "I'm ready 👀"

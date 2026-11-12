@@ -262,6 +262,31 @@ def format_read(a, headline=None):
             f'Trend {trend} {a.get("trend", "?")} | UP {ask_text(a["asks"]["UP"])} • DOWN {ask_text(a["asks"]["DOWN"])}\n'
             '⚠️ Kraken proxy • Not a guaranteed settlement')
 
+def run_brti_test():
+    """Read-only entitlement test. Does not alter market decisions or place orders."""
+    import io
+    from contextlib import redirect_stdout
+    try:
+        import test_brti
+        output=io.StringIO()
+        with redirect_stdout(output):
+            result=test_brti.main()
+        lines=output.getvalue().splitlines()
+        status=next((x for x in lines if x.startswith('HTTP status:')), '')
+        if result == 0 and 'ACCESS SUCCESS' in lines:
+            msg='🟢 BRTI ACCESS SUCCESS\nKalshi index endpoint responded. KeKe still uses Kraken until V5.1 integration.'
+        else:
+            issue=next((x.split(':')[0] for x in lines if x.startswith(('SETUP ERROR:', 'KEY ERROR:', 'ACCESS FAILED:', 'REQUEST ERROR:'))), 'ACCESS NOT CONFIRMED')
+            msg=f'🔴 BRTI TEST: {issue}\n{status}\nKeKe still uses Kraken.'
+    except ModuleNotFoundError as exc:
+        name=exc.name or 'unknown'
+        msg=f'🟠 BRTI TEST BLOCKED: missing Python package {name}.\nKeKe remains online; no BRTI access confirmed.'
+    except Exception as exc:
+        msg=f'🔴 BRTI TEST ERROR: {type(exc).__name__}\nKeKe remains online; no BRTI access confirmed.'
+        LOG.exception('BRTI connectivity test failed')
+    LOG.info('BRTI test finished: %s', msg.replace('\n',' | '))
+    send(msg)
+
 def send_stats():
     with connect() as c:
         n=c.execute('SELECT COUNT(*) FROM settlement_observations').fetchone()[0]
@@ -299,6 +324,7 @@ def telegram_commands():
                 send(format_read(state['last_read']) if state['last_read'] else 'Waiting for fresh market data.')
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/last'):send_last()
+            elif cmd.startswith('/brti'):run_brti_test()
     except Exception:LOG.exception('Telegram command polling error')
 
 def initialize_telegram():
@@ -312,7 +338,8 @@ def initialize_telegram():
             {'command':'stop','description':'Pause alerts; keep recording'},
             {'command':'status','description':'Latest settlement read'},
             {'command':'stats','description':'Settlement research counts'},
-            {'command':'last','description':'Last settlement ENTER'}]))
+            {'command':'last','description':'Last settlement ENTER'},
+            {'command':'brti','description':'Test read-only Kalshi BRTI access'}]))
     except Exception:LOG.exception('Telegram setup error')
 
 def maybe_alert(a,new_contract):
@@ -338,6 +365,7 @@ def main():
     init_db()
     initialize_telegram()
     LOG.info('KeKe V5.0 Settlement-Only starting; Stats database: %s',DB_PATH)
+    run_brti_test()
     send('🧠 KeKe V5.0 SETTLEMENT-ONLY online. Scalp alerts removed. '
          'Using pre-contract candles for early analysis; recording to persistent /data database. '
          'No automatic trades. /status /stats /last')

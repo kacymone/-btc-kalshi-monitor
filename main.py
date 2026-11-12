@@ -17,6 +17,8 @@ CHAT=os.getenv('TELEGRAM_CHAT_ID')
 DATA_DIR=os.getenv('DATA_DIR','/data')
 DB_NAME='kate_btc_watcher.db'
 CHECK_EVERY=10
+GRADE_EVERY=60
+GRADE_BATCH=12
 MAX_DATA_AGE=75
 MIN_ENTRY_SECONDS=90
 MAX_ENTRY_ASK=.92
@@ -29,7 +31,7 @@ BRTI_MAX_AGE=30
 session=requests.Session()
 state={'ticker':None,'last_alert':None,'last_sent':0,'last_side':None,'last_read':None,
        'enabled':True,'offset':None,'entry_side':None,'entry_at':None,'last_btc':None,
-       'last_btc_at':None,'last_poll':0}
+       'last_btc_at':None,'last_poll':0,'last_grade':0}
 
 # Do not silently fall back to an ephemeral disk after a volume has been attached.
 def database_path():
@@ -66,6 +68,13 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS settlement_results (
           ticker TEXT PRIMARY KEY, settled_side TEXT, source TEXT,
           recorded_at INTEGER, verified INTEGER NOT NULL DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS settlement_predictions (
+          ticker TEXT PRIMARY KEY, captured_at INTEGER NOT NULL,
+          seconds_left INTEGER, side TEXT NOT NULL, source TEXT NOT NULL,
+          distance REAL, ask REAL, official_side TEXT,
+          graded_at INTEGER, grade TEXT DEFAULT 'PENDING')''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_v52_predictions_grade ON settlement_predictions(grade,captured_at)')
+
 
 def http_json(url,params=None,timeout=6):
     r=session.get(url,params=params,timeout=timeout)
@@ -275,6 +284,110 @@ def record(a):
               (a['ticker'],a['at'],a['seconds'],side,a['asks'][side],a['btc'],
                a['target'],a['confidence'],a['reason']))
 
+def record_early_prediction(a):
+    # One independent early directional baseline per contract
+    if a['source']!='BRTI' or a['favored'] not in ('UP','DOWN'):
+        return
+    if a['seconds'] < 600 or a['seconds'] > 900:
+        return
+    if a['distance'] is None or abs(a['distance']) < MIN_CUSHION:
+        return
+    with connect() as c:
+        c.execute('''INSERT OR IGNORE INTO settlement_predictions
+            (ticker,captured_at,seconds_left,side,source,distance,ask)
+            VALUES (?,?,?,?,?,?,?)''',
+            (a['ticker'],a['at'],a['seconds'],a['favored'],a['source'],
+             a['distance'],a['asks'].get(a['favored'])))
+
+
+def official_result(ticker):
+    # Public market result only
+    # Tickers are sourced from Kalshi, but still restrict path components.
+    if not re.fullmatch(r'[A-Za-z0-9_-]{4,150}',ticker):
+        raise ValueError('Invalid market ticker')
+    try:
+        obj=http_json(BASE+'/markets/'+ticker,timeout=8)
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 404:
+            raise
+        obj=http_json(BASE+'/historical/markets/'+ticker,timeout=8)
+    m=obj.get('market') if isinstance(obj,dict) else None
+    if not isinstance(m,dict) or m.get('ticker') != ticker:
+        raise ValueError('Unexpected market response')
+    result=str(m.get('result') or '').lower()
+    if result=='yes':return 'UP'
+    if result=='no':return 'DOWN'
+    if result in ('','null','none'):
+        return None
+    # scalar, void, and unknown outcomes are never scored as a win/loss.
+    LOG.warning('Nonbinary market result for %s: %s',ticker,result)
+    return 'UNGRADABLE'
+
+
+def grade_settlements():
+    # Grade against Kalshi market results
+    with connect() as c:
+        pending=c.execute('''SELECT ticker FROM (
+            SELECT ticker FROM settlement_calls WHERE result='PENDING'
+            UNION SELECT ticker FROM settlement_predictions WHERE grade='PENDING'
+        ) ORDER BY ticker LIMIT ?''',(GRADE_BATCH,)).fetchall()
+    verified_now=0
+    for row in pending:
+        ticker=row['ticker']
+        try:
+            outcome=official_result(ticker)
+        except Exception as exc:
+            LOG.warning('Official settlement lookup failed for %s: %s',ticker,type(exc).__name__)
+            continue
+        if outcome is None:
+            continue
+        now=int(time.time())
+        with connect() as c:
+            if outcome=='UNGRADABLE':
+                c.execute("UPDATE settlement_calls SET result='UNGRADABLE',result_source='Kalshi market result' WHERE ticker=? AND result='PENDING'",(ticker,))
+                c.execute("UPDATE settlement_predictions SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
+                continue
+            c.execute('''INSERT INTO settlement_results(ticker,settled_side,source,recorded_at,verified)
+                VALUES (?,?,?,?,1) ON CONFLICT(ticker) DO UPDATE SET
+                settled_side=excluded.settled_side,source=excluded.source,
+                recorded_at=excluded.recorded_at,verified=1''',
+                (ticker,outcome,'Kalshi public market result',now))
+            c.execute('''UPDATE settlement_calls SET
+                result=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
+                result_source='Kalshi public market result'
+                WHERE ticker=? AND result='PENDING' ''',(outcome,ticker))
+            c.execute('''UPDATE settlement_predictions SET
+                grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
+                official_side=?,graded_at=? WHERE ticker=? AND grade='PENDING' ''',
+                (outcome,outcome,now,ticker))
+            verified_now+=1
+    if verified_now:
+        LOG.info('Official outcomes newly verified: %d',verified_now)
+
+
+def grade_summary():
+    with connect() as c:
+        observations=c.execute('SELECT COUNT(*) FROM settlement_observations').fetchone()[0]
+        contracts=c.execute('SELECT COUNT(DISTINCT ticker) FROM settlement_observations').fetchone()[0]
+        calls=c.execute("SELECT result,COUNT(*) n FROM settlement_calls GROUP BY result").fetchall()
+        predictions=c.execute("SELECT grade,COUNT(*) n FROM settlement_predictions GROUP BY grade").fetchall()
+        verified=c.execute('SELECT COUNT(*) FROM settlement_results WHERE verified=1').fetchone()[0]
+        returns=c.execute("SELECT ask,result FROM settlement_calls WHERE result IN ('WIN','LOSS') AND ask IS NOT NULL AND ask>0 AND ask<1").fetchall()
+    call_counts={r['result']:r['n'] for r in calls}
+    pred_counts={r['grade']:r['n'] for r in predictions}
+    cw=call_counts.get('WIN',0);cl=call_counts.get('LOSS',0)
+    pw=pred_counts.get('WIN',0);pl=pred_counts.get('LOSS',0)
+    def pct(w,l):return f'{100*w/(w+l):.1f}%' if w+l else 'n/a'
+    # Illustrative payoff per one contract at the recorded ask; excludes fees,
+    # slippage, missed fills, and market impact. Not realized profit.
+    gross=sum((1-r['ask']) if r['result']=='WIN' else -r['ask'] for r in returns)
+    return (f'📊 KEKE REPORT CARD\n'
+            f'Contracts {contracts} • Snapshots {observations} • Official results {verified}\n'
+            f'🚨 ENTER: {cw}W / {cl}L • {pct(cw,cl)} • pending {call_counts.get("PENDING",0)}\n'
+            f'🔎 EARLY LEAN: {pw}W / {pl}L • {pct(pw,pl)} • pending {pred_counts.get("PENDING",0)}\n'
+            f'Illustrative ENTER gross: ${gross:+.2f} across {len(returns)} graded calls (1 contract each; NO fees/fills)\n'
+            'Official outcomes only • No real trades placed')
+
 def tg(method,**data):
     if not TOKEN: return None
     r=session.post(f'https://api.telegram.org/bot{TOKEN}/{method}',data=data,timeout=7)
@@ -354,12 +467,7 @@ def run_brti_test():
             send(f'🔴 BRTI TEST FAILED: {type(exc).__name__}\nDiagnostic fetch: {type(diag_exc).__name__}\nNo settlement ENTER.')
 
 def send_stats():
-    with connect() as c:
-        n=c.execute('SELECT COUNT(*) FROM settlement_observations').fetchone()[0]
-        calls=c.execute('SELECT COUNT(*) FROM settlement_calls').fetchone()[0]
-        contracts=c.execute('SELECT COUNT(DISTINCT ticker) FROM settlement_observations').fetchone()[0]
-        verified=c.execute('SELECT COUNT(*) FROM settlement_results WHERE verified=1').fetchone()[0]
-    send(f'📊 SETTLEMENT RESEARCH\nContracts observed: {contracts}\nSnapshots: {n}\nENTER calls: {calls}\nVerified outcomes: {verified}\n\nNo accuracy or win rate is claimed without verified outcomes.')
+    send(grade_summary())
 
 def send_last():
     with connect() as c:
@@ -430,15 +538,18 @@ def maybe_alert(a,new_contract):
 def main():
     init_db()
     initialize_telegram()
-    LOG.info('KeKe V5.1 BRTI Settlement-Only starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.2 BRTI Settlement Tracker starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.1 BRTI settlement watcher online. '
+    send('🧠 KeKe V5.2 BRTI settlement tracker online. '
          'BRTI for target distance; Kraken for momentum. Persistent /data database. '
-         'No automatic trades. /status /stats /last')
+         'Automatic official-result grading active. No trades. /stats' )
     while True:
         started=time.monotonic()
         try:
             telegram_commands()
+            if time.monotonic()-state['last_grade']>=GRADE_EVERY:
+                state['last_grade']=time.monotonic()
+                grade_settlements()
             market=get_market()
             if market:
                 btc,candles=kraken_data()
@@ -455,6 +566,7 @@ def main():
                         state['brti_error_at']=time.time()
                 a=assessment(market,btc,candles,brti)
                 record(a)
+                record_early_prediction(a)
                 new=state['ticker']!=a['ticker']
                 if new:
                     state['ticker']=a['ticker']

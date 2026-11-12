@@ -861,36 +861,104 @@ def check_telegram_commands():
         print("Telegram command error:", e)
 
 
+def synthesize_market_briefing(ticker, analysis):
+    """One shared, evidence-labeled read for the active contract."""
+    memory = contract_case_file(ticker, analysis)
+    settlement = settlement_outlook({"ticker": ticker}, analysis, memory)
+    thesis = memory.get("thesis", "NEUTRAL")
+    strength = memory.get("strength", "WEAK")
+    trajectory = memory.get("trajectory", "FLAT")
+    w60 = memory.get("w60", {})
+    distance = analysis.get("target_distance")
+    seconds = int(analysis.get("seconds_left") or 0)
+    side = settlement.get("side", "UNKNOWN")
+    ask = analysis.get("yes_ask") if side == "UP" else analysis.get("no_ask")
+    bid = analysis.get("yes_bid") if side == "UP" else analysis.get("no_bid")
+    delta = w60.get("btc_delta", 0)
+    observations = []
+    if w60.get("samples", 0) >= 2:
+        observations.append(f"BTC {'rose' if delta > 0 else 'fell' if delta < 0 else 'was flat'} ${abs(delta):.2f} across the observed last-minute window")
+    if distance is not None:
+        observations.append(f"BTC is ${abs(distance):.2f} {'above' if distance >= 0 else 'below'} target")
+    if trajectory != "FLAT":
+        observations.append(f"target cushion trajectory: {trajectory.lower()}")
+    crosses = memory.get("crosses_up", 0) + memory.get("crosses_down", 0)
+    if crosses:
+        observations.append(f"{crosses} recorded target crosses this contract")
+    conflicts = (thesis in ("UP", "DOWN") and side in ("UP", "DOWN") and thesis != side)
+    if conflicts:
+        interpretation = f"MIXED: contract pressure favors {thesis}, but BTC is currently on the {side} side of target."
+    elif thesis == "NEUTRAL":
+        interpretation = "No clear contract-wide directional thesis yet."
+    else:
+        interpretation = f"Contract pressure favors {thesis} ({strength.lower()}); recent trajectory is {trajectory.lower()}."
+    if seconds <= 0:
+        action = "Contract timer expired; verify official settlement."
+    elif distance is None:
+        action = "WAIT: settlement target unavailable; don't infer a settlement edge."
+    elif conflicts:
+        action = "WAIT: conflicting evidence. Watch for a sustained target reclaim or rejection."
+    elif ask is not None and ask >= .90:
+        action = f"NO NEW CHASE: {side} costs {ask*100:.1f}¢; limited gross upside before fees."
+    elif thesis == "NEUTRAL" or memory.get("samples", 0) < 3:
+        action = "WAIT: need more contract observations and a clean entry trigger."
+    else:
+        action = f"WATCH {thesis}: thesis is developing, but this briefing alone is NOT an ENTER call."
+    triggers = []
+    if analysis.get("support") is not None:
+        triggers.append(f"Support ${analysis['support']:,.2f}: a sustained break weakens UP")
+    if analysis.get("resistance") is not None:
+        triggers.append(f"Resistance ${analysis['resistance']:,.2f}: a sustained reclaim strengthens UP")
+    if analysis.get("contract_target") is not None:
+        triggers.append(f"Target ${analysis['contract_target']:,.2f}: watch crosses and failed reclaims")
+    if w60.get("samples", 0) < 2:
+        interpretation += " Recent-window evidence is insufficient."
+    return {"memory": memory, "settlement": settlement, "observations": observations,
+            "interpretation": interpretation, "action": action, "bid": bid,
+            "ask": ask, "conflicts": conflicts, "triggers": triggers}
+
+
 def send_status():
     if not watcher_enabled:
-        send_telegram(
-            "💤 WATCHER STATUS: OFF\n\n"
-            "Send /start when you're ready."
-        )
+        send_telegram("💤 WATCHER STATUS: OFF\\n\\nSend /start when you're ready.")
         return
-
-    if not last_analysis:
-        send_telegram(
-            "🟢 WATCHER STATUS: ON\n\n"
-            "I'm monitoring BTC...no current analysis available yet."
-        )
+    if not last_analysis or not last_market:
+        send_telegram("🟢 WATCHER STATUS: ON\\n\\nWaiting for a current market snapshot.")
         return
-
     analysis = last_analysis
-
-    seconds = analysis["seconds_left"]
-    minutes = seconds // 60
-    secs = seconds % 60
-
+    ticker = last_market
+    briefing = synthesize_market_briefing(ticker, analysis)
+    memory = briefing["memory"]
+    settlement = briefing["settlement"]
+    seconds = max(0, int(analysis.get("seconds_left") or 0))
+    last_seen = memory.get("last_captured_at")
+    age = int(time.time()) - int(last_seen) if last_seen else None
+    freshness = f"Data age: {age}s" if age is not None else "Data freshness: UNKNOWN"
+    if age is None or age > max(45, CHECK_EVERY * 3):
+        freshness += " ⚠️ STALE — do not act on this briefing"
+    observations = "\\n".join("• " + item for item in briefing["observations"]) or "• Not enough history yet"
+    dist = analysis.get("target_distance")
+    cushion = f"${abs(dist):,.2f} {'above' if dist >= 0 else 'below'} target" if dist is not None else "unknown"
+    trigger_text = "\n".join("• " + t for t in briefing["triggers"]) or "• Levels unavailable"
+    position_text = ""
+    if active_position.get("ticker") == ticker:
+        position_text = f"\\n💰 Monitored bot-call position: {active_position.get('side')} (not verified as your actual trade)."
     send_telegram(
-        "🟢 WATCHER STATUS: ON\n\n"
-        f"{analysis['action']}\n\n"
-        f"BTC: ${analysis['btc_price']:,.2f}\n"
-        f"Trend: {analysis['trend']}\n"
-        f"UP ask: {analysis['yes_ask']}\n"
-        f"DOWN ask: {analysis['no_ask']}\n"
-        f"Time left: {minutes}:{secs:02d}\n\n"
-        f"{analysis['reason']}"
+        "👀 LIVE CONTRACT BRIEFING\\n"
+        f"{freshness}\\n"
+        f"⏱ {seconds//60}:{seconds%60:02d} left\\n\\n"
+        f"🧠 CONTRACT THESIS: {memory.get('thesis', 'NEUTRAL')} — {memory.get('strength', 'WEAK')}\\n"
+        f"{briefing['interpretation']}\\n\\n"
+        f"📍 OBSERVED\\n{observations}\\n"
+        f"BTC: ${analysis.get('live_btc_price') or analysis.get('btc_price') or 0:,.2f}\\n"
+        f"UP ask: {analysis.get('yes_ask')} | DOWN ask: {analysis.get('no_ask')}\\n\\n"
+        f"🏁 SETTLEMENT: {settlement.get('side')} — {settlement.get('strength')}\\n"
+        f"Cushion: {cushion}\\n"
+        f"Reversal difficulty: {settlement.get('reversal_difficulty')} (heuristic, uncalibrated)\\n\\n"
+        f"🎯 NEXT: {briefing['action']}\\n"
+        f"📍 WATCH LEVELS\n{trigger_text}\n"
+        f"Official entry signal: {analysis.get('action')}\\n"
+        f"{position_text}"
     )
 
 
@@ -2058,7 +2126,7 @@ def contract_case_file(ticker, analysis=None):
     elif w60["distance_delta"]<-15: trajectory="WIDENING DOWN"
     elif w120["distance_delta"]>20: trajectory="DRIFTING UP"
     elif w120["distance_delta"]<-20: trajectory="DRIFTING DOWN"
-    return {"samples":len(rows),"thesis":thesis,"strength":strength,"points":points,"current_distance":current,
+    return {"last_captured_at":int(rows[-1]["captured_at"]),"samples":len(rows),"thesis":thesis,"strength":strength,"points":points,"current_distance":current,
             "max_above":max(ds) if ds else None,"max_below":min(ds) if ds else None,
             "crosses_up":sum(1 for r in rows if r["target_cross"]=="UP"),
             "crosses_down":sum(1 for r in rows if r["target_cross"]=="DOWN"),
@@ -2153,8 +2221,9 @@ def trader_position_read(market, analysis, shadow):
         active_position["best_bid"] = b if old_best is None else max(float(old_best), b)
 
     hist = recent_market_history(market.get("ticker"))
-    memory = contract_case_file(market.get("ticker"), analysis)
-    settlement_market = settlement_outlook(market, analysis, memory)
+    shared = analysis.get("shared_briefing") or synthesize_market_briefing(market.get("ticker"), analysis)
+    memory = shared["memory"]
+    settlement_market = shared["settlement"]
     btc_delta = 0.0
     cushion_delta = 0.0
     elapsed = 0
@@ -2298,7 +2367,7 @@ def record_market_snapshot(market, analysis):
     no_bid, no_ask = analysis.get("no_bid"), analysis.get("no_ask")
     yes_spread = (yes_ask - yes_bid) if yes_ask is not None and yes_bid is not None else None
     no_spread = (no_ask - no_bid) if no_ask is not None and no_bid is not None else None
-    btc = analysis.get("btc_price")
+    btc = analysis.get("live_btc_price") or analysis.get("btc_price")
     support, resistance = analysis.get("support"), analysis.get("resistance")
 
     try:
@@ -2382,6 +2451,15 @@ def target_line(analysis):
 
 
 def build_message(market, analysis):
+    shared = analysis.get("shared_briefing")
+    shared_line = ""
+    if shared:
+        mem, settle = shared["memory"], shared["settlement"]
+        shared_line = (
+            f"\n🧠 CONTRACT: {mem.get('thesis', 'NEUTRAL')} — {mem.get('strength', 'WEAK')}\n"
+            f"🏁 SETTLEMENT: {settle.get('side', 'UNKNOWN')} — {settle.get('strength', 'UNKNOWN')} (uncalibrated)\n"
+            f"🎯 NEXT: {shared['action']}\n"
+        )
     seconds = analysis["seconds_left"]
 
     minutes = seconds // 60
@@ -2434,6 +2512,7 @@ Trend: {analysis['trend']}
 Contract:
 {ticker}
 
+{shared_line}
 ⚠️ Signal only — no automatic trade.
 """.strip()
 
@@ -2448,7 +2527,7 @@ def main():
     global last_market
     global last_analysis
 
-    print("Kate's BTC Watcher V4.5 Contract Memory starting...")
+    print("Kate's BTC Watcher V4.7 Shared Trader Read starting...")
     print("Stats database:", DB_PATH)
 
     init_db()
@@ -2457,7 +2536,7 @@ def main():
     initialize_telegram_offset()
 
     send_telegram(
-        "🧠 KATE'S BTC WATCHER V4.5 CONTRACT MEMORY IS ONLINE.\n\n"
+        "🧠 KATE'S BTC WATCHER V4.7 SHARED TRADER READ IS ONLINE.\n\n"
         "Commands:\n"
         "/start — turn alerts ON\n"
         "/stop — turn alerts OFF\n"
@@ -2523,6 +2602,9 @@ def main():
 
             # Persist the completed 1m candle so early formations are not thrown away.
             record_one_minute_snapshot(market, analysis)
+
+            # Shared contract interpretation: advisory, not a replacement for validated entry gates.
+            analysis["shared_briefing"] = synthesize_market_briefing(ticker, analysis)
 
             # V4.3.1 scores BOTH directions against the prior snapshot.
             shadow = analyze_shadow_setup(market, analysis)

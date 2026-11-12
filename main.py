@@ -1,25 +1,27 @@
 import os
-import re
 import time
 import sqlite3
 import requests
 from datetime import datetime, timezone
 
-# -----------------------------
+# =========================================================
 # SETTINGS
-# -----------------------------
+# =========================================================
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 SERIES = "KXBTC15M"
+
+KRAKEN_OHLC = "https://api.kraken.com/0/public/OHLC"
+KRAKEN_PAIR = "XBTUSD"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 CHECK_EVERY = 15
 
-LEVEL_LOOKBACK = 8
+STRUCTURE_CANDLES = 8
 LEVEL_TOLERANCE_PCT = 0.15
-BREAK_BUFFER_PCT = 0.03
+BREAKOUT_BUFFER_PCT = 0.05
 
 SCALP_PRICE = 0.88
 HARD_SKIP_PRICE = 0.97
@@ -29,97 +31,91 @@ MAX_SECONDS_FOR_ENTRY = 13 * 60
 
 RETEST_MAX_CANDLES = 4
 
+# Railway Volume:
+# Mount a Railway Volume at /data and the bot will automatically
+# keep its stats across restarts/redeploys.
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
+FALLBACK_DATA_DIR = "."
+DB_FILENAME = "kate_btc_watcher.db"
 
-
-# -----------------------------
+# =========================================================
 # STATE
-# -----------------------------
+# =========================================================
 
 last_alert = None
 last_market = None
 last_analysis = None
 
 watcher_enabled = True
-telegram_offset = 0
+telegram_offset = None
 
 retest_state = {
     "direction": None,
     "level": None,
-    "armed_at": None,
+    "armed_at": None
 }
 
+# Prevent the same completed 3m confirmation from being logged twice.
 logged_signal_keys = set()
 
-
-# -----------------------------
+# =========================================================
 # DATABASE
-# -----------------------------
+# =========================================================
 
 def get_db_path():
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-
         test_path = os.path.join(DATA_DIR, ".write_test")
-
         with open(test_path, "w") as f:
             f.write("ok")
-
         os.remove(test_path)
-
-        return os.path.join(
-            DATA_DIR,
-            "kate_btc_watcher.db"
-        )
-
+        return os.path.join(DATA_DIR, DB_FILENAME)
     except Exception:
-        return os.path.join(
-            os.getcwd(),
-            "kate_btc_watcher.db"
-        )
+        return os.path.join(FALLBACK_DATA_DIR, DB_FILENAME)
 
 
 DB_PATH = get_db_path()
 
 
 def db_connect():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
     with db_connect() as conn:
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_key TEXT UNIQUE,
-                ticker TEXT,
-                side TEXT,
-                setup TEXT,
+                signal_key TEXT UNIQUE NOT NULL,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                setup TEXT NOT NULL,
                 trend TEXT,
-                entry_price REAL,
+                entry_price REAL NOT NULL,
                 btc_price REAL,
                 support REAL,
                 resistance REAL,
                 seconds_left INTEGER,
                 candle_time INTEGER,
-                created_at INTEGER,
+                created_at INTEGER NOT NULL,
+
                 best_price REAL,
                 worst_price REAL,
                 price_1m REAL,
                 price_3m REAL,
                 price_5m REAL,
+
                 hit_3c INTEGER DEFAULT 0,
                 hit_5c INTEGER DEFAULT 0,
                 hit_10c INTEGER DEFAULT 0,
+
                 last_price REAL,
                 last_updated INTEGER,
                 finalized INTEGER DEFAULT 0
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS market_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,98 +127,86 @@ def init_db():
                 target_distance REAL,
                 target_distance_pct REAL,
                 target_position TEXT,
-
-                yes_bid REAL,
-                yes_ask REAL,
-                no_bid REAL,
-                no_ask REAL,
-
-                yes_spread REAL,
-                no_spread REAL,
-
-                support REAL,
-                resistance REAL,
-                trend TEXT,
-
-                distance_to_support REAL,
-                distance_to_resistance REAL,
-
-                candle_time INTEGER,
-                candle_color TEXT,
-                candle_open REAL,
-                candle_high REAL,
-                candle_low REAL,
-                candle_close REAL,
-
-                near_support INTEGER,
-                near_resistance INTEGER,
-
-                support_rejection INTEGER,
-                resistance_rejection INTEGER,
-
-                breakout_up INTEGER,
-                breakout_down INTEGER,
-
-                retest_up INTEGER,
-                retest_down INTEGER,
-                armed_direction TEXT,
-
-                target_cross TEXT,
-                target_velocity REAL,
-
-                action TEXT,
-                setup TEXT,
-                direction TEXT,
-                confirmed INTEGER,
-                scalp INTEGER
+                yes_bid REAL, yes_ask REAL, no_bid REAL, no_ask REAL,
+                yes_spread REAL, no_spread REAL,
+                support REAL, resistance REAL, trend TEXT,
+                distance_to_support REAL, distance_to_resistance REAL,
+                candle_time INTEGER, candle_color TEXT,
+                candle_open REAL, candle_high REAL, candle_low REAL, candle_close REAL,
+                near_support INTEGER, near_resistance INTEGER,
+                support_rejection INTEGER, resistance_rejection INTEGER,
+                breakout_up INTEGER, breakout_down INTEGER,
+                retest_up INTEGER, retest_down INTEGER, armed_direction TEXT,
+                target_cross TEXT, target_velocity REAL,
+                action TEXT, setup TEXT, direction TEXT, confirmed INTEGER, scalp INTEGER
             )
         """)
-
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_snapshots_ticker_time
             ON market_snapshots(ticker, captured_at)
         """)
-
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signals_ticker
+            ON signals(ticker)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signals_created
+            ON signals(created_at)
+        """)
         conn.commit()
 
 
-# -----------------------------
-# ENTER SIGNAL TRACKING
-# -----------------------------
+def load_logged_signal_keys():
+    global logged_signal_keys
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT signal_key FROM signals"
+            ).fetchall()
+        logged_signal_keys = {
+            row["signal_key"] for row in rows
+        }
+    except Exception as e:
+        print("Load signal keys error:", e)
+
 
 def make_signal_key(ticker, analysis):
     return (
         f"{ticker}|"
-        f"{analysis.get('direction')}|"
-        f"{analysis.get('setup')}|"
-        f"{analysis.get('candle_time')}"
+        f"{analysis['direction']}|"
+        f"{analysis['setup']}|"
+        f"{analysis['candle_time']}"
     )
 
 
 def record_enter_signal(ticker, analysis):
+    if not analysis["confirmed"]:
+        return
+
     if not analysis["action"].startswith("🗣️ ENTER"):
         return
 
-    signal_key = make_signal_key(
-        ticker,
-        analysis
-    )
+    if analysis["entry_price"] is None:
+        return
+
+    signal_key = make_signal_key(ticker, analysis)
 
     if signal_key in logged_signal_keys:
         return
 
-    side = analysis["direction"]
-    entry_price = analysis["entry_price"]
-
-    if side == "UP":
-        exit_bid = analysis.get("yes_bid")
-    else:
-        exit_bid = analysis.get("no_bid")
-
-    if entry_price is None:
-        return
-
     now = int(time.time())
+    entry = float(analysis["entry_price"])
+
+    # Entry cost is the ask, but the price we could actually sell into
+    # at that moment is the bid. Keep those separate so scalp stats do
+    # not pretend the entry ask was already an achievable exit price.
+    if analysis["direction"] == "UP":
+        initial_exit_bid = analysis.get("yes_bid")
+    else:
+        initial_exit_bid = analysis.get("no_bid")
+
+    if initial_exit_bid is not None:
+        initial_exit_bid = float(initial_exit_bid)
 
     try:
         with db_connect() as conn:
@@ -243,60 +227,46 @@ def record_enter_signal(ticker, analysis):
                     best_price,
                     worst_price,
                     last_price,
-                    last_updated,
-                    finalized
+                    last_updated
                 )
-                VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, 0
-                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal_key,
                 ticker,
-                side,
+                analysis["direction"],
                 analysis["setup"],
                 analysis["trend"],
-                entry_price,
+                entry,
                 analysis["btc_price"],
                 analysis["support"],
                 analysis["resistance"],
                 analysis["seconds_left"],
                 analysis["candle_time"],
                 now,
-                exit_bid,
-                exit_bid,
-                exit_bid,
+                initial_exit_bid,
+                initial_exit_bid,
+                initial_exit_bid,
                 now
             ))
-
             conn.commit()
 
         logged_signal_keys.add(signal_key)
+        print("Logged ENTER signal:", signal_key)
 
     except Exception as e:
-        print(
-            "Record ENTER error:",
-            e
-        )
+        print("Record signal error:", e)
 
 
-def side_bid_for_signal(
-    market,
-    side
-):
+def side_bid_for_signal(side, market):
+    # Entry is recorded from the ask; post-entry opportunity is measured
+    # from the bid, which is the side available to sell into.
     if side == "UP":
-        return market.get(
-            "yes_bid_dollars"
-        )
-
-    return market.get(
-        "no_bid_dollars"
-    )
+        return money(market.get("yes_bid_dollars"))
+    return money(market.get("no_bid_dollars"))
 
 
 def update_open_signals(market):
     ticker = market.get("ticker")
-
     if not ticker:
         return
 
@@ -312,109 +282,47 @@ def update_open_signals(market):
             """, (ticker,)).fetchall()
 
             for row in rows:
-                current_price = (
-                    side_bid_for_signal(
-                        market,
-                        row["side"]
-                    )
+                current_price = side_bid_for_signal(
+                    row["side"],
+                    market
                 )
 
                 if current_price is None:
                     continue
 
-                current_price = float(
-                    current_price
-                )
+                entry = float(row["entry_price"])
+                age = now - int(row["created_at"])
 
-                entry_price = float(
-                    row["entry_price"]
-                )
+                best = row["best_price"]
+                worst = row["worst_price"]
 
-                best_price = (
-                    float(row["best_price"])
-                    if row["best_price"]
-                    is not None
-                    else current_price
+                best = current_price if best is None else max(
+                    float(best), current_price
                 )
-
-                worst_price = (
-                    float(row["worst_price"])
-                    if row["worst_price"]
-                    is not None
-                    else current_price
-                )
-
-                best_price = max(
-                    best_price,
-                    current_price
-                )
-
-                worst_price = min(
-                    worst_price,
-                    current_price
-                )
-
-                age = (
-                    now
-                    - int(row["created_at"])
+                worst = current_price if worst is None else min(
+                    float(worst), current_price
                 )
 
                 price_1m = row["price_1m"]
                 price_3m = row["price_3m"]
                 price_5m = row["price_5m"]
 
-                if (
-                    age >= 60
-                    and price_1m is None
-                ):
+                if price_1m is None and age >= 60:
                     price_1m = current_price
 
-                if (
-                    age >= 180
-                    and price_3m is None
-                ):
+                if price_3m is None and age >= 180:
                     price_3m = current_price
 
-                if (
-                    age >= 300
-                    and price_5m is None
-                ):
+                if price_5m is None and age >= 300:
                     price_5m = current_price
 
-                hit_3c = int(
-                    row["hit_3c"] or 0
-                )
-
-                hit_5c = int(
-                    row["hit_5c"] or 0
-                )
-
-                hit_10c = int(
-                    row["hit_10c"] or 0
-                )
-
-                if (
-                    best_price
-                    >= entry_price + 0.03
-                ):
-                    hit_3c = 1
-
-                if (
-                    best_price
-                    >= entry_price + 0.05
-                ):
-                    hit_5c = 1
-
-                if (
-                    best_price
-                    >= entry_price + 0.10
-                ):
-                    hit_10c = 1
+                hit_3c = 1 if best >= entry + 0.03 else row["hit_3c"]
+                hit_5c = 1 if best >= entry + 0.05 else row["hit_5c"]
+                hit_10c = 1 if best >= entry + 0.10 else row["hit_10c"]
 
                 conn.execute("""
                     UPDATE signals
-                    SET
-                        best_price = ?,
+                    SET best_price = ?,
                         worst_price = ?,
                         price_1m = ?,
                         price_3m = ?,
@@ -426,8 +334,8 @@ def update_open_signals(market):
                         last_updated = ?
                     WHERE id = ?
                 """, (
-                    best_price,
-                    worst_price,
+                    best,
+                    worst,
                     price_1m,
                     price_3m,
                     price_5m,
@@ -442,122 +350,63 @@ def update_open_signals(market):
             conn.commit()
 
     except Exception as e:
-        print(
-            "Update signals error:",
-            e
-        )
+        print("Update signal tracking error:", e)
 
 
-def finalize_old_signals(
-    current_ticker
-):
+def finalize_old_signals(current_ticker):
     try:
         with db_connect() as conn:
             conn.execute("""
                 UPDATE signals
                 SET finalized = 1
-                WHERE finalized = 0
-                  AND ticker != ?
+                WHERE ticker != ?
+                  AND finalized = 0
             """, (current_ticker,))
-
             conn.commit()
-
     except Exception as e:
-        print(
-            "Finalize signals error:",
-            e
-        )
+        print("Finalize signals error:", e)
 
-
-def load_logged_signal_keys():
-    try:
-        with db_connect() as conn:
-            rows = conn.execute("""
-                SELECT signal_key
-                FROM signals
-            """).fetchall()
-
-            for row in rows:
-                logged_signal_keys.add(
-                    row["signal_key"]
-                )
-
-    except Exception as e:
-        print(
-            "Load signal keys error:",
-            e
-        )
-
-
-# -----------------------------
-# STATS HELPERS
-# -----------------------------
 
 def cents(value):
     if value is None:
         return "—"
-
     return f"{float(value) * 100:.0f}¢"
 
 
-def signed_cents(value):
-    if value is None:
+def signed_cents(delta):
+    if delta is None:
         return "—"
-
-    value = float(value)
-
-    sign = "+" if value >= 0 else ""
-
-    return (
-        f"{sign}{value * 100:.1f}¢"
-    )
+    return f"{delta * 100:+.0f}¢"
 
 
-def pct_text(
-    numerator,
-    denominator
-):
-    if not denominator:
+def pct_text(count, total):
+    if not total:
         return "—"
-
-    return (
-        f"{numerator / denominator * 100:.0f}%"
-    )
+    return f"{count / total * 100:.0f}%"
 
 
 def price_bucket(price):
-    if price < 0.50:
+    cents_value = price * 100
+
+    if cents_value < 50:
         return "<50¢"
-
-    if price < 0.70:
+    if cents_value < 70:
         return "50–69¢"
-
-    if price < 0.80:
+    if cents_value < 80:
         return "70–79¢"
-
-    if price < 0.90:
+    if cents_value < 90:
         return "80–89¢"
-
     return "90¢+"
 
 
-def time_bucket(seconds_left):
-    if seconds_left is None:
-        return "Unknown"
-
-    if seconds_left < 180:
-        return "<3m"
-
-    if seconds_left < 360:
-        return "3–5m"
-
-    if seconds_left < 540:
-        return "6–8m"
-
-    if seconds_left < 720:
-        return "9–11m"
-
-    return "12m+"
+def time_bucket(seconds):
+    if seconds >= 600:
+        return "10+ min"
+    if seconds >= 300:
+        return "5–10 min"
+    if seconds >= 120:
+        return "2–5 min"
+    return "<2 min"
 
 
 def get_last_signal():
@@ -569,13 +418,8 @@ def get_last_signal():
                 ORDER BY id DESC
                 LIMIT 1
             """).fetchone()
-
     except Exception as e:
-        print(
-            "Last signal error:",
-            e
-        )
-
+        print("Last signal error:", e)
         return None
 
 
@@ -589,10 +433,7 @@ def send_last():
         )
         return
 
-    entry = float(
-        row["entry_price"]
-    )
-
+    entry = float(row["entry_price"])
     best = row["best_price"]
     worst = row["worst_price"]
 
@@ -608,24 +449,32 @@ def send_last():
         else None
     )
 
+    status = (
+        "FINAL"
+        if row["finalized"]
+        else "STILL TRACKING"
+    )
+
     send_telegram(
         "🧾 LAST ENTER CALL\n\n"
-        f"Side: {row['side']}\n"
+        f"{row['side']} @ {cents(entry)}\n"
         f"Setup: {row['setup']}\n"
-        f"Trend: {row['trend']}\n\n"
-        f"Entry ask: {cents(entry)}\n"
-        f"Best sellable bid: {cents(best)}\n"
-        f"Best move: {signed_cents(best_move)}\n"
-        f"Worst sellable bid: {cents(worst)}\n"
-        f"Worst move: {signed_cents(worst_move)}\n\n"
-        f"After ~1m: {cents(row['price_1m'])}\n"
-        f"After ~3m: {cents(row['price_3m'])}\n"
-        f"After ~5m: {cents(row['price_5m'])}\n\n"
-        f"+3¢ available: {'YES' if row['hit_3c'] else 'NO'}\n"
-        f"+5¢ available: {'YES' if row['hit_5c'] else 'NO'}\n"
-        f"+10¢ available: {'YES' if row['hit_10c'] else 'NO'}"
+        f"Trend: {row['trend']}\n"
+        f"Status: {status}\n\n"
+        f"Best price: {cents(best)} "
+        f"({signed_cents(best_move)})\n"
+        f"Worst price: {cents(worst)} "
+        f"({signed_cents(worst_move)})\n\n"
+        f"After 1m: {cents(row['price_1m'])}\n"
+        f"After 3m: {cents(row['price_3m'])}\n"
+        f"After 5m: {cents(row['price_5m'])}\n\n"
+        f"+3¢ available: {'✅' if row['hit_3c'] else '❌'}\n"
+        f"+5¢ available: {'✅' if row['hit_5c'] else '❌'}\n"
+        f"+10¢ available: {'✅' if row['hit_10c'] else '❌'}"
     )
-    def send_stats():
+
+
+def send_stats():
     try:
         with db_connect() as conn:
             rows = conn.execute("""
@@ -633,823 +482,586 @@ def send_last():
                 FROM signals
                 ORDER BY id ASC
             """).fetchall()
-
     except Exception as e:
-        print(
-            "Stats error:",
-            e
-        )
-
-        send_telegram(
-            "⚠️ I couldn't read the stats database."
-        )
+        print("Stats error:", e)
+        send_telegram("Stats database error.")
         return
 
     total = len(rows)
 
     if total == 0:
         send_telegram(
-            "📊 V4.2 STATS\n\n"
-            "No ENTER calls logged yet.\n\n"
-            "🧠 Black-box WAIT data is still "
-            "being recorded in the background."
+            "📊 WATCHER STATS\n\n"
+            "No ENTER calls logged yet.\n"
+            "WAIT calls do not count."
         )
         return
 
-    hit_3 = sum(
-        int(row["hit_3c"] or 0)
-        for row in rows
-    )
+    hit3 = sum(int(row["hit_3c"] or 0) for row in rows)
+    hit5 = sum(int(row["hit_5c"] or 0) for row in rows)
+    hit10 = sum(int(row["hit_10c"] or 0) for row in rows)
 
-    hit_5 = sum(
-        int(row["hit_5c"] or 0)
-        for row in rows
-    )
+    up_rows = [r for r in rows if r["side"] == "UP"]
+    down_rows = [r for r in rows if r["side"] == "DOWN"]
 
-    hit_10 = sum(
-        int(row["hit_10c"] or 0)
-        for row in rows
-    )
-
-    up_rows = [
-        row
-        for row in rows
-        if row["side"] == "UP"
-    ]
-
-    down_rows = [
-        row
-        for row in rows
-        if row["side"] == "DOWN"
-    ]
-
-    up_hit_3 = sum(
-        int(row["hit_3c"] or 0)
-        for row in up_rows
-    )
-
-    down_hit_3 = sum(
-        int(row["hit_3c"] or 0)
-        for row in down_rows
-    )
-
-    lines = [
-        "📊 V4.2 ENTER STATS",
-        "",
-        f"Total ENTER calls: {total}",
-        "",
-        "💰 SCALP OPPORTUNITY",
-        f"+3¢ available: {hit_3}/{total} "
-        f"({pct_text(hit_3, total)})",
-        f"+5¢ available: {hit_5}/{total} "
-        f"({pct_text(hit_5, total)})",
-        f"+10¢ available: {hit_10}/{total} "
-        f"({pct_text(hit_10, total)})",
-        "",
-        "⬆️⬇️ BY SIDE",
-        f"UP: {len(up_rows)} calls | "
-        f"+3¢: {up_hit_3}/{len(up_rows)} "
-        f"({pct_text(up_hit_3, len(up_rows))})",
-        f"DOWN: {len(down_rows)} calls | "
-        f"+3¢: {down_hit_3}/{len(down_rows)} "
-        f"({pct_text(down_hit_3, len(down_rows))})",
-    ]
+    def hit5_rate(group):
+        if not group:
+            return "—"
+        hits = sum(int(r["hit_5c"] or 0) for r in group)
+        return pct_text(hits, len(group))
 
     setup_groups = {}
+    for row in rows:
+        setup_groups.setdefault(row["setup"], []).append(row)
+
+    setup_lines = []
+    for setup, group in sorted(
+        setup_groups.items(),
+        key=lambda item: len(item[1]),
+        reverse=True
+    ):
+        hits = sum(int(r["hit_5c"] or 0) for r in group)
+        setup_lines.append(
+            f"• {setup}: {hits}/{len(group)} "
+            f"hit +5¢ ({pct_text(hits, len(group))})"
+        )
 
     price_groups = {}
-
-    time_groups = {}
-
     for row in rows:
-        setup = (
-            row["setup"]
-            or "UNKNOWN"
-        )
+        bucket = price_bucket(float(row["entry_price"]))
+        price_groups.setdefault(bucket, []).append(row)
 
-        if setup not in setup_groups:
-            setup_groups[setup] = {
-                "total": 0,
-                "hit3": 0
-            }
-
-        setup_groups[setup]["total"] += 1
-
-        setup_groups[setup]["hit3"] += int(
-            row["hit_3c"] or 0
-        )
-
-        entry = float(
-            row["entry_price"]
-        )
-
-        p_bucket = price_bucket(
-            entry
-        )
-
-        if p_bucket not in price_groups:
-            price_groups[p_bucket] = {
-                "total": 0,
-                "hit3": 0
-            }
-
-        price_groups[p_bucket][
-            "total"
-        ] += 1
-
-        price_groups[p_bucket][
-            "hit3"
-        ] += int(
-            row["hit_3c"] or 0
-        )
-
-        t_bucket = time_bucket(
-            row["seconds_left"]
-        )
-
-        if t_bucket not in time_groups:
-            time_groups[t_bucket] = {
-                "total": 0,
-                "hit3": 0
-            }
-
-        time_groups[t_bucket][
-            "total"
-        ] += 1
-
-        time_groups[t_bucket][
-            "hit3"
-        ] += int(
-            row["hit_3c"] or 0
-        )
-
-    lines.extend([
-        "",
-        "🧩 BY SETUP"
-    ])
-
-    for setup, data in sorted(
-        setup_groups.items()
-    ):
-        lines.append(
-            f"{setup}: "
-            f"{data['hit3']}/"
-            f"{data['total']} hit +3¢ "
-            f"({pct_text(data['hit3'], data['total'])})"
-        )
-
-    lines.extend([
-        "",
-        "💵 BY ENTRY PRICE"
-    ])
-
-    price_order = [
-        "<50¢",
-        "50–69¢",
-        "70–79¢",
-        "80–89¢",
-        "90¢+"
-    ]
+    price_order = ["<50¢", "50–69¢", "70–79¢", "80–89¢", "90¢+"]
+    price_lines = []
 
     for bucket in price_order:
-        if bucket not in price_groups:
+        group = price_groups.get(bucket, [])
+        if not group:
             continue
-
-        data = price_groups[bucket]
-
-        lines.append(
-            f"{bucket}: "
-            f"{data['hit3']}/"
-            f"{data['total']} hit +3¢ "
-            f"({pct_text(data['hit3'], data['total'])})"
+        hits = sum(int(r["hit_5c"] or 0) for r in group)
+        price_lines.append(
+            f"• {bucket}: {hits}/{len(group)} "
+            f"hit +5¢ ({pct_text(hits, len(group))})"
         )
 
-    lines.extend([
-        "",
-        "⏱ BY TIME LEFT"
-    ])
+    time_groups = {}
+    for row in rows:
+        bucket = time_bucket(int(row["seconds_left"] or 0))
+        time_groups.setdefault(bucket, []).append(row)
 
-    time_order = [
-        "<3m",
-        "3–5m",
-        "6–8m",
-        "9–11m",
-        "12m+",
-        "Unknown"
-    ]
+    time_order = ["10+ min", "5–10 min", "2–5 min", "<2 min"]
+    time_lines = []
 
     for bucket in time_order:
-        if bucket not in time_groups:
+        group = time_groups.get(bucket, [])
+        if not group:
             continue
-
-        data = time_groups[bucket]
-
-        lines.append(
-            f"{bucket}: "
-            f"{data['hit3']}/"
-            f"{data['total']} hit +3¢ "
-            f"({pct_text(data['hit3'], data['total'])})"
+        hits = sum(int(r["hit_5c"] or 0) for r in group)
+        time_lines.append(
+            f"• {bucket}: {hits}/{len(group)} "
+            f"hit +5¢ ({pct_text(hits, len(group))})"
         )
 
-    lines.extend([
-        "",
-        "🧠 WAIT states + target movement "
-        "are also being saved for later analysis."
-    ])
+    completed_best_moves = []
+    completed_worst_moves = []
 
-    send_telegram(
-        "\n".join(lines)
+    for row in rows:
+        entry = float(row["entry_price"])
+
+        if row["best_price"] is not None:
+            completed_best_moves.append(
+                float(row["best_price"]) - entry
+            )
+
+        if row["worst_price"] is not None:
+            completed_worst_moves.append(
+                float(row["worst_price"]) - entry
+            )
+
+    avg_best = (
+        sum(completed_best_moves) / len(completed_best_moves)
+        if completed_best_moves
+        else None
     )
 
+    avg_worst = (
+        sum(completed_worst_moves) / len(completed_worst_moves)
+        if completed_worst_moves
+        else None
+    )
 
-# -----------------------------
+    message = (
+        "📊 KATE'S WATCHER STATS\n\n"
+        f"ENTER calls: {total}\n"
+        f"+3¢ available: {hit3}/{total} ({pct_text(hit3, total)})\n"
+        f"+5¢ available: {hit5}/{total} ({pct_text(hit5, total)})\n"
+        f"+10¢ available: {hit10}/{total} ({pct_text(hit10, total)})\n\n"
+        f"Average best move: {signed_cents(avg_best)}\n"
+        f"Average worst move: {signed_cents(avg_worst)}\n\n"
+        f"UP calls: {len(up_rows)} | +5¢: {hit5_rate(up_rows)}\n"
+        f"DOWN calls: {len(down_rows)} | +5¢: {hit5_rate(down_rows)}\n\n"
+        "🧠 BY SETUP (+5¢)\n"
+        + ("\n".join(setup_lines) if setup_lines else "—")
+        + "\n\n💵 BY ENTRY PRICE (+5¢)\n"
+        + ("\n".join(price_lines) if price_lines else "—")
+        + "\n\n⏱ BY TIME LEFT (+5¢)\n"
+        + ("\n".join(time_lines) if time_lines else "—")
+        + "\n\n"
+        "More calls = more useful these numbers become."
+    )
+
+    send_telegram(message)
+
+
+# =========================================================
 # TELEGRAM
-# -----------------------------
+# =========================================================
 
-def send_telegram(text):
-    if (
-        not TELEGRAM_TOKEN
-        or not TELEGRAM_CHAT_ID
-    ):
-        print(
-            "Telegram is not configured."
-        )
+def telegram_url(method):
+    return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+
+
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram variables missing.")
         return
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
     try:
-        requests.post(
-            url,
-            json={
+        response = requests.post(
+            telegram_url("sendMessage"),
+            data={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": text
+                "text": message
             },
             timeout=10
         )
+        response.raise_for_status()
+    except Exception as e:
+        print("Telegram send error:", e)
+
+
+def initialize_telegram_offset():
+    global telegram_offset
+
+    if not TELEGRAM_TOKEN:
+        return
+
+    try:
+        response = requests.get(
+            telegram_url("getUpdates"),
+            params={
+                "timeout": 0,
+                "limit": 100
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+
+        updates = response.json().get("result", [])
+
+        if updates:
+            telegram_offset = updates[-1]["update_id"] + 1
 
     except Exception as e:
-        print(
-            "Telegram send error:",
-            e
+        print("Telegram initialization error:", e)
+
+
+def check_telegram_commands():
+    global telegram_offset
+    global watcher_enabled
+    global last_alert
+
+    if not TELEGRAM_TOKEN:
+        return
+
+    try:
+        params = {
+            "timeout": 0,
+            "limit": 20
+        }
+
+        if telegram_offset is not None:
+            params["offset"] = telegram_offset
+
+        response = requests.get(
+            telegram_url("getUpdates"),
+            params=params,
+            timeout=10
         )
+        response.raise_for_status()
+
+        updates = response.json().get("result", [])
+
+        for update in updates:
+            telegram_offset = update["update_id"] + 1
+
+            message = update.get("message", {})
+
+            chat_id = str(
+                message.get("chat", {}).get("id", "")
+            )
+
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+
+            text = message.get("text", "").strip().lower()
+
+            if text.startswith("/stop"):
+                watcher_enabled = False
+
+                send_telegram(
+                    "💤 KATE'S BTC WATCHER IS OFF.\n\n"
+                    "No trading alerts until you send /start."
+                )
+
+            elif text.startswith("/start"):
+                watcher_enabled = True
+                last_alert = None
+
+                send_telegram(
+                    "🟢 KATE'S BTC WATCHER IS ON.\n\n"
+                    "I'm watching BTC again 👀"
+                )
+
+            elif text.startswith("/status"):
+                send_status()
+
+            elif text.startswith("/stats"):
+                send_stats()
+
+            elif text.startswith("/last"):
+                send_last()
+
+    except Exception as e:
+        print("Telegram command error:", e)
 
 
 def send_status():
     if not watcher_enabled:
         send_telegram(
-            "🔴 WATCHER STATUS: OFF\n\n"
-            "Send /start when you want me "
-            "watching again."
+            "💤 WATCHER STATUS: OFF\n\n"
+            "Send /start when you're ready."
         )
         return
 
-    if (
-        last_market is None
-        or last_analysis is None
-    ):
+    if not last_analysis:
         send_telegram(
-            "🟡 WATCHER STATUS: ON\n\n"
-            "I'm running, but I don't have "
-            "a complete market read yet."
+            "🟢 WATCHER STATUS: ON\n\n"
+            "I'm monitoring BTC...no current analysis available yet."
         )
         return
 
-    remaining = last_analysis.get(
-        "seconds_left"
-    )
+    analysis = last_analysis
 
-    if remaining is None:
-        time_text = "N/A"
-    else:
-        mins = remaining // 60
-        secs = remaining % 60
-
-        time_text = (
-            f"{mins}:{secs:02d}"
-        )
-
-    target = last_analysis.get(
-        "contract_target"
-    )
-
-    target_text = (
-        f"${target:,.2f}"
-        if target is not None
-        else "N/A"
-    )
-
-    distance = last_analysis.get(
-        "target_distance"
-    )
-
-    if distance is None:
-        distance_text = "N/A"
-
-    elif distance >= 0:
-        distance_text = (
-            f"${abs(distance):,.2f} ABOVE"
-        )
-
-    else:
-        distance_text = (
-            f"${abs(distance):,.2f} BELOW"
-        )
+    seconds = analysis["seconds_left"]
+    minutes = seconds // 60
+    secs = seconds % 60
 
     send_telegram(
         "🟢 WATCHER STATUS: ON\n\n"
-        f"{last_analysis['action']}\n"
-        f"Setup: {last_analysis['setup']}\n\n"
-        f"BTC: ${last_analysis['btc_price']:,.2f}\n"
-        f"Target: {target_text}\n"
-        f"BTC vs target: {distance_text}\n\n"
-        f"UP ask: {cents(last_analysis['yes_ask'])}\n"
-        f"DOWN ask: {cents(last_analysis['no_ask'])}\n"
-        f"Time left: {time_text}\n\n"
-        f"Contract:\n{last_market}"
+        f"{analysis['action']}\n\n"
+        f"BTC: ${analysis['btc_price']:,.2f}\n"
+        f"Trend: {analysis['trend']}\n"
+        f"UP ask: {analysis['yes_ask']}\n"
+        f"DOWN ask: {analysis['no_ask']}\n"
+        f"Time left: {minutes}:{secs:02d}\n\n"
+        f"{analysis['reason']}"
     )
 
 
-def get_updates():
-    global telegram_offset
-
-    if not TELEGRAM_TOKEN:
-        return []
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/getUpdates"
-    )
-
-    params = {
-        "timeout": 0,
-        "offset": telegram_offset
-    }
-
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            timeout=10
-        )
-
-        data = response.json()
-
-        if not data.get("ok"):
-            return []
-
-        return data.get(
-            "result",
-            []
-        )
-
-    except Exception as e:
-        print(
-            "Telegram update error:",
-            e
-        )
-
-        return []
-
-
-def check_commands():
-    global telegram_offset
-    global watcher_enabled
-
-    updates = get_updates()
-
-    for update in updates:
-        update_id = update.get(
-            "update_id"
-        )
-
-        if update_id is not None:
-            telegram_offset = (
-                update_id + 1
-            )
-
-        message = update.get(
-            "message",
-            {}
-        )
-
-        chat = message.get(
-            "chat",
-            {}
-        )
-
-        chat_id = str(
-            chat.get("id", "")
-        )
-
-        if (
-            TELEGRAM_CHAT_ID
-            and chat_id
-            != str(TELEGRAM_CHAT_ID)
-        ):
-            continue
-
-        text = (
-            message.get("text", "")
-            .strip()
-            .lower()
-        )
-
-        if text == "/start":
-            watcher_enabled = True
-
-            send_telegram(
-                "🟢 WATCHER ON.\n\n"
-                "I'm watching BTC again."
-            )
-
-        elif text == "/stop":
-            watcher_enabled = False
-
-            send_telegram(
-                "🔴 WATCHER OFF.\n\n"
-                "No market alerts until "
-                "you send /start."
-            )
-
-        elif text == "/status":
-            send_status()
-
-        elif text == "/last":
-            send_last()
-
-        elif text == "/stats":
-            send_stats()
-
-
-# -----------------------------
+# =========================================================
 # KALSHI
-# -----------------------------
+# =========================================================
 
-def get_live_market():
-    url = (
-        f"{KALSHI_BASE}/markets"
-    )
-
-    params = {
-        "series_ticker": SERIES,
-        "status": "open",
-        "limit": 100
-    }
-
+def get_live_btc_market():
     response = requests.get(
-        url,
-        params=params,
+        f"{KALSHI_BASE}/markets",
+        params={
+            "series_ticker": SERIES,
+            "status": "open",
+            "limit": 100
+        },
         timeout=10
     )
 
     response.raise_for_status()
 
-    markets = response.json().get(
-        "markets",
-        []
-    )
+    markets = response.json().get("markets", [])
 
     if not markets:
         return None
 
-    now = datetime.now(
-        timezone.utc
-    )
-
-    candidates = []
+    now = datetime.now(timezone.utc)
+    active = []
 
     for market in markets:
-        close_time = market.get(
-            "close_time"
-        )
-
-        if not close_time:
-            continue
-
         try:
-            close_dt = (
-                datetime.fromisoformat(
-                    close_time.replace(
-                        "Z",
-                        "+00:00"
-                    )
-                )
+            close_time = datetime.fromisoformat(
+                market["close_time"].replace("Z", "+00:00")
             )
+
+            if close_time > now:
+                active.append((close_time, market))
 
         except Exception:
             continue
 
-        seconds = (
-            close_dt - now
-        ).total_seconds()
-
-        if seconds > 0:
-            candidates.append(
-                (
-                    seconds,
-                    market
-                )
-            )
-
-    if not candidates:
+    if not active:
         return None
 
-    candidates.sort(
-        key=lambda x: x[0]
-    )
+    active.sort(key=lambda item: item[0])
 
-    return candidates[0][1]
+    return active[0][1]
 
-
-def get_seconds_left(market):
-    close_time = market.get(
-        "close_time"
-    )
-
-    if not close_time:
-        return None
-
-    try:
-        close_dt = (
-            datetime.fromisoformat(
-                close_time.replace(
-                    "Z",
-                    "+00:00"
-                )
-            )
-        )
-
-        seconds = int(
-            (
-                close_dt
-                - datetime.now(
-                    timezone.utc
-                )
-            ).total_seconds()
-        )
-
-        return max(
-            0,
-            seconds
-        )
-
-    except Exception:
-        return None
 
 
 def get_contract_target(market):
-    candidate_fields = [
-        "functional_strike",
-        "floor_strike",
-        "strike",
-        "cap_strike"
+    """Return Kalshi's BTC threshold/target for this market.
+
+    Prefer structured strike fields from the API. Fall back to parsing
+    human-readable market text only if Kalshi does not populate them.
+    """
+    candidates = [
+        market.get("floor_strike"),
+        market.get("functional_strike"),
     ]
 
-    for field in candidate_fields:
-        value = market.get(field)
-
+    for value in candidates:
         if value is None:
             continue
-
         try:
-            value = float(value)
-
-            if value > 1000:
-                return value
-
-        except Exception:
+            return float(str(value).replace(",", "").replace("$", "").strip())
+        except (TypeError, ValueError):
             pass
 
-    text_fields = [
-        "subtitle",
-        "title",
-        "yes_sub_title",
-        "rules_primary"
-    ]
-
-    for field in text_fields:
-        text = market.get(
-            field
-        )
-
-        if not text:
-            continue
-
-        matches = re.findall(
-            r"\$?\s*([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)",
-            str(text)
-        )
-
+    # Defensive fallback for markets where the threshold is only present
+    # in the title/subtitle. We do NOT infer it from the ticker.
+    import re
+    for field in ("title", "subtitle", "yes_sub_title", "no_sub_title"):
+        text = str(market.get(field) or "")
+        matches = re.findall(r"\$?([0-9]{2,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]{4,6}(?:\.[0-9]+)?)", text)
         for match in matches:
             try:
-                value = float(
-                    match.replace(
-                        ",",
-                        ""
-                    )
-                )
-
-                if value > 1000:
+                value = float(match.replace(",", ""))
+                if 10000 <= value <= 1000000:
                     return value
-
-            except Exception:
+            except ValueError:
                 continue
 
     return None
 
 
-# -----------------------------
-# KRAKEN
-# -----------------------------
+def target_context(btc_price, target, direction=None):
+    if target is None or btc_price is None:
+        return {
+            "target": target,
+            "distance": None,
+            "distance_pct": None,
+            "position": "UNKNOWN",
+            "side_status": "UNKNOWN"
+        }
 
-def get_kraken_candles(
-    interval=1
-):
-    url = (
-        "https://api.kraken.com/"
-        "0/public/OHLC"
-    )
+    distance = float(btc_price) - float(target)
+    distance_pct = (distance / float(target)) * 100 if target else None
+    position = "ABOVE" if distance > 0 else "BELOW" if distance < 0 else "AT"
 
-    params = {
-        "pair": "XBTUSD",
-        "interval": interval
+    side_status = "UNKNOWN"
+    if direction == "UP":
+        side_status = "AHEAD" if distance >= 0 else "BEHIND"
+    elif direction == "DOWN":
+        side_status = "AHEAD" if distance < 0 else "BEHIND"
+
+    return {
+        "target": float(target),
+        "distance": distance,
+        "distance_pct": distance_pct,
+        "position": position,
+        "side_status": side_status
     }
 
+# =========================================================
+# BTC DATA
+# =========================================================
+
+def get_kraken_candles(interval):
     response = requests.get(
-        url,
-        params=params,
+        KRAKEN_OHLC,
+        params={
+            "pair": KRAKEN_PAIR,
+            "interval": interval
+        },
         timeout=10
     )
 
     response.raise_for_status()
 
-    payload = response.json()
+    data = response.json()
 
-    if payload.get("error"):
-        raise RuntimeError(
-            str(payload["error"])
-        )
+    if data.get("error"):
+        raise Exception(f"Kraken error: {data['error']}")
 
-    result = payload.get(
-        "result",
-        {}
-    )
+    result = data.get("result", {})
 
-    pair_key = next(
-        (
-            key
-            for key in result
-            if key != "last"
-        ),
-        None
-    )
+    candle_key = None
 
-    if pair_key is None:
+    for key in result:
+        if key != "last":
+            candle_key = key
+            break
+
+    if not candle_key:
         return []
 
     candles = []
 
-    for row in result[pair_key]:
-        candles.append({
-            "time": int(row[0]),
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[6])
-        })
+    for candle in result[candle_key]:
+        try:
+            candles.append({
+                "time": int(float(candle[0])),
+                "open": float(candle[1]),
+                "high": float(candle[2]),
+                "low": float(candle[3]),
+                "close": float(candle[4]),
+                "volume": float(candle[6])
+            })
+        except Exception:
+            continue
 
     return candles
 
 
-def completed_1m_candles():
-    candles = get_kraken_candles(
-        interval=1
-    )
+# =========================================================
+# BUILD COMPLETED 3M CANDLES
+# =========================================================
 
-    if len(candles) <= 1:
-        return []
-
-    return candles[:-1]
-
-
-def build_completed_3m_candles(
-    one_minute
-):
+def build_3m_candles(one_minute):
     grouped = {}
 
     for candle in one_minute:
-        bucket = (
-            candle["time"]
-            - candle["time"] % 180
-        )
+        bucket = candle["time"] - candle["time"] % 180
 
-        grouped.setdefault(
-            bucket,
-            []
-        ).append(candle)
+        if bucket not in grouped:
+            grouped[bucket] = {
+                "time": bucket,
+                "open": candle["open"],
+                "high": candle["high"],
+                "low": candle["low"],
+                "close": candle["close"],
+                "volume": candle["volume"]
+            }
 
-    result = []
-
-    for bucket in sorted(
-        grouped.keys()
-    ):
-        rows = sorted(
-            grouped[bucket],
-            key=lambda x: x["time"]
-        )
-
-        if len(rows) != 3:
-            continue
-
-        result.append({
-            "time": bucket,
-            "open": rows[0]["open"],
-            "high": max(
-                row["high"]
-                for row in rows
-            ),
-            "low": min(
-                row["low"]
-                for row in rows
-            ),
-            "close": rows[-1]["close"],
-            "volume": sum(
-                row["volume"]
-                for row in rows
+        else:
+            grouped[bucket]["high"] = max(
+                grouped[bucket]["high"],
+                candle["high"]
             )
-        })
 
-    return result
+            grouped[bucket]["low"] = min(
+                grouped[bucket]["low"],
+                candle["low"]
+            )
+
+            grouped[bucket]["close"] = candle["close"]
+            grouped[bucket]["volume"] += candle["volume"]
+
+    candles = [
+        grouped[key]
+        for key in sorted(grouped)
+    ]
+
+    now = int(time.time())
+
+    return [
+        candle
+        for candle in candles
+        if candle["time"] + 180 <= now
+    ]
 
 
-def completed_15m_candles():
-    candles = get_kraken_candles(
-        interval=15
-    )
+# =========================================================
+# HELPERS
+# =========================================================
 
-    if len(candles) <= 1:
-        return []
-
-    return candles[:-1]
-    # -----------------------------
-# 15M STRUCTURE
-# -----------------------------
-
-def get_structure():
-    candles = completed_15m_candles()
-
-    if len(candles) < LEVEL_LOOKBACK:
+def money(value):
+    try:
+        return float(value)
+    except Exception:
         return None
 
-    recent = candles[
-        -LEVEL_LOOKBACK:
-    ]
 
-    support = min(
-        candle["low"]
-        for candle in recent
+def seconds_left(market):
+    close_time = datetime.fromisoformat(
+        market["close_time"].replace("Z", "+00:00")
     )
 
-    resistance = max(
-        candle["high"]
-        for candle in recent
+    return max(
+        0,
+        int(
+            (
+                close_time
+                - datetime.now(timezone.utc)
+            ).total_seconds()
+        )
     )
 
-    midpoint = (
-        len(recent) // 2
+
+def pct_distance(price, level):
+    if not level:
+        return 999
+
+    return abs(price - level) / level * 100
+
+
+def clear_retest():
+    retest_state["direction"] = None
+    retest_state["level"] = None
+    retest_state["armed_at"] = None
+
+
+def arm_retest(direction, level, candle_time):
+    retest_state["direction"] = direction
+    retest_state["level"] = level
+    retest_state["armed_at"] = candle_time
+
+
+# =========================================================
+# 15M STRUCTURE
+# =========================================================
+
+def get_structure():
+    candles = get_kraken_candles(15)
+
+    if len(candles) < STRUCTURE_CANDLES + 2:
+        return None
+
+    completed = candles[:-1]
+    recent = completed[-STRUCTURE_CANDLES:]
+
+    support = min(candle["low"] for candle in recent)
+    resistance = max(candle["high"] for candle in recent)
+
+    closes = [candle["close"] for candle in recent]
+
+    midpoint = len(closes) // 2
+
+    first_avg = (
+        sum(closes[:midpoint])
+        / len(closes[:midpoint])
     )
 
-    first_half = recent[
-        :midpoint
-    ]
+    second_avg = (
+        sum(closes[midpoint:])
+        / len(closes[midpoint:])
+    )
 
-    second_half = recent[
-        midpoint:
-    ]
-
-    first_avg = sum(
-        candle["close"]
-        for candle in first_half
-    ) / len(first_half)
-
-    second_avg = sum(
-        candle["close"]
-        for candle in second_half
-    ) / len(second_half)
-
-    if second_avg > first_avg:
+    if second_avg > first_avg * 1.001:
         trend = "BULLISH"
 
-    elif second_avg < first_avg:
+    elif second_avg < first_avg * 0.999:
         trend = "BEARISH"
 
     else:
-        trend = "FLAT"
+        trend = "RANGE"
 
     return {
         "support": support,
@@ -1458,53 +1070,16 @@ def get_structure():
     }
 
 
-# -----------------------------
-# RETEST MEMORY
-# -----------------------------
+# =========================================================
+# 3M PRICE ACTION + STATEFUL RETEST
+# =========================================================
 
-def clear_retest():
-    retest_state["direction"] = None
-    retest_state["level"] = None
-    retest_state["armed_at"] = None
+def analyze_price_action(support, resistance):
+    one_minute = get_kraken_candles(1)
 
+    candles = build_3m_candles(one_minute)
 
-def arm_retest(
-    direction,
-    level,
-    candle_time
-):
-    retest_state["direction"] = (
-        direction
-    )
-
-    retest_state["level"] = (
-        level
-    )
-
-    retest_state["armed_at"] = (
-        candle_time
-    )
-
-
-# -----------------------------
-# 3M PRICE ACTION
-# -----------------------------
-
-def analyze_price_action(
-    support,
-    resistance
-):
-    one_minute = (
-        completed_1m_candles()
-    )
-
-    candles = (
-        build_completed_3m_candles(
-            one_minute
-        )
-    )
-
-    if len(candles) < 2:
+    if len(candles) < 3:
         return None
 
     previous = candles[-2]
@@ -1512,96 +1087,49 @@ def analyze_price_action(
 
     price = current["close"]
 
-    support_tolerance = (
-        support
-        * LEVEL_TOLERANCE_PCT
-        / 100
-    )
-
-    resistance_tolerance = (
-        resistance
-        * LEVEL_TOLERANCE_PCT
-        / 100
-    )
-
-    break_support = (
-        support
-        * BREAK_BUFFER_PCT
-        / 100
-    )
-
-    break_resistance = (
-        resistance
-        * BREAK_BUFFER_PCT
-        / 100
-    )
+    green = current["close"] > current["open"]
+    red = current["close"] < current["open"]
 
     near_support = (
-        abs(
-            price - support
-        )
-        <= support_tolerance
+        pct_distance(price, support)
+        <= LEVEL_TOLERANCE_PCT
     )
 
     near_resistance = (
-        abs(
-            price - resistance
-        )
-        <= resistance_tolerance
+        pct_distance(price, resistance)
+        <= LEVEL_TOLERANCE_PCT
     )
 
-    green = (
-        current["close"]
-        > current["open"]
-    )
-
-    red = (
-        current["close"]
-        < current["open"]
-    )
+    # V4 wording/state helpers.
+    above_support = price >= support
+    below_support = price < support
+    below_resistance = price <= resistance
+    above_resistance = price > resistance
 
     support_rejection = (
         current["low"]
-        <= support + support_tolerance
+        <= support * (1 + LEVEL_TOLERANCE_PCT / 100)
         and current["close"] > support
         and green
     )
 
     resistance_rejection = (
         current["high"]
-        >= (
-            resistance
-            - resistance_tolerance
-        )
-        and current["close"]
-        < resistance
+        >= resistance * (1 - LEVEL_TOLERANCE_PCT / 100)
+        and current["close"] < resistance
         and red
     )
 
     breakout_up = (
-        current["close"]
-        > (
-            resistance
-            + break_resistance
-        )
-        and previous["close"]
-        <= (
-            resistance
-            + break_resistance
-        )
+        previous["close"] <= resistance
+        and current["close"]
+        > resistance * (1 + BREAKOUT_BUFFER_PCT / 100)
     )
 
     breakout_down = (
-        current["close"]
-        < (
-            support
-            - break_support
-        )
-        and previous["close"]
-        >= (
-            support
-            - break_support
-        )
+        previous["close"] >= support
+        and current["close"]
+        < support * (1 - BREAKOUT_BUFFER_PCT / 100)
     )
 
     if breakout_up:
@@ -1621,56 +1149,27 @@ def analyze_price_action(
     retest_up = False
     retest_down = False
 
-    armed_direction = (
-        retest_state["direction"]
-    )
+    armed_direction = retest_state["direction"]
+    armed_level = retest_state["level"]
+    armed_at = retest_state["armed_at"]
 
-    armed_level = (
-        retest_state["level"]
-    )
-
-    armed_at = (
-        retest_state["armed_at"]
-    )
-
-    if (
-        armed_direction
-        and armed_level is not None
-        and armed_at is not None
-    ):
+    if armed_direction and armed_level and armed_at:
         candles_since = int(
-            (
-                current["time"]
-                - armed_at
-            )
-            / 180
+            (current["time"] - armed_at) / 180
         )
 
-        if (
-            candles_since
-            > RETEST_MAX_CANDLES
-        ):
+        if candles_since > RETEST_MAX_CANDLES:
             clear_retest()
 
-        elif (
-            candles_since >= 1
-            and armed_direction == "UP"
-        ):
+        elif candles_since >= 1 and armed_direction == "UP":
             touched = (
                 current["low"]
-                <= (
-                    armed_level
-                    + (
-                        armed_level
-                        * LEVEL_TOLERANCE_PCT
-                        / 100
-                    )
-                )
+                <= armed_level
+                * (1 + LEVEL_TOLERANCE_PCT / 100)
             )
 
             held = (
-                current["close"]
-                > armed_level
+                current["close"] > armed_level
                 and green
             )
 
@@ -1680,36 +1179,20 @@ def analyze_price_action(
 
             elif (
                 current["close"]
-                < (
-                    armed_level
-                    - (
-                        armed_level
-                        * BREAK_BUFFER_PCT
-                        / 100
-                    )
-                )
+                < armed_level
+                * (1 - BREAKOUT_BUFFER_PCT / 100)
             ):
                 clear_retest()
 
-        elif (
-            candles_since >= 1
-            and armed_direction == "DOWN"
-        ):
+        elif candles_since >= 1 and armed_direction == "DOWN":
             touched = (
                 current["high"]
-                >= (
-                    armed_level
-                    - (
-                        armed_level
-                        * LEVEL_TOLERANCE_PCT
-                        / 100
-                    )
-                )
+                >= armed_level
+                * (1 - LEVEL_TOLERANCE_PCT / 100)
             )
 
             failed = (
-                current["close"]
-                < armed_level
+                current["close"] < armed_level
                 and red
             )
 
@@ -1719,210 +1202,78 @@ def analyze_price_action(
 
             elif (
                 current["close"]
-                > (
-                    armed_level
-                    + (
-                        armed_level
-                        * BREAK_BUFFER_PCT
-                        / 100
-                    )
-                )
+                > armed_level
+                * (1 + BREAKOUT_BUFFER_PCT / 100)
             ):
                 clear_retest()
 
     return {
         "price": price,
+        "candle_time": current["time"],
+        "candle_open": current["open"],
+        "candle_high": current["high"],
+        "candle_low": current["low"],
+        "candle_close": current["close"],
+        "candle_color": "GREEN" if green else "RED" if red else "FLAT",
 
-        "candle_time": (
-            current["time"]
-        ),
+        "near_support": near_support,
+        "near_resistance": near_resistance,
 
-        "candle_open": (
-            current["open"]
-        ),
+        "above_support": above_support,
+        "below_support": below_support,
+        "below_resistance": below_resistance,
+        "above_resistance": above_resistance,
 
-        "candle_high": (
-            current["high"]
-        ),
+        "support_rejection": support_rejection,
+        "resistance_rejection": resistance_rejection,
 
-        "candle_low": (
-            current["low"]
-        ),
+        "breakout_up": breakout_up,
+        "breakout_down": breakout_down,
 
-        "candle_close": (
-            current["close"]
-        ),
+        "retest_up": retest_up,
+        "retest_down": retest_down,
 
-        "candle_color": (
-            "GREEN"
-            if green
-            else (
-                "RED"
-                if red
-                else "FLAT"
-            )
-        ),
-
-        "near_support": (
-            near_support
-        ),
-
-        "near_resistance": (
-            near_resistance
-        ),
-
-        "support_rejection": (
-            support_rejection
-        ),
-
-        "resistance_rejection": (
-            resistance_rejection
-        ),
-
-        "breakout_up": (
-            breakout_up
-        ),
-
-        "breakout_down": (
-            breakout_down
-        ),
-
-        "retest_up": (
-            retest_up
-        ),
-
-        "retest_down": (
-            retest_down
-        ),
-
-        "armed_direction": (
-            retest_state["direction"]
-        )
+        "armed_direction": retest_state["direction"]
     }
 
 
-# -----------------------------
-# MARKET ANALYSIS
-# -----------------------------
+# =========================================================
+# FINAL ACTION DECISION
+# =========================================================
 
 def analyze_market(market):
+    yes_bid = money(market.get("yes_bid_dollars"))
+    yes_ask = money(market.get("yes_ask_dollars"))
+    no_bid = money(market.get("no_bid_dollars"))
+    no_ask = money(market.get("no_ask_dollars"))
+
+    remaining = seconds_left(market)
+
     structure = get_structure()
 
     if not structure:
         return None
 
-    support = (
-        structure["support"]
-    )
-
-    resistance = (
-        structure["resistance"]
-    )
-
-    trend = (
-        structure["trend"]
-    )
-
     pa = analyze_price_action(
-        support,
-        resistance
+        structure["support"],
+        structure["resistance"]
     )
 
     if not pa:
         return None
 
-    btc_price = pa["price"]
-
-    yes_bid = market.get(
-        "yes_bid_dollars"
-    )
-
-    yes_ask = market.get(
-        "yes_ask_dollars"
-    )
-
-    no_bid = market.get(
-        "no_bid_dollars"
-    )
-
-    no_ask = market.get(
-        "no_ask_dollars"
-    )
-
-    for name in [
-        "yes_bid",
-        "yes_ask",
-        "no_bid",
-        "no_ask"
-    ]:
-        value = locals()[name]
-
-        if value is not None:
-            try:
-                if name == "yes_bid":
-                    yes_bid = float(value)
-
-                elif name == "yes_ask":
-                    yes_ask = float(value)
-
-                elif name == "no_bid":
-                    no_bid = float(value)
-
-                elif name == "no_ask":
-                    no_ask = float(value)
-
-            except Exception:
-                pass
-
-    seconds_left = (
-        get_seconds_left(
-            market
-        )
-    )
-
-    target = (
-        get_contract_target(
-            market
-        )
-    )
-
-    target_distance = None
-    target_distance_pct = None
-    target_position = "UNKNOWN"
-
-    if (
-        target is not None
-        and btc_price is not None
-    ):
-        target_distance = (
-            btc_price - target
-        )
-
-        if target != 0:
-            target_distance_pct = (
-                target_distance
-                / target
-                * 100
-            )
-
-        if target_distance > 0:
-            target_position = "ABOVE"
-
-        elif target_distance < 0:
-            target_position = "BELOW"
-
-        else:
-            target_position = "AT"
+    contract_target = get_contract_target(market)
 
     action = "🗣️ WAIT 🟡"
     setup = "NONE"
+    reason = "BTC is between key levels."
+
     direction = None
     confirmed = False
 
-    reason = (
-        "BTC is between the key "
-        "support and resistance levels."
-    )
+    # -----------------------------------------
+    # STRONG CONFIRMATIONS
+    # -----------------------------------------
 
     if pa["retest_up"]:
         direction = "UP"
@@ -1930,10 +1281,9 @@ def analyze_market(market):
         setup = "RETEST HOLD"
 
         reason = (
-            "BTC broke resistance, "
-            "came back to test it, "
-            "and the completed 3m candle "
-            "held above it."
+            "Resistance broke...BTC came back "
+            "to retest it and the 3m candle "
+            "held above the level."
         )
 
     elif pa["retest_down"]:
@@ -1942,9 +1292,8 @@ def analyze_market(market):
         setup = "RETEST REJECTION"
 
         reason = (
-            "BTC broke support, "
-            "came back to test it, "
-            "and the completed 3m candle "
+            "Support broke...BTC came back "
+            "to retest it and the 3m candle "
             "rejected the old support."
         )
 
@@ -1954,123 +1303,102 @@ def analyze_market(market):
         setup = "SUPPORT REJECTION"
 
         reason = (
-            "BTC tested support and "
-            "the completed 3m candle "
-            "bounced back above it."
+            "BTC tested 15m support and the "
+            "completed 3m candle bounced back up."
         )
 
-    elif pa[
-        "resistance_rejection"
-    ]:
+    elif pa["resistance_rejection"]:
         direction = "DOWN"
         confirmed = True
-        setup = (
-            "RESISTANCE REJECTION"
-        )
+        setup = "RESISTANCE REJECTION"
 
         reason = (
-            "BTC tested resistance and "
-            "the completed 3m candle "
-            "turned back down."
+            "BTC tested 15m resistance and the "
+            "completed 3m candle turned back down."
         )
+
+    # -----------------------------------------
+    # DEVELOPING SETUPS
+    # -----------------------------------------
 
     elif pa["breakout_up"]:
         setup = "UP BREAKOUT"
 
         reason = (
-            "BTC broke resistance. "
-            "The bot is waiting for "
-            "the retest confirmation."
+            "BTC broke resistance...waiting "
+            "for a 3m retest before entering."
         )
 
     elif pa["breakout_down"]:
         setup = "DOWN BREAK"
 
         reason = (
-            "BTC broke support. "
-            "The bot is waiting for "
-            "the retest confirmation."
+            "BTC broke support...waiting "
+            "for a 3m retest before entering."
         )
 
-    elif (
-        pa["armed_direction"]
-        == "UP"
-    ):
+    elif pa["armed_direction"] == "UP":
         setup = "UP RETEST ARMED"
 
         reason = (
-            "The resistance breakout "
-            "is armed. Waiting for BTC "
-            "to retest and hold."
+            "The resistance breakout is still "
+            "armed...waiting for BTC to retest "
+            "and stay above the level."
         )
 
-    elif (
-        pa["armed_direction"]
-        == "DOWN"
-    ):
-        setup = (
-            "DOWN RETEST ARMED"
-        )
+    elif pa["armed_direction"] == "DOWN":
+        setup = "DOWN RETEST ARMED"
 
         reason = (
-            "The support break is armed. "
-            "Waiting for BTC to retest "
-            "and reject."
+            "The support break is still armed..."
+            "waiting for BTC to retest and turn "
+            "back down."
         )
 
-    elif (
-        pa["near_support"]
-        and btc_price < support
-    ):
+    # V4 FIX:
+    # Don't call BTC "near support" as if it is still above
+    # support when the completed 3m close is already below it.
+    elif pa["near_support"] and pa["below_support"]:
         setup = "SUPPORT BREAKING"
 
         reason = (
-            "BTC is below support, "
-            "but the break is not "
-            "confirmed yet."
+            "BTC is below 15m support, but the "
+            "break is not confirmed enough for "
+            "an entry yet...WAIT."
         )
 
-    elif (
-        pa["near_support"]
-        and btc_price >= support
-    ):
+    elif pa["near_support"] and pa["above_support"]:
         setup = "WATCH SUPPORT"
 
         reason = (
-            "BTC is near support, "
-            "but there is not a completed "
-            "3m rejection yet."
+            "BTC is just above 15m support..."
+            "waiting to see if it bounces or breaks."
         )
 
-    elif (
-        pa["near_resistance"]
-        and btc_price > resistance
-    ):
-        setup = (
-            "RESISTANCE BREAKING"
-        )
+    elif pa["near_resistance"] and pa["above_resistance"]:
+        setup = "RESISTANCE BREAKING"
 
         reason = (
-            "BTC is above resistance, "
-            "but the breakout is not "
-            "confirmed yet."
+            "BTC is above 15m resistance, but the "
+            "break is not confirmed enough for "
+            "an entry yet...WAIT."
         )
 
-    elif (
-        pa["near_resistance"]
-        and btc_price <= resistance
-    ):
-        setup = (
-            "WATCH RESISTANCE"
-        )
+    elif pa["near_resistance"] and pa["below_resistance"]:
+        setup = "WATCH RESISTANCE"
 
         reason = (
-            "BTC is near resistance, "
-            "but there is not a completed "
-            "3m rejection yet."
+            "BTC is just below 15m resistance..."
+            "waiting to see if it breaks through "
+            "or turns back down."
         )
+
+    # -----------------------------------------
+    # KALSHI ENTRY DECISION
+    # -----------------------------------------
 
     entry_price = None
+    scalp = False
 
     if direction == "UP":
         entry_price = yes_ask
@@ -2078,1040 +1406,413 @@ def analyze_market(market):
     elif direction == "DOWN":
         entry_price = no_ask
 
-    scalp = False
+    target_read = target_context(pa["price"], contract_target, direction)
 
-    if confirmed and direction:
-        if seconds_left is None:
-            action = "🗣️ WAIT 🟡"
-
-            reason = (
-                "The setup confirmed, "
-                "but I cannot read the "
-                "contract clock."
+    # The target is core contract context. A confirmed BTC setup can still
+    # be useful for a scalp on either side, so V4.1 does not invent an
+    # arbitrary distance cutoff. Instead it explicitly tells us whether
+    # the suggested side is currently ahead or still has to cross the target.
+    if confirmed and contract_target is not None:
+        gap = abs(target_read["distance"])
+        if target_read["side_status"] == "AHEAD":
+            reason += (
+                f" 🎯 {direction} is currently AHEAD of the "
+                f"${contract_target:,.2f} target by ${gap:,.2f}."
+            )
+        else:
+            reason += (
+                f" 🎯 {direction} is currently BEHIND the "
+                f"${contract_target:,.2f} target by ${gap:,.2f}; "
+                "BTC still needs to move toward/cross the target."
             )
 
-        elif (
-            seconds_left
-            < MIN_SECONDS_FOR_ENTRY
-        ):
-            action = (
-                "🗣️ DON'T TOUCH "
-                "THIS SHIT 🚫"
-            )
+    if confirmed:
+        if entry_price is None:
+            action = "🗣️ DON'T TOUCH THIS SHIT 🚫"
 
-            reason = (
-                "The setup confirmed "
-                "with less than one minute "
-                "left. Too late."
-            )
-
-        elif (
-            seconds_left
-            > MAX_SECONDS_FOR_ENTRY
-        ):
-            action = "🗣️ WAIT 🟡"
-
-            reason = (
-                "The setup confirmed, "
-                "but this contract is "
-                "still too early."
-            )
-
-        elif entry_price is None:
-            action = "🗣️ WAIT 🟡"
-
-            reason = (
-                "The setup confirmed, "
-                "but Kalshi is not giving "
+            reason += (
+                " Kalshi doesn't currently have "
                 "a usable ask price."
             )
 
-        elif (
-            entry_price
-            >= HARD_SKIP_PRICE
-        ):
-            action = (
-                "🗣️ DON'T TOUCH "
-                "THIS SHIT 🚫"
+        elif remaining < MIN_SECONDS_FOR_ENTRY:
+            action = "🗣️ DON'T TOUCH THIS SHIT 🚫"
+
+            reason += (
+                " There's less than a minute left..."
+                "too late for a fresh entry signal."
             )
 
-            reason = (
-                f"{direction} is already "
-                f"{cents(entry_price)}. "
-                "There is not enough room "
-                "left for our scalp."
+        elif entry_price >= HARD_SKIP_PRICE:
+            action = "🗣️ DON'T TOUCH THIS SHIT 🚫"
+
+            reason += (
+                f" {direction} is already "
+                f"${entry_price:.2f}...almost all "
+                "the contract value is priced in."
             )
 
         else:
-            action = (
-                f"🗣️ ENTER {direction} "
-                + (
-                    "🟢"
-                    if direction == "UP"
-                    else "🔴"
-                )
-            )
+            if direction == "UP":
+                action = "🗣️ ENTER UP 🟢"
+            else:
+                action = "🗣️ ENTER DOWN 🔴"
 
-            if (
-                entry_price
-                >= SCALP_PRICE
-            ):
+            if entry_price >= SCALP_PRICE:
                 scalp = True
 
                 reason += (
-                    "\n\n💰 SCALP ONLY — "
-                    "the contract is expensive, "
-                    "so we're looking for "
-                    "the little move."
+                    f" 💰 SCALP: {direction} is "
+                    f"${entry_price:.2f}, so the "
+                    "remaining room is smaller."
                 )
+
+            elif remaining > MAX_SECONDS_FOR_ENTRY:
+                reason += (
+                    " Contract is still early..."
+                    "expect more movement."
+                )
+
+    # -----------------------------------------
+    # RANGE / CHOP
+    # -----------------------------------------
+
+    if (
+        not confirmed
+        and setup == "NONE"
+        and structure["trend"] == "RANGE"
+    ):
+        action = "🗣️ DON'T TOUCH THIS SHIT 🚫"
+
+        reason = (
+            "BTC is ranging in the middle of the "
+            "structure with no clean 3m setup."
+        )
 
     return {
         "action": action,
         "setup": setup,
+        "reason": reason,
+
         "direction": direction,
         "confirmed": confirmed,
         "scalp": scalp,
-        "reason": reason,
 
-        "btc_price": btc_price,
-        "support": support,
-        "resistance": resistance,
-        "trend": trend,
+        "btc_price": pa["price"],
+        "contract_target": contract_target,
+        "target_distance": target_read["distance"],
+        "target_distance_pct": target_read["distance_pct"],
+        "target_position": target_read["position"],
+        "target_side_status": target_read["side_status"],
+
+        "support": structure["support"],
+        "resistance": structure["resistance"],
+        "trend": structure["trend"],
 
         "yes_bid": yes_bid,
         "yes_ask": yes_ask,
+
         "no_bid": no_bid,
         "no_ask": no_ask,
 
-        "entry_price": (
-            entry_price
-        ),
-
-        "seconds_left": (
-            seconds_left
-        ),
-
-        "contract_target": (
-            target
-        ),
-
-        "target_distance": (
-            target_distance
-        ),
-
-        "target_distance_pct": (
-            target_distance_pct
-        ),
-
-        "target_position": (
-            target_position
-        ),
-
-        "candle_time": (
-            pa["candle_time"]
-        ),
-
-        "candle_open": (
-            pa["candle_open"]
-        ),
-
-        "candle_high": (
-            pa["candle_high"]
-        ),
-
-        "candle_low": (
-            pa["candle_low"]
-        ),
-
-        "candle_close": (
-            pa["candle_close"]
-        ),
-
-        "candle_color": (
-            pa["candle_color"]
-        ),
-
-        "near_support": (
-            pa["near_support"]
-        ),
-
-        "near_resistance": (
-            pa["near_resistance"]
-        ),
-
-        "support_rejection": (
-            pa["support_rejection"]
-        ),
-
-        "resistance_rejection": (
-            pa[
-                "resistance_rejection"
-            ]
-        ),
-
-        "breakout_up": (
-            pa["breakout_up"]
-        ),
-
-        "breakout_down": (
-            pa["breakout_down"]
-        ),
-
-        "retest_up": (
-            pa["retest_up"]
-        ),
-
-        "retest_down": (
-            pa["retest_down"]
-        ),
-
-        "armed_direction": (
-            pa["armed_direction"]
-        )
+        "entry_price": entry_price,
+        "seconds_left": remaining,
+        "candle_time": pa["candle_time"],
+        "candle_open": pa["candle_open"],
+        "candle_high": pa["candle_high"],
+        "candle_low": pa["candle_low"],
+        "candle_close": pa["candle_close"],
+        "candle_color": pa["candle_color"],
+        "near_support": pa["near_support"],
+        "near_resistance": pa["near_resistance"],
+        "support_rejection": pa["support_rejection"],
+        "resistance_rejection": pa["resistance_rejection"],
+        "breakout_up": pa["breakout_up"],
+        "breakout_down": pa["breakout_down"],
+        "retest_up": pa["retest_up"],
+        "retest_down": pa["retest_down"],
+        "armed_direction": pa["armed_direction"]
     }
 
 
-# -----------------------------
-# BLACK-BOX SNAPSHOTS
-# -----------------------------
+# =========================================================
+# V4.2 BLACK-BOX SNAPSHOT RECORDER
+# =========================================================
 
-def record_market_snapshot(
-    market,
-    analysis
-):
-    ticker = market.get(
-        "ticker"
-    )
-
-    if (
-        not ticker
-        or not analysis
-    ):
+def record_market_snapshot(market, analysis):
+    """Save the observable market state every monitor loop without changing signals."""
+    ticker = market.get("ticker")
+    if not ticker or not analysis:
         return
 
     now = int(time.time())
-
-    yes_bid = analysis.get(
-        "yes_bid"
-    )
-
-    yes_ask = analysis.get(
-        "yes_ask"
-    )
-
-    no_bid = analysis.get(
-        "no_bid"
-    )
-
-    no_ask = analysis.get(
-        "no_ask"
-    )
-
-    yes_spread = None
-    no_spread = None
-
-    if (
-        yes_bid is not None
-        and yes_ask is not None
-    ):
-        yes_spread = (
-            yes_ask - yes_bid
-        )
-
-    if (
-        no_bid is not None
-        and no_ask is not None
-    ):
-        no_spread = (
-            no_ask - no_bid
-        )
-
-    btc_price = analysis.get(
-        "btc_price"
-    )
-
-    support = analysis.get(
-        "support"
-    )
-
-    resistance = analysis.get(
-        "resistance"
-    )
-
-    distance_to_support = None
-    distance_to_resistance = None
-
-    if (
-        btc_price is not None
-        and support is not None
-    ):
-        distance_to_support = (
-            btc_price - support
-        )
-
-    if (
-        btc_price is not None
-        and resistance is not None
-    ):
-        distance_to_resistance = (
-            resistance - btc_price
-        )
-
-    target_cross = None
-    target_velocity = None
+    yes_bid, yes_ask = analysis.get("yes_bid"), analysis.get("yes_ask")
+    no_bid, no_ask = analysis.get("no_bid"), analysis.get("no_ask")
+    yes_spread = (yes_ask - yes_bid) if yes_ask is not None and yes_bid is not None else None
+    no_spread = (no_ask - no_bid) if no_ask is not None and no_bid is not None else None
+    btc = analysis.get("btc_price")
+    support, resistance = analysis.get("support"), analysis.get("resistance")
 
     try:
         with db_connect() as conn:
             previous = conn.execute("""
-                SELECT
-                    captured_at,
-                    target_distance
+                SELECT target_distance, captured_at
                 FROM market_snapshots
                 WHERE ticker = ?
-                ORDER BY
-                    captured_at DESC,
-                    id DESC
+                ORDER BY captured_at DESC, id DESC
                 LIMIT 1
-            """, (
-                ticker,
-            )).fetchone()
+            """, (ticker,)).fetchone()
 
-            current_distance = (
-                analysis.get(
-                    "target_distance"
-                )
-            )
+            target_cross = None
+            target_velocity = None
+            distance = analysis.get("target_distance")
 
-            if (
-                previous
-                and current_distance
-                is not None
-                and previous[
-                    "target_distance"
-                ] is not None
-            ):
-                old_distance = float(
-                    previous[
-                        "target_distance"
-                    ]
-                )
-
-                elapsed = max(
-                    1,
-                    now
-                    - int(
-                        previous[
-                            "captured_at"
-                        ]
-                    )
-                )
-
-                target_velocity = (
-                    current_distance
-                    - old_distance
-                ) / elapsed
-
-                if (
-                    old_distance <= 0
-                    and current_distance > 0
-                ):
+            if previous and distance is not None and previous["target_distance"] is not None:
+                old = float(previous["target_distance"])
+                dt = max(1, now - int(previous["captured_at"]))
+                target_velocity = (float(distance) - old) / dt
+                if old <= 0 < distance:
                     target_cross = "UP"
-
-                elif (
-                    old_distance >= 0
-                    and current_distance < 0
-                ):
+                elif old >= 0 > distance:
                     target_cross = "DOWN"
 
             conn.execute("""
                 INSERT INTO market_snapshots (
-                    captured_at,
-                    ticker,
-                    seconds_left,
-                    btc_price,
-                    contract_target,
-                    target_distance,
-                    target_distance_pct,
-                    target_position,
-
-                    yes_bid,
-                    yes_ask,
-                    no_bid,
-                    no_ask,
-
-                    yes_spread,
-                    no_spread,
-
-                    support,
-                    resistance,
-                    trend,
-
-                    distance_to_support,
-                    distance_to_resistance,
-
-                    candle_time,
-                    candle_color,
-                    candle_open,
-                    candle_high,
-                    candle_low,
-                    candle_close,
-
-                    near_support,
-                    near_resistance,
-
-                    support_rejection,
-                    resistance_rejection,
-
-                    breakout_up,
-                    breakout_down,
-
-                    retest_up,
-                    retest_down,
-                    armed_direction,
-
-                    target_cross,
-                    target_velocity,
-
-                    action,
-                    setup,
-                    direction,
-                    confirmed,
-                    scalp
-                )
-                VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?,
-                    ?, ?, ?,
-                    ?, ?,
-                    ?, ?, ?, ?, ?, ?,
-                    ?, ?,
-                    ?, ?,
-                    ?, ?,
-                    ?, ?, ?,
-                    ?, ?,
-                    ?, ?, ?, ?, ?
-                )
+                    captured_at,ticker,seconds_left,btc_price,contract_target,
+                    target_distance,target_distance_pct,target_position,
+                    yes_bid,yes_ask,no_bid,no_ask,yes_spread,no_spread,
+                    support,resistance,trend,distance_to_support,distance_to_resistance,
+                    candle_time,candle_color,candle_open,candle_high,candle_low,candle_close,
+                    near_support,near_resistance,support_rejection,resistance_rejection,
+                    breakout_up,breakout_down,retest_up,retest_down,armed_direction,
+                    target_cross,target_velocity,action,setup,direction,confirmed,scalp
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
-                now,
-                ticker,
-                analysis.get(
-                    "seconds_left"
-                ),
-                btc_price,
-                analysis.get(
-                    "contract_target"
-                ),
-                current_distance,
-                analysis.get(
-                    "target_distance_pct"
-                ),
-                analysis.get(
-                    "target_position"
-                ),
-
-                yes_bid,
-                yes_ask,
-                no_bid,
-                no_ask,
-
-                yes_spread,
-                no_spread,
-
-                support,
-                resistance,
-                analysis.get(
-                    "trend"
-                ),
-
-                distance_to_support,
-                distance_to_resistance,
-
-                analysis.get(
-                    "candle_time"
-                ),
-                analysis.get(
-                    "candle_color"
-                ),
-                analysis.get(
-                    "candle_open"
-                ),
-                analysis.get(
-                    "candle_high"
-                ),
-                analysis.get(
-                    "candle_low"
-                ),
-                analysis.get(
-                    "candle_close"
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "near_support"
-                        )
-                    )
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "near_resistance"
-                        )
-                    )
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "support_rejection"
-                        )
-                    )
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "resistance_rejection"
-                        )
-                    )
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "breakout_up"
-                        )
-                    )
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "breakout_down"
-                        )
-                    )
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "retest_up"
-                        )
-                    )
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "retest_down"
-                        )
-                    )
-                ),
-
-                analysis.get(
-                    "armed_direction"
-                ),
-
-                target_cross,
-                target_velocity,
-
-                analysis.get(
-                    "action"
-                ),
-                analysis.get(
-                    "setup"
-                ),
-                analysis.get(
-                    "direction"
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "confirmed"
-                        )
-                    )
-                ),
-
-                int(
-                    bool(
-                        analysis.get(
-                            "scalp"
-                        )
-                    )
-                )
+                now,ticker,analysis.get("seconds_left"),btc,analysis.get("contract_target"),
+                distance,analysis.get("target_distance_pct"),analysis.get("target_position"),
+                yes_bid,yes_ask,no_bid,no_ask,yes_spread,no_spread,
+                support,resistance,analysis.get("trend"),
+                (btc-support) if btc is not None and support is not None else None,
+                (resistance-btc) if btc is not None and resistance is not None else None,
+                analysis.get("candle_time"),analysis.get("candle_color"),analysis.get("candle_open"),
+                analysis.get("candle_high"),analysis.get("candle_low"),analysis.get("candle_close"),
+                int(bool(analysis.get("near_support"))),int(bool(analysis.get("near_resistance"))),
+                int(bool(analysis.get("support_rejection"))),int(bool(analysis.get("resistance_rejection"))),
+                int(bool(analysis.get("breakout_up"))),int(bool(analysis.get("breakout_down"))),
+                int(bool(analysis.get("retest_up"))),int(bool(analysis.get("retest_down"))),
+                analysis.get("armed_direction"),target_cross,target_velocity,
+                analysis.get("action"),analysis.get("setup"),analysis.get("direction"),
+                int(bool(analysis.get("confirmed"))),int(bool(analysis.get("scalp")))
             ))
-
             conn.commit()
-
     except Exception as e:
-        print(
-            "Snapshot recorder error:",
-            e
-        )
-        # -----------------------------
-# TELEGRAM MESSAGE
-# -----------------------------
+        print("Snapshot recorder error:", e)
 
-def build_message(
-    market,
-    analysis
-):
-    ticker = market.get(
-        "ticker",
-        "UNKNOWN"
-    )
+# =========================================================
+# MESSAGE
+# =========================================================
 
-    remaining = analysis.get(
-        "seconds_left"
-    )
+def target_line(analysis):
+    target = analysis.get("contract_target")
+    distance = analysis.get("target_distance")
+    position = analysis.get("target_position", "UNKNOWN")
+    side_status = analysis.get("target_side_status", "UNKNOWN")
 
-    if remaining is None:
-        time_text = "N/A"
+    if target is None or distance is None:
+        return "Target: unavailable from Kalshi API ⚠️"
 
-    else:
-        minutes = (
-            remaining // 60
-        )
-
-        seconds = (
-            remaining % 60
-        )
-
-        time_text = (
-            f"{minutes}:{seconds:02d}"
-        )
-
-    target = analysis.get(
-        "contract_target"
-    )
-
-    distance = analysis.get(
-        "target_distance"
-    )
-
-    position = analysis.get(
-        "target_position"
-    )
-
-    if target is None:
-        target_block = (
-            "Target: N/A"
-        )
-
-    else:
-        target_block = (
-            f"Target: ${target:,.2f}"
-        )
-
-        if distance is not None:
-            if distance > 0:
-                target_block += (
-                    f"\nBTC is "
-                    f"${abs(distance):,.2f} "
-                    "ABOVE target"
-                )
-
-            elif distance < 0:
-                target_block += (
-                    f"\nBTC is "
-                    f"${abs(distance):,.2f} "
-                    "BELOW target"
-                )
-
-            else:
-                target_block += (
-                    "\nBTC is AT target"
-                )
-
-        if position == "ABOVE":
-            target_block += (
-                "\n🟢 UP is currently AHEAD"
-            )
-
-        elif position == "BELOW":
-            target_block += (
-                "\n🔴 DOWN is currently AHEAD"
-            )
-
-    yes_bid_text = cents(
-        analysis.get(
-            "yes_bid"
-        )
-    )
-
-    yes_ask_text = cents(
-        analysis.get(
-            "yes_ask"
-        )
-    )
-
-    no_bid_text = cents(
-        analysis.get(
-            "no_bid"
-        )
-    )
-
-    no_ask_text = cents(
-        analysis.get(
-            "no_ask"
-        )
-    )
-
-    scalp_text = ""
-
-    if analysis.get("scalp"):
-        scalp_text = (
-            "\n💰 SCALP MODE"
-        )
+    signed = f"{distance:+,.2f}"
+    status = ""
+    if analysis.get("direction"):
+        status = f" | {analysis['direction']} is {side_status}"
 
     return (
-        f"{analysis['action']}\n\n"
-        f"Setup: {analysis['setup']}\n"
-        f"{analysis['reason']}"
-        f"{scalp_text}\n\n"
-
-        f"BTC: "
-        f"${analysis['btc_price']:,.2f}\n\n"
-
-        f"🎯 CONTRACT TARGET\n"
-        f"{target_block}\n\n"
-
-        f"📊 15M STRUCTURE\n"
-        f"Support: "
-        f"${analysis['support']:,.2f}\n"
-        f"Resistance: "
-        f"${analysis['resistance']:,.2f}\n"
-        f"Trend: "
-        f"{analysis['trend']}\n\n"
-
-        f"🎯 KALSHI\n"
-        f"🟢 UP bid: "
-        f"{yes_bid_text}\n"
-        f"🟢 UP ask: "
-        f"{yes_ask_text}\n"
-        f"🔴 DOWN bid: "
-        f"{no_bid_text}\n"
-        f"🔴 DOWN ask: "
-        f"{no_ask_text}\n\n"
-
-        f"⏱ Time left: "
-        f"{time_text}\n\n"
-
-        f"Contract:\n"
-        f"{ticker}\n\n"
-
-        f"⚠️ Signal only — "
-        f"no automatic trade."
+        f"Target: ${target:,.2f}\n"
+        f"BTC is {position} target by ${abs(distance):,.2f} "
+        f"({signed} vs target){status}"
     )
 
 
-# -----------------------------
-# ALERT KEY
-# -----------------------------
+def build_message(market, analysis):
+    seconds = analysis["seconds_left"]
 
-def make_alert_key(
-    ticker,
-    analysis
-):
-    action = analysis.get(
-        "action"
-    )
+    minutes = seconds // 60
+    secs = seconds % 60
 
-    setup = analysis.get(
-        "setup"
-    )
+    ticker = market.get("ticker", "Unknown")
 
-    direction = analysis.get(
-        "direction"
-    )
+    scalp_line = ""
 
-    candle_time = analysis.get(
-        "candle_time"
-    )
+    if analysis["scalp"]:
+        scalp_line = (
+            "\n💰 SCALP SETUP — smaller profit window"
+        )
+
+    entry_line = ""
 
     if (
-        action
-        and action.startswith(
-            "🗣️ ENTER"
-        )
+        analysis["direction"]
+        and analysis["entry_price"] is not None
     ):
-        return (
-            ticker,
-            action,
-            setup,
-            direction,
-            candle_time
+        entry_line = (
+            f"\nSuggested side: {analysis['direction']}"
+            f"\nCurrent ask: ${analysis['entry_price']:.2f}"
         )
 
-    return (
-        ticker,
-        action,
-        setup,
-        direction
-    )
+    return f"""
+{analysis['action']}
+
+Setup: {analysis['setup']}
+{analysis['reason']}
+{scalp_line}
+
+BTC: ${analysis['btc_price']:,.2f}
+
+🎯 CONTRACT TARGET
+{target_line(analysis)}
+
+📊 15M STRUCTURE
+Support: ${analysis['support']:,.2f}
+Resistance: ${analysis['resistance']:,.2f}
+Trend: {analysis['trend']}
+
+🎯 KALSHI
+🟢 UP ask: {analysis['yes_ask']}
+🔴 DOWN ask: {analysis['no_ask']}
+{entry_line}
+
+⏱ Time left: {minutes}:{secs:02d}
+
+Contract:
+{ticker}
+
+⚠️ Signal only — no automatic trade.
+""".strip()
 
 
-# -----------------------------
-# MAIN
-# -----------------------------
+# =========================================================
+# MAIN LOOP
+# =========================================================
 
 def main():
     global last_alert
     global last_market
     global last_analysis
 
-    print(
-        "Kate's BTC Watcher "
-        "V4.2 starting..."
-    )
+    print("Kate's BTC Watcher V4.2 starting...")
+    print("Stats database:", DB_PATH)
 
     init_db()
     load_logged_signal_keys()
+    initialize_telegram_offset()
 
     send_telegram(
-        "🔥 KATE'S BTC WATCHER "
-        "V4.2 IS ONLINE.\n\n"
+        "🔥 KATE'S BTC WATCHER V4.2 IS ONLINE.\n\n"
+        "Commands:\n"
+        "/start — turn alerts ON\n"
+        "/stop — turn alerts OFF\n"
+        "/status — current read\n"
+        "/last — last ENTER call\n"
+        "/stats — performance stats\n\n"
         "📊 ENTER calls are being tracked.\n"
         "🎯 Contract target is being read.\n"
-        "🧠 Black-box snapshots are "
-        "recording every loop.\n"
-        "💵 Scalp exits are measured "
-        "from the sellable bid."
+        "🧠 Black-box snapshots are recording every loop.\n"
+        "💵 Scalp exits are measured from the sellable bid.\n"
+        "I'm ready 👀"
     )
 
     while True:
-        loop_started = time.time()
-
         try:
-            # Always listen for Telegram
-            # commands first.
-            check_commands()
+            # Commands always work, even if trading alerts are OFF.
+            check_telegram_commands()
 
             if not watcher_enabled:
-                elapsed = (
-                    time.time()
-                    - loop_started
-                )
-
-                sleep_for = max(
-                    1,
-                    CHECK_EVERY - elapsed
-                )
-
-                time.sleep(
-                    sleep_for
-                )
-
+                time.sleep(CHECK_EVERY)
                 continue
 
-            market = get_live_market()
+            market = get_live_btc_market()
 
             if not market:
-                print(
-                    "No open BTC "
-                    "15m market found."
-                )
-
-                elapsed = (
-                    time.time()
-                    - loop_started
-                )
-
-                sleep_for = max(
-                    1,
-                    CHECK_EVERY - elapsed
-                )
-
-                time.sleep(
-                    sleep_for
-                )
-
+                print("No open BTC 15-minute market.")
+                time.sleep(CHECK_EVERY)
                 continue
 
-            ticker = market.get(
-                "ticker"
-            )
+            ticker = market.get("ticker")
 
-            if not ticker:
-                print(
-                    "Market has no ticker."
-                )
+            # Keep already-recorded ENTER calls updated every loop,
+            # even if there is no new Telegram alert.
+            update_open_signals(market)
+            finalize_old_signals(ticker)
 
-                elapsed = (
-                    time.time()
-                    - loop_started
-                )
-
-                sleep_for = max(
-                    1,
-                    CHECK_EVERY - elapsed
-                )
-
-                time.sleep(
-                    sleep_for
-                )
-
-                continue
-
-            # -------------------------
-            # NEW CONTRACT
-            # -------------------------
-
-            if (
-                last_market is not None
-                and ticker != last_market
-            ):
-                clear_retest()
-
-                finalize_old_signals(
-                    ticker
-                )
-
-                last_alert = None
-
-            last_market = ticker
-
-            # -------------------------
-            # ANALYZE MARKET
-            # -------------------------
-
-            analysis = (
-                analyze_market(
-                    market
-                )
-            )
+            analysis = analyze_market(market)
 
             if not analysis:
-                print(
-                    "Waiting for enough "
-                    "BTC candle data..."
-                )
-
-                elapsed = (
-                    time.time()
-                    - loop_started
-                )
-
-                sleep_for = max(
-                    1,
-                    CHECK_EVERY - elapsed
-                )
-
-                time.sleep(
-                    sleep_for
-                )
-
+                time.sleep(CHECK_EVERY)
                 continue
 
             last_analysis = analysis
 
-            # -------------------------
-            # BLACK BOX
-            # -------------------------
+            # V4.2: record every observed state, including WAITs.
+            record_market_snapshot(market, analysis)
 
-            record_market_snapshot(
-                market,
+            # ---------------------------------
+            # NEW CONTRACT
+            # ---------------------------------
+
+            if ticker != last_market:
+                last_market = ticker
+                last_alert = None
+
+                # Don't carry a retest setup into
+                # another Kalshi contract.
+                clear_retest()
+
+                send_telegram(
+                    "🆕 NEW BTC 15-MIN CONTRACT\n\n"
+                    f"{ticker}\n\n"
+                    "I'm watching 👀"
+                )
+
+            # ---------------------------------
+            # RECORD EVERY REAL ENTER CALL
+            # ---------------------------------
+
+            record_enter_signal(
+                ticker,
                 analysis
             )
 
-            # -------------------------
-            # TRACK OPEN ENTER CALLS
-            # -------------------------
+            # ---------------------------------
+            # ALERT WHEN MEANINGFUL STATE CHANGES
+            # ---------------------------------
 
-            update_open_signals(
-                market
-            )
-
-            # -------------------------
-            # RECORD NEW ENTER
-            # -------------------------
-
-            if (
-                analysis["action"]
-                .startswith(
-                    "🗣️ ENTER"
-                )
-            ):
-                record_enter_signal(
-                    ticker,
-                    analysis
-                )
-
-            # -------------------------
-            # ALERT
-            # -------------------------
-
-            alert_key = (
-                make_alert_key(
-                    ticker,
-                    analysis
-                )
-            )
-
-            if (
-                alert_key
-                != last_alert
-            ):
-                send_telegram(
-                    build_message(
-                        market,
-                        analysis
-                    )
-                )
-
-                last_alert = alert_key
-
-            # -------------------------
-            # CONSOLE
-            # -------------------------
-
-            print(
-                datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),
-                "|",
+            signal_key = (
                 ticker,
-                "|",
                 analysis["action"],
-                "|",
                 analysis["setup"],
-                "| BTC",
-                analysis["btc_price"],
-                "| TARGET",
-                analysis.get(
-                    "contract_target"
-                )
+                analysis["scalp"],
+                analysis["candle_time"]
+                if analysis["confirmed"]
+                else None
             )
+
+            if signal_key != last_alert:
+                last_alert = signal_key
+
+                message = build_message(
+                    market,
+                    analysis
+                )
+
+                send_telegram(message)
+                print(message)
+
+            time.sleep(CHECK_EVERY)
 
         except Exception as e:
-            print(
-                "Main loop error:",
-                repr(e)
-            )
+            print("Monitor error:", e)
+            time.sleep(15)
 
-        # Keep the full loop close
-        # to CHECK_EVERY seconds.
-        elapsed = (
-            time.time()
-            - loop_started
-        )
-
-        sleep_for = max(
-            1,
-            CHECK_EVERY - elapsed
-        )
-
-        time.sleep(
-            sleep_for
-        )
-
-
-# -----------------------------
-# RUN
-# -----------------------------
 
 if __name__ == "__main__":
     main()

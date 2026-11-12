@@ -40,6 +40,10 @@ EARLY_ENTER_MARGIN = 4
 GET_READY_MAX_PRICE = 0.88
 GET_READY_MIN_SECONDS = 180
 
+# Trader Mode: position-facing updates after a bot-issued ENTER.
+POSITION_UPDATE_COOLDOWN = 60
+POSITION_HISTORY_SECONDS = 180
+
 # Railway Volume:
 # Mount a Railway Volume at /data and the bot will automatically
 # keep its stats across restarts/redeploys.
@@ -61,6 +65,14 @@ formation_state = {
     "ticker": None, "direction": None, "stage": "WATCH",
     "first_score": 0, "peak_score": 0, "started_at": None,
     "entry_sent": False, "last_notice": None
+}
+
+# Once the bot itself calls ENTER, Trader Mode treats that side as the active
+# thesis. Shadow noise still feeds the brain, but Telegram becomes position-facing.
+active_position = {
+    "ticker": None, "side": None, "entry_price": None, "entered_at": None,
+    "entry_btc": None, "entry_target_distance": None, "best_bid": None,
+    "last_status": None, "last_sent_at": 0, "source_setup": None
 }
 
 watcher_enabled = True
@@ -1931,6 +1943,209 @@ def build_shadow_message(analysis, shadow):
         "⚠️ EARLY FORMATION ONLY — NOT AN ENTER CALL."
     )
 
+
+
+# =========================================================
+# V4.4 TRADER MODE — USE HISTORY, DON'T JUST STORE IT
+# =========================================================
+
+def clear_active_position():
+    active_position.update({
+        "ticker": None, "side": None, "entry_price": None, "entered_at": None,
+        "entry_btc": None, "entry_target_distance": None, "best_bid": None,
+        "last_status": None, "last_sent_at": 0, "source_setup": None
+    })
+
+
+def activate_position_from_enter(ticker, analysis):
+    if not analysis.get("confirmed") or not str(analysis.get("action", "")).startswith("🗣️ ENTER"):
+        return False
+    side = analysis.get("direction")
+    if side not in ("UP", "DOWN") or analysis.get("entry_price") is None:
+        return False
+    # Do not restart the same position every loop when the old 3m confirmation repeats.
+    if active_position.get("ticker") == ticker and active_position.get("side") == side:
+        return False
+    bid = analysis.get("yes_bid") if side == "UP" else analysis.get("no_bid")
+    active_position.update({
+        "ticker": ticker, "side": side, "entry_price": float(analysis["entry_price"]),
+        "entered_at": int(time.time()), "entry_btc": analysis.get("live_btc_price") or analysis.get("btc_price"),
+        "entry_target_distance": analysis.get("target_distance"), "best_bid": bid,
+        "last_status": None, "last_sent_at": 0, "source_setup": analysis.get("setup")
+    })
+    return True
+
+
+def recent_market_history(ticker, seconds=POSITION_HISTORY_SECONDS):
+    cutoff = int(time.time()) - seconds
+    try:
+        with db_connect() as conn:
+            return conn.execute("""
+                SELECT captured_at, btc_price, target_distance, target_velocity,
+                       yes_bid, yes_ask, no_bid, no_ask, trend
+                FROM market_snapshots
+                WHERE ticker=? AND captured_at>=?
+                ORDER BY captured_at ASC, id ASC
+            """, (ticker, cutoff)).fetchall()
+    except Exception as e:
+        print("Trader history error:", e)
+        return []
+
+
+def trader_position_read(market, analysis, shadow):
+    if active_position.get("ticker") != market.get("ticker"):
+        return None
+    side = active_position.get("side")
+    if side not in ("UP", "DOWN"):
+        return None
+
+    now = int(time.time())
+    seconds_left = int(analysis.get("seconds_left") or 0)
+    live = analysis.get("live_btc_price") or analysis.get("btc_price")
+    target = analysis.get("contract_target")
+    distance = (live - target) if live is not None and target is not None else analysis.get("target_distance")
+    signed_cushion = distance if side == "UP" else (-distance if distance is not None else None)
+    bid = analysis.get("yes_bid") if side == "UP" else analysis.get("no_bid")
+    ask = analysis.get("yes_ask") if side == "UP" else analysis.get("no_ask")
+    opp_bid = analysis.get("no_bid") if side == "UP" else analysis.get("yes_bid")
+    if bid is not None:
+        b = float(bid)
+        old_best = active_position.get("best_bid")
+        active_position["best_bid"] = b if old_best is None else max(float(old_best), b)
+
+    hist = recent_market_history(market.get("ticker"))
+    btc_delta = 0.0
+    cushion_delta = 0.0
+    elapsed = 0
+    if hist and live is not None:
+        first = hist[0]
+        if first["btc_price"] is not None:
+            btc_delta = float(live) - float(first["btc_price"])
+        if distance is not None and first["target_distance"] is not None:
+            cushion_delta = float(distance) - float(first["target_distance"])
+        elapsed = max(1, now - int(first["captured_at"]))
+
+    # Signed momentum is positive when it helps the held side.
+    side_momentum = btc_delta if side == "UP" else -btc_delta
+    side_cushion_change = cushion_delta if side == "UP" else -cushion_delta
+    speed_against = max(0.0, -side_momentum / max(1, elapsed))
+    projected_adverse = speed_against * seconds_left
+
+    own_score = shadow.get("up_score" if side == "UP" else "down_score", 0) if shadow else 0
+    opp_score = shadow.get("down_score" if side == "UP" else "up_score", 0) if shadow else 0
+
+    # Overall lean deliberately synthesizes history + current evidence.
+    lean_points = 0
+    if signed_cushion is not None:
+        lean_points += 2 if signed_cushion > 50 else (1 if signed_cushion > 0 else -3)
+    lean_points += 1 if side_momentum > 20 else (-1 if side_momentum < -20 else 0)
+    lean_points += 1 if side_cushion_change > 15 else (-1 if side_cushion_change < -15 else 0)
+    lean_points += 1 if own_score >= opp_score + 2 else (-1 if opp_score >= own_score + 2 else 0)
+    if side == "UP" and analysis.get("near_support"): lean_points += 1
+    if side == "DOWN" and analysis.get("near_resistance"): lean_points += 1
+
+    if lean_points >= 3:
+        overall = f"{side} LEAN — STRONG"
+    elif lean_points >= 1:
+        overall = f"{side} LEAN — MODERATE"
+    elif lean_points >= 0:
+        overall = "TOSS-UP"
+    else:
+        overall = f"{'DOWN' if side == 'UP' else 'UP'} LEAN"
+
+    # Settlement strength is a time-aware risk read, NOT a calibrated probability.
+    if signed_cushion is None:
+        settlement = "UNKNOWN"
+    elif signed_cushion <= 0:
+        settlement = "WEAK"
+    else:
+        threat_ratio = projected_adverse / max(1.0, signed_cushion)
+        if seconds_left <= 90 and threat_ratio < 0.45 and signed_cushion >= 35:
+            settlement = "STRONG"
+        elif threat_ratio < 0.8 and signed_cushion >= 25:
+            settlement = "MODERATE"
+        else:
+            settlement = "WEAK"
+
+    entry = active_position.get("entry_price")
+    scalp_cents = None
+    if bid is not None and entry is not None:
+        scalp_cents = round((float(bid) - float(entry)) * 100, 1)
+
+    target_lost = signed_cushion is not None and signed_cushion <= 0
+    hard_opposition = opp_score >= max(5, own_score + 3)
+    sustained_against = side_momentum < -25 and side_cushion_change < -20
+    structure_broken = (side == "UP" and live is not None and analysis.get("support") is not None and live < analysis["support"]) or \
+                       (side == "DOWN" and live is not None and analysis.get("resistance") is not None and live > analysis["resistance"])
+
+    if (target_lost and (hard_opposition or sustained_against)) or structure_broken:
+        status = "EXIT"
+    elif hard_opposition or sustained_against or settlement == "WEAK" and side_momentum < -15:
+        status = "PROTECT"
+    else:
+        status = "HOLD"
+
+    if scalp_cents is None:
+        scalp_read = "No clean sellable-bid P/L read yet."
+    elif scalp_cents >= 5:
+        scalp_read = f"+{scalp_cents:.1f}¢ available at the sellable bid — profit is on the table."
+    elif scalp_cents >= 2:
+        scalp_read = f"+{scalp_cents:.1f}¢ at the sellable bid — small scalp available."
+    elif scalp_cents >= 0:
+        scalp_read = f"{scalp_cents:+.1f}¢ at the sellable bid — little scalp cushion."
+    else:
+        scalp_read = f"{scalp_cents:.1f}¢ vs entry at the sellable bid — position is below entry."
+
+    if side_momentum > 20:
+        momentum_text = f"BTC moved ${abs(side_momentum):,.0f} in favor of {side} over the recent window."
+    elif side_momentum < -20:
+        momentum_text = f"BTC moved ${abs(side_momentum):,.0f} against {side} over the recent window."
+    else:
+        momentum_text = "Recent BTC movement is choppy/flat rather than decisive."
+
+    if status == "EXIT":
+        header = f"🚨 EXIT {side}"
+        action = "The original thesis is materially invalidated."
+    elif status == "PROTECT":
+        header = f"⚠️ {side} WEAKENING — PROTECT PROFIT"
+        action = "Opposing pressure is becoming meaningful; don't treat the original ENTER as unchanged."
+    else:
+        header = f"📡 HOLD {side} {'🟢' if side == 'UP' else '🔴'}"
+        action = "The position thesis is still intact."
+
+    mins, secs = divmod(max(0, seconds_left), 60)
+    cushion_text = "n/a" if signed_cushion is None else f"${signed_cushion:+,.2f} for {side}"
+    return {
+        "status": status,
+        "message": (
+            f"{header}\n\n"
+            f"Overall read: {overall}\n"
+            f"⏱ Time left: {mins}:{secs:02d}\n"
+            f"🎯 Target cushion: {cushion_text}\n"
+            f"📈 Momentum: {momentum_text}\n\n"
+            f"💰 Scalp read: {scalp_read}\n"
+            f"⏳ Settlement read: {settlement}\n\n"
+            f"{action}"
+        )
+    }
+
+
+def maybe_send_position_update(market, analysis, shadow, force=False):
+    read = trader_position_read(market, analysis, shadow)
+    if not read:
+        return False
+    now = int(time.time())
+    changed = read["status"] != active_position.get("last_status")
+    due = now - int(active_position.get("last_sent_at") or 0) >= POSITION_UPDATE_COOLDOWN
+    if force or changed or due:
+        send_telegram(read["message"])
+        active_position["last_status"] = read["status"]
+        active_position["last_sent_at"] = now
+    if read["status"] == "EXIT":
+        clear_active_position()
+        reset_formation(market.get("ticker"))
+    return True
+
 # =========================================================
 # V4.3 BLACK-BOX SNAPSHOT RECORDER
 # =========================================================
@@ -2096,7 +2311,7 @@ def main():
     global last_market
     global last_analysis
 
-    print("Kate's BTC Watcher V4.3.1 starting...")
+    print("Kate's BTC Watcher V4.4 Trader Mode starting...")
     print("Stats database:", DB_PATH)
 
     init_db()
@@ -2104,7 +2319,7 @@ def main():
     initialize_telegram_offset()
 
     send_telegram(
-        "👁️ KATE'S BTC WATCHER V4.3.1 EYES + JUDGMENT + MEMORY IS ONLINE.\n\n"
+        "📡 KATE'S BTC WATCHER V4.4 TRADER MODE IS ONLINE.\n\n"
         "Commands:\n"
         "/start — turn alerts ON\n"
         "/stop — turn alerts OFF\n"
@@ -2114,7 +2329,9 @@ def main():
         "📊 ENTER calls are being tracked.\n"
         "🎯 Contract target is being read.\n"
         "🧠 Black-box snapshots are recording every loop.\n"
-        "👀 GET READY calls are shadow-only and tracked separately.\n"
+        "👀 Shadow evidence is used internally and tracked separately.\n"
+        "📡 Bot-issued ENTERs automatically switch into HOLD / PROTECT / EXIT mode.\n"
+        "⏱ Time + target cushion + recent momentum feed the position read.\n"
         "📈 1m price action is now part of the early read.\n"
         "💵 Scalp exits are measured from the sellable bid.\n"
         "I'm ready 👀"
@@ -2170,6 +2387,9 @@ def main():
             # V4.3.1 scores BOTH directions against the prior snapshot.
             shadow = analyze_shadow_setup(market, analysis)
             notices = apply_fast_brain(market, analysis, shadow)
+            # While in a position, shadow chatter becomes internal evidence instead of Telegram spam.
+            if active_position.get("ticker") == ticker:
+                notices = []
             if shadow and shadow.get("direction"):
                 record_shadow_signal(market, analysis, shadow)
             update_shadow_signals(market, analysis)
@@ -2189,6 +2409,8 @@ def main():
                 # Don't carry a retest setup into
                 # another Kalshi contract.
                 clear_retest()
+                if active_position.get("ticker") and active_position.get("ticker") != ticker:
+                    clear_active_position()
                 reset_formation(ticker)
 
                 send_telegram(
@@ -2211,6 +2433,12 @@ def main():
                 ticker,
                 analysis
             )
+            new_position = activate_position_from_enter(ticker, analysis)
+
+            # Once an ENTER exists, Trader Mode owns the user-facing updates.
+            position_active = active_position.get("ticker") == ticker
+            if position_active and not new_position:
+                maybe_send_position_update(market, analysis, shadow)
 
             # ---------------------------------
             # ALERT WHEN MEANINGFUL STATE CHANGES
@@ -2226,7 +2454,7 @@ def main():
                 else None
             )
 
-            if signal_key != last_alert:
+            if signal_key != last_alert and (not position_active or new_position):
                 last_alert = signal_key
 
                 message = build_message(
@@ -2236,6 +2464,8 @@ def main():
 
                 send_telegram(message)
                 print(message)
+                if new_position:
+                    maybe_send_position_update(market, analysis, shadow, force=True)
 
             time.sleep(CHECK_EVERY)
 

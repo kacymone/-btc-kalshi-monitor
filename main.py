@@ -6,6 +6,7 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding, ed25519
 from datetime import datetime, timezone
 import requests
+import csv, io, zipfile
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 LOG = logging.getLogger('keke')
@@ -534,6 +535,52 @@ def run_brti_test():
         except Exception as diag_exc:
             send(f'🔴 BRTI TEST FAILED: {type(exc).__name__}\nDiagnostic fetch: {type(diag_exc).__name__}\nNo settlement ENTER.')
 
+def export_research():
+    """Send a consistent, read-only CSV archive; never alter the live database."""
+    if not TOKEN or not CHAT:
+        return
+    tables=('settlement_observations','settlement_calls','settlement_results',
+            'settlement_predictions','v53_opportunities','keke_thesis_events')
+    try:
+        # SQLite online backup takes a consistent snapshot, including WAL changes.
+        snapshot=sqlite3.connect(':memory:')
+        try:
+            with connect() as live:
+                live.backup(snapshot, pages=100, sleep=0.05)
+            output=io.BytesIO()
+            counts=[]
+            with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_DEFLATED) as z:
+                for table in tables:
+                    exists=snapshot.execute('SELECT 1 FROM sqlite_master WHERE type=? AND name=?',('table',table)).fetchone()
+                    if not exists:
+                        continue
+                    cur=snapshot.execute('SELECT * FROM "'+table+'"')
+                    buf=io.StringIO(newline='')
+                    writer=csv.writer(buf)
+                    writer.writerow([d[0] for d in cur.description])
+                    n=0
+                    for row in cur:
+                        writer.writerow(row)
+                        n+=1
+                    z.writestr(table+'.csv',buf.getvalue())
+                    counts.append(f'{table}: {n}')
+                z.writestr('README.txt','KeKe research export (read-only SQLite snapshot).\n'+ '\n'.join(counts)+'\nNo trading orders or API credentials included.\n')
+            output.seek(0)
+            if output.getbuffer().nbytes>45*1024*1024:
+                send('⚠️ Export is over 45 MB. No data was changed; ask for a smaller export.')
+                return
+            response=session.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',
+                data={'chat_id':CHAT,'caption':'📦 KeKe research export • CSV files • read-only'},
+                files={'document':('keke_research_export.zip',output,'application/zip')},timeout=90)
+            response.raise_for_status()
+            if not response.json().get('ok'):
+                raise ValueError('Telegram rejected export')
+        finally:
+            snapshot.close()
+    except Exception:
+        LOG.exception('Research export failed')
+        send('⚠️ Export failed. Your existing database was not changed.')
+
 def send_stats():
     send(grade_summary())
 
@@ -559,6 +606,7 @@ def telegram_commands():
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/last'):send_last()
             elif cmd.startswith('/brti'):run_brti_test()
+            elif cmd == '/export':export_research()
     except Exception:LOG.exception('Telegram command polling error')
 
 def initialize_telegram():
@@ -573,7 +621,8 @@ def initialize_telegram():
             {'command':'status','description':'Latest settlement read'},
             {'command':'stats','description':'Settlement research counts'},
             {'command':'last','description':'Last settlement ENTER'},
-            {'command':'brti','description':'Test read-only Kalshi BRTI access'}]))
+            {'command':'brti','description':'Test read-only Kalshi BRTI access'},
+            {'command':'export','description':'Download research CSV archive'}]))
     except Exception:LOG.exception('Telegram setup error')
 
 # Thesis state is reconstructed from SQLite on restart, so a deploy does not

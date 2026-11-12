@@ -1,4 +1,4 @@
-"""KeKe V5.0 — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.1 diagnostic — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -139,8 +139,8 @@ def kraken_data():
     live=float(ticker['c'][0])
     return live,candles
 
-def brti_live():
-    """Authenticated Kalshi CF Benchmarks passthrough; fail closed on unknown/stale data."""
+def brti_raw():
+    """Fetch authenticated index response; do not log credentials or payload."""
     key_id=os.getenv('KALSHI_API_KEY_ID','').strip()
     pem=os.getenv('KALSHI_PRIVATE_KEY','').replace('\\n','\n').strip()
     pem_path=os.getenv('KALSHI_PRIVATE_KEY_PATH','').strip()
@@ -161,6 +161,11 @@ def brti_live():
     obj=response.json()
     if not isinstance(obj,dict) or obj.get('error'):
         raise ValueError('BRTI response error')
+    return obj
+
+def brti_live():
+    """Parse a verified live tick; never use unrecognized data for calls."""
+    obj=brti_raw()
     # CF Benchmarks latest-values passthrough documented shape.
     payload=obj.get('payload')
     candidates=[]
@@ -309,13 +314,32 @@ def format_read(a, headline=None):
             f'{side} {ask_text(a["asks"].get(side)) if side in a["asks"] else "n/a"} • Trend {a.get("trend","?")} (Kraken)\n'
             '⚠️ Live index ≠ final 60s average')
 
+def safe_shape(value, depth=0):
+    """Show only JSON key names and types; never values or array contents."""
+    if isinstance(value, dict):
+        if depth >= 3: return '{object}'
+        parts=[]
+        for k,v in list(value.items())[:12]:
+            name=str(k)
+            if any(term in name.lower() for term in ('secret','token','password','signature','private','credential','authorization','key')):
+                continue
+            parts.append(f'{name}: {safe_shape(v,depth+1)}')
+        return '{' + ', '.join(parts) + '}'
+    if isinstance(value,list):
+        return f'list[{len(value)}] ' + (safe_shape(value[0],depth+1) if value and depth<3 else '')
+    return type(value).__name__
+
 def run_brti_test():
     try:
         price,stamp=brti_live()
         send(f'🟢 BRTI LIVE: ${price:,.2f}\nFeed age: {time.time()-stamp:.0f}s\nSettlement reads use BRTI; Kraken for trend.')
     except Exception as exc:
         LOG.warning('BRTI test failed: %s',type(exc).__name__)
-        send(f'🔴 BRTI NOT READY: {str(exc)[:130]}\nSettlement ENTER disabled when feed unavailable.')
+        try:
+            shape=safe_shape(brti_raw())
+            send('🔎 BRTI RESPONSE STRUCTURE (field names/types only):\n'+shape[:1100]+'\n⚪ Settlement ENTER remains disabled.')
+        except Exception as diag_exc:
+            send(f'🔴 BRTI TEST FAILED: {type(exc).__name__}\nDiagnostic fetch: {type(diag_exc).__name__}\nNo settlement ENTER.')
 
 def send_stats():
     with connect() as c:

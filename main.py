@@ -239,19 +239,28 @@ def send(message):
 def money_text(x): return f'${x:,.2f}' if x is not None else 'UNKNOWN'
 def ask_text(x): return f'{x*100:.1f}¢' if x is not None else 'n/a'
 
-def format_read(a,headline='🧠 SETTLEMENT READ'):
-    mm,ss=divmod(a['seconds'],60)
-    return (f'{headline}\n\n⏱ {mm}:{ss:02d} left\n'
-            f'BTC (Kraken): {money_text(a["btc"])}\n'
-            f'Kalshi target: {money_text(a["target"])}\n'
-            f'Target distance: {money_text(a["distance"])} (BTC minus target)\n'
-            f'Pre-contract trend: {a["trend"]}\n'
-            f'🏁 Currently ahead: {a["favored"] or "UNKNOWN"}\n'
-            f'Confidence: {a["confidence"]} (NOT calibrated)\n'
-            f'UP ask: {ask_text(a["asks"]["UP"])} | DOWN ask: {ask_text(a["asks"]["DOWN"])}\n\n'
-            f'📣 {a["decision"]}\n{a["reason"]}\n\n'
-            '⚠️ Kraken is a proxy, not Kalshi’s official settlement source. '
-            'Entry price, fees, and execution matter. Signal only; no automatic bet.')
+def format_read(a, headline=None):
+    """Phone-preview-first settlement alert. All figures are reference estimates."""
+    mm, ss = divmod(max(0, int(a['seconds'])), 60)
+    decision = a['decision']
+    icon = '🟢' if decision == 'ENTER UP' else '🔴' if decision == 'ENTER DOWN' else '🟡'
+    distance = a.get('distance')
+    if distance is None:
+        position = 'Target unavailable'
+    else:
+        position = f'BTC ${abs(distance):,.0f} {"above" if distance >= 0 else "below"} target'
+    trend = {'UP':'↑','DOWN':'↓'}.get(a.get('trend'), '↔')
+    reason = a.get('reason') or ''
+    if decision == 'WAIT':
+        if distance is not None and abs(distance) < 25:
+            reason = 'Too close to target'
+        elif not reason:
+            reason = 'No clear settlement edge'
+    first = f'{icon} {decision} — {reason}' if decision == 'WAIT' else f'{icon} {decision}'
+    return (f'{first}\n'
+            f'⏱ {mm}:{ss:02d} | {position}\n'
+            f'Trend {trend} {a.get("trend", "?")} | UP {ask_text(a["asks"]["UP"])} • DOWN {ask_text(a["asks"]["DOWN"])}\n'
+            '⚠️ Kraken proxy • Not a guaranteed settlement')
 
 def send_stats():
     with connect() as c:

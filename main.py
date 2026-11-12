@@ -1,4 +1,4 @@
-"""KeKe V5.1 record diagnostic — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.3 early-settlement research — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -74,6 +74,13 @@ def init_db():
           distance REAL, ask REAL, official_side TEXT,
           graded_at INTEGER, grade TEXT DEFAULT 'PENDING')''')
         c.execute('CREATE INDEX IF NOT EXISTS idx_v52_predictions_grade ON settlement_predictions(grade,captured_at)')
+        c.execute('''CREATE TABLE IF NOT EXISTS v53_opportunities (
+            ticker TEXT NOT NULL, side TEXT NOT NULL, captured_at INTEGER NOT NULL,
+            seconds_left INTEGER, stage TEXT, ask REAL, multiplier REAL,
+            score REAL, brti REAL, target REAL, distance REAL, indicators TEXT,
+            official_side TEXT, grade TEXT DEFAULT 'PENDING', graded_at INTEGER,
+            PRIMARY KEY(ticker,side,stage))''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_v53_grade ON v53_opportunities(grade,captured_at)')
 
 
 def http_json(url,params=None,timeout=6):
@@ -139,7 +146,7 @@ def kraken_data():
             t=int(float(r[0]))
             if t+60<=now:
                 candles.append({'time':t,'open':float(r[1]),'high':float(r[2]),
-                                'low':float(r[3]),'close':float(r[4])})
+                                'low':float(r[3]),'close':float(r[4]),'volume':float(r[6]) if len(r)>6 else 0.0})
         except (IndexError,TypeError,ValueError): pass
     if len(candles)<12: raise ValueError('Not enough completed 1m candles')
     obj=http_json(KRAKEN+'/Ticker',{'pair':'XBTUSD'})
@@ -199,72 +206,102 @@ def brti_live():
     stamp_seconds,price=max(valid,key=lambda x:x[0])
     return price,stamp_seconds
 
+def ema(values, period):
+    k=2/(period+1)
+    out=values[0]
+    for x in values[1:]:out=x*k+out*(1-k)
+    return out
+
+def rsi(values, period=14):
+    diffs=[values[i]-values[i-1] for i in range(1,len(values))]
+    recent=diffs[-period:]
+    gains=sum(max(x,0) for x in recent)/period
+    losses=sum(max(-x,0) for x in recent)/period
+    if gains==0 and losses==0:return 50.0
+    if losses==0:return 100.0
+    return 100-100/(1+gains/losses)
+
 def assessment(m,btc,candles,brti=None):
-    now=int(time.time())
-    seconds=seconds_remaining(m)
-    target=target_of(m)
-    bids={s:quote(m,s,'bid') for s in ('UP','DOWN')}
-    asks={s:quote(m,s,'ask') for s in ('UP','DOWN')}
+    now=int(time.time()); seconds=seconds_remaining(m); target=target_of(m)
+    bids={side:quote(m,side,'bid') for side in ('UP','DOWN')}
+    asks={side:quote(m,side,'ask') for side in ('UP','DOWN')}
     closes=[c['close'] for c in candles]
-    # Last 1/3-minute movements use *completed* candles, live quote supplements them.
-    delta1=btc-closes[-1]
-    delta3=btc-closes[-3]
-    last_ranges=[c['high']-c['low'] for c in candles[-12:]]
-    typical_range=sum(last_ranges)/len(last_ranges)
+    delta1=btc-closes[-1];delta3=btc-closes[-3]
+    ranges=[c['high']-c['low'] for c in candles[-12:]]
+    typical_range=sum(ranges)/len(ranges)
     trend='UP' if closes[-1]>closes[-6] and closes[-3]>closes[-9] else ('DOWN' if closes[-1]<closes[-6] and closes[-3]<closes[-9] else 'MIXED')
-    distance=brti-target if target is not None and brti is not None else None
+    distance=brti-target if brti is not None and target is not None else None
     favored='UP' if distance is not None and distance>0 else ('DOWN' if distance is not None and distance<0 else None)
-    confidence='UNCERTAIN'
-    decision='WAIT'
-    reasons=[]
-    if brti is None:
-        reasons.append('BRTI unavailable — no settlement call')
-    elif target is None:
-        reasons.append('Kalshi target unavailable')
-    elif distance is None or abs(distance)<MIN_CUSHION:
-        reasons.append('BTC too close to target for an early directional call')
+    # Completed 1-minute Kraken candles; pre-contract candles available immediately.
+    e5=ema(closes[-50:],5);e13=ema(closes[-50:],13)
+    r=rsi(closes)
+    vol=[c['volume'] for c in candles[-21:]]
+    vol_ratio=vol[-1]/max(sum(vol[:-1])/max(1,len(vol)-1),.000001)
+    recent=candles[-16:-1]
+    resistance=max(c['high'] for c in recent)
+    support=min(c['low'] for c in recent)
+    vwap_num=sum(((c['high']+c['low']+c['close'])/3)*c['volume'] for c in candles[-15:])
+    vwap_den=sum(c['volume'] for c in candles[-15:])
+    vwap=vwap_num/vwap_den if vwap_den else closes[-1]
+    # A directional research score, NOT a probability or claimed statistical edge.
+    score=0.0
+    score+=1.0 if btc>e5 else -1.0
+    score+=1.0 if e5>e13 else -1.0
+    score+=.75 if btc>vwap else -.75
+    score+=.75 if delta3>0 else -.75
+    score+=.5 if closes[-1]>closes[-6] else -.5
+    score+=.5 if r>55 else (-.5 if r<45 else 0)
+    if btc>resistance and vol_ratio>1.15:score+=1.0
+    if btc<support and vol_ratio>1.15:score-=1.0
+    # Distance is BRTI-based; never replace settlement source with Kraken.
+    if distance is not None:
+        normalized=distance/max(typical_range*max(seconds/60,1)**.5,10)
+        score+=max(-2.0,min(2.0,normalized))
+    side='UP' if score>0 else 'DOWN'
+    strength=abs(score)
+    ask=asks[side];bid=bids[side]
+    spread=ask-bid if ask is not None and bid is not None else None
+    multiple=1/ask if ask is not None and ask>0 else None
+    decision='WAIT';confidence='UNVALIDATED';reasons=[]
+    if brti is None or target is None:
+        reasons.append('BRTI/target unavailable')
+    elif seconds<MIN_ENTRY_SECONDS:
+        reasons.append('Late contract')
+    elif ask is None or bid is None or spread is None or spread<0 or spread>.08:
+        reasons.append('Quote/spread unavailable')
+    elif ask>=.92:
+        reasons.append('Low payout multiple')
+    elif strength>=3.0:
+        decision=f'PAPER BUY {side}'
+        reasons.append('Experimental multi-indicator alignment; not calibrated')
+    elif strength>=1.5:
+        decision=f'WATCH {side}'
+        reasons.append('Directional setup developing')
     else:
-        # A heuristic stress test, not an estimated probability or historical win rate.
-        cushion=abs(distance)
-        time_factor=max(seconds/60,0.5)
-        required_move_per_min=cushion/time_factor
-        observed_move=max(typical_range,abs(delta3)/3,5)
-        difficulty=required_move_per_min/observed_move
-        momentum_favors=(favored=='UP' and delta3>0) or (favored=='DOWN' and delta3<0)
-        trend_favors=(trend==favored)
-        if difficulty>=1.5 and (momentum_favors or trend_favors):
-            confidence='HIGH HEURISTIC'
-        elif difficulty>=.7 and (momentum_favors or trend_favors):
-            confidence='MODERATE HEURISTIC'
-        elif difficulty>=1.0 and abs(delta3)<typical_range:
-            confidence='MODERATE HEURISTIC'
-        else:
-            confidence='LOW HEURISTIC'
-        reasons.append(f'{favored} ahead by ${cushion:.2f}; reversal needs ~${required_move_per_min:.1f}/min')
-        reasons.append(f'Observed 1m range ~${typical_range:.1f}; recent 3m change ${delta3:+.1f}')
-        if not trend_favors and trend!='MIXED':
-            reasons.append('Pre-contract trend opposes favored side')
-        if seconds<MIN_ENTRY_SECONDS:
-            reasons.append('Too close to expiration for a new entry')
-        elif confidence=='LOW HEURISTIC':
-            reasons.append('Cushion/reversal evidence is not strong enough')
-        else:
-            ask=asks[favored]
-            bid=bids[favored]
-            if ask is None or bid is None or ask<bid:
-                reasons.append('No reliable tradable bid/ask quote')
-            elif ask>=MAX_ENTRY_ASK:
-                reasons.append(f'{favored} ask {ask*100:.0f}¢: limited gross payout room')
-            elif ask-bid>.08:
-                reasons.append('Spread too wide for an entry alert')
-            else:
-                # This is not a probability-vs-price edge claim; price is a hard guardrail only.
-                decision=f'ENTER {favored}'
-                reasons.append(f'{favored} ask {ask*100:.1f}¢ (fees not included)')
-    return {'ticker':m['ticker'],'at':now,'seconds':seconds,'btc':brti,'kraken':btc,'source':'BRTI' if brti is not None else 'UNAVAILABLE','target':target,
-            'distance':distance,'favored':favored,'trend':trend,'delta1':delta1,'delta3':delta3,
-            'volatility':typical_range,'confidence':confidence,'decision':decision,
-            'reason':'; '.join(reasons),'bids':bids,'asks':asks}
+        reasons.append('Mixed directional evidence')
+    indicators={'ema5':round(e5,2),'ema13':round(e13,2),'rsi14':round(r,1),
+                'vwap15':round(vwap,2),'vol_ratio':round(vol_ratio,2),
+                'support15':round(support,2),'resistance15':round(resistance,2),
+                'momentum1':round(delta1,2),'momentum3':round(delta3,2),
+                'momentum5':round(btc-closes[-5],2),'momentum15':round(btc-closes[-15],2)}
+    return {'ticker':m['ticker'],'at':now,'seconds':seconds,'btc':brti,'kraken':btc,
+            'source':'BRTI' if brti is not None else 'UNAVAILABLE','target':target,
+            'distance':distance,'favored':favored,'trend':trend,'delta1':delta1,
+            'delta3':delta3,'volatility':typical_range,'confidence':confidence,
+            'decision':decision,'reason':'; '.join(reasons),'bids':bids,'asks':asks,
+            'predicted':side,'score':score,'multiplier':multiple,'indicators':indicators}
+
+def record_v53(a):
+    # First WATCH and first PAPER BUY per side per contract; immutable first-call record.
+    if a['source']!='BRTI' or a['decision']=='WAIT':return
+    stage='PAPER_BUY' if a['decision'].startswith('PAPER BUY') else 'WATCH'
+    side=a['predicted']
+    with connect() as c:
+        c.execute('''INSERT OR IGNORE INTO v53_opportunities
+          (ticker,side,captured_at,seconds_left,stage,ask,multiplier,score,brti,target,distance,indicators)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+          (a['ticker'],side,a['at'],a['seconds'],stage,a['asks'][side],a['multiplier'],
+           a['score'],a['btc'],a['target'],a['distance'],json.dumps(a['indicators'])))
 
 def record(a):
     with connect() as c:
@@ -275,7 +312,7 @@ def record(a):
           (a['at'],a['ticker'],a['seconds'],a['btc'],a['target'],a['distance'],
            a['bids']['UP'],a['asks']['UP'],a['bids']['DOWN'],a['asks']['DOWN'],
            a['trend'],a['delta1'],a['delta3'],a['volatility'],a['favored'],
-           a['confidence'],a['decision'],a['reason'],'5.1-BRTI'))
+           a['confidence'],a['decision'],a['reason'],'5.3-RESEARCH'))
         if a['decision'].startswith('ENTER '):
             side=a['decision'].split()[-1]
             c.execute('''INSERT OR IGNORE INTO settlement_calls
@@ -330,6 +367,7 @@ def grade_settlements():
         pending=c.execute('''SELECT ticker FROM (
             SELECT ticker FROM settlement_calls WHERE result='PENDING'
             UNION SELECT ticker FROM settlement_predictions WHERE grade='PENDING'
+            UNION SELECT ticker FROM v53_opportunities WHERE grade='PENDING'
         ) ORDER BY ticker LIMIT ?''',(GRADE_BATCH,)).fetchall()
     verified_now=0
     for row in pending:
@@ -346,6 +384,7 @@ def grade_settlements():
             if outcome=='UNGRADABLE':
                 c.execute("UPDATE settlement_calls SET result='UNGRADABLE',result_source='Kalshi market result' WHERE ticker=? AND result='PENDING'",(ticker,))
                 c.execute("UPDATE settlement_predictions SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
+                c.execute("UPDATE v53_opportunities SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 continue
             c.execute('''INSERT INTO settlement_results(ticker,settled_side,source,recorded_at,verified)
                 VALUES (?,?,?,?,1) ON CONFLICT(ticker) DO UPDATE SET
@@ -360,6 +399,7 @@ def grade_settlements():
                 grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
                 official_side=?,graded_at=? WHERE ticker=? AND grade='PENDING' ''',
                 (outcome,outcome,now,ticker))
+            c.execute('''UPDATE v53_opportunities SET grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END, official_side=?, graded_at=? WHERE ticker=? AND grade='PENDING' ''',(outcome,outcome,now,ticker))
             verified_now+=1
     if verified_now:
         LOG.info('Official outcomes newly verified: %d',verified_now)
@@ -372,6 +412,7 @@ def grade_summary():
         calls=c.execute("SELECT result,COUNT(*) n FROM settlement_calls GROUP BY result").fetchall()
         predictions=c.execute("SELECT grade,COUNT(*) n FROM settlement_predictions GROUP BY grade").fetchall()
         verified=c.execute('SELECT COUNT(*) FROM settlement_results WHERE verified=1').fetchone()[0]
+        v53=c.execute("SELECT stage,grade,COUNT(*) n FROM v53_opportunities GROUP BY stage,grade").fetchall()
         returns=c.execute("SELECT ask,result FROM settlement_calls WHERE result IN ('WIN','LOSS') AND ask IS NOT NULL AND ask>0 AND ask<1").fetchall()
     call_counts={r['result']:r['n'] for r in calls}
     pred_counts={r['grade']:r['n'] for r in predictions}
@@ -381,10 +422,13 @@ def grade_summary():
     # Illustrative payoff per one contract at the recorded ask; excludes fees,
     # slippage, missed fills, and market impact. Not realized profit.
     gross=sum((1-r['ask']) if r['result']=='WIN' else -r['ask'] for r in returns)
+    research={(x['stage'],x['grade']):x['n'] for x in v53}
+    bw=research.get(('PAPER_BUY','WIN'),0);bl=research.get(('PAPER_BUY','LOSS'),0)
     return (f'📊 KEKE REPORT CARD\n'
             f'Contracts {contracts} • Snapshots {observations} • Official results {verified}\n'
             f'🚨 ENTER: {cw}W / {cl}L • {pct(cw,cl)} • pending {call_counts.get("PENDING",0)}\n'
             f'🔎 EARLY LEAN: {pw}W / {pl}L • {pct(pw,pl)} • pending {pred_counts.get("PENDING",0)}\n'
+            f'🧪 V5.3 PAPER: {bw}W / {bl}L • {pct(bw,bl)} • pending {research.get(("PAPER_BUY","PENDING"),0)}\n'
             f'Illustrative ENTER gross: ${gross:+.2f} across {len(returns)} graded calls (1 contract each; NO fees/fills)\n'
             'Official outcomes only • No real trades placed')
 
@@ -411,20 +455,19 @@ def ask_text(x): return f'{x*100:.1f}¢' if x is not None else 'n/a'
 
 def format_read(a, headline=None):
     mm,ss=divmod(max(0,int(a['seconds'])),60)
-    if a.get('source')!='BRTI':
-        return f'⚪ WAIT — BRTI unavailable\n⏱ {mm}:{ss:02d} | No verified settlement read\nKraken trend {a.get("trend","?")} (reference only)'
-    side=a.get('favored') or 'EVEN'
-    d=a.get('distance')
-    direction='above' if d is not None and d>=0 else 'below'
+    if a['source']!='BRTI':return f'⚪ WAIT | {mm}:{ss:02d}\nBRTI unavailable • No prediction'
+    side=a['predicted'];ask=a['asks'].get(side)
+    mult=f'{1/ask:.2f}×' if ask and ask>0 else 'n/a'
+    icon='🟢' if side=='UP' else '🔴'
     decision=a['decision']
-    if decision.startswith('ENTER '):
-        first=f'{"🟢" if side=="UP" else "🔴"} {decision} (heuristic)'
+    if decision.startswith('PAPER BUY'):
+        label=f'{icon} PAPER BUY {side} • {mult}'
+    elif decision.startswith('WATCH'):
+        label=f'👀 WATCH {side} • {mult}'
     else:
-        first=f'🏁 {side} AHEAD | 🟡 BUY: WAIT'
-    return (f'{first}\n'
-            f'⏱ {mm}:{ss:02d} | BRTI ${abs(d):,.0f} {direction} target\n'
-            f'{side} {ask_text(a["asks"].get(side)) if side in a["asks"] else "n/a"} • Trend {a.get("trend","?")} (Kraken)\n'
-            '⚠️ Live index ≠ final 60s average')
+        label=f'🟡 WAIT • Lean {side} • {mult}'
+    lead=f'{a["favored"]} ahead' if a['favored'] else 'Even'
+    return f'{label}\n⏱ {mm}:{ss:02d} | {lead} • score {a["score"]:+.1f}\n🧪 Unvalidated • No automatic trades'
 
 def safe_shape(value, depth=0):
     """Show only JSON key names and types; never values or array contents."""
@@ -518,29 +561,22 @@ def initialize_telegram():
 
 def maybe_alert(a,new_contract):
     if not state['enabled']:return
-    now=time.time()
-    action=a['decision']
+    now=time.time();action=a['decision']
     if new_contract:
-        send(format_read(a,'🆕 NEW BTC 15-MIN CONTRACT — EARLY READ'))
-        state['last_alert']=action
-        state['last_sent']=now
-        return
-    # Send meaningful changes promptly; don't spam repeated WAIT/ENTER calls.
+        send(format_read(a));state['last_alert']=action;state['last_sent']=now;return
     if action!=state['last_alert']:
-        if action.startswith('ENTER ') or (state['last_alert'] or '').startswith('ENTER '):
-            send(format_read(a,'🚨 SETTLEMENT THESIS UPDATE'))
-            state['last_sent']=now
-        elif now-state['last_sent']>=ALERT_COOLDOWN:
-            send(format_read(a,'🔄 SETTLEMENT READ CHANGED'))
-            state['last_sent']=now
+        if action.startswith('PAPER BUY') or (state['last_alert'] or '').startswith('PAPER BUY'):
+            send(format_read(a));state['last_sent']=now
+        elif action.startswith('WATCH') and now-state['last_sent']>=ALERT_COOLDOWN:
+            send(format_read(a));state['last_sent']=now
         state['last_alert']=action
 
 def main():
     init_db()
     initialize_telegram()
-    LOG.info('KeKe V5.2 BRTI Settlement Tracker starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.3 Early Settlement Research starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.2 BRTI settlement tracker online. '
+    send('🧠 KeKe V5.3 early-settlement research online. '
          'BRTI for target distance; Kraken for momentum. Persistent /data database. '
          'Automatic official-result grading active. No trades. /stats' )
     while True:
@@ -567,6 +603,7 @@ def main():
                 a=assessment(market,btc,candles,brti)
                 record(a)
                 record_early_prediction(a)
+                record_v53(a)
                 new=state['ticker']!=a['ticker']
                 if new:
                     state['ticker']=a['ticker']

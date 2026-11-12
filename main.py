@@ -164,32 +164,31 @@ def brti_raw():
     return obj
 
 def brti_live():
-    """Parse a verified live tick; never use unrecognized data for calls."""
+    """Read the freshest validated BRTI tick from Kalshi data.payload."""
     obj=brti_raw()
-    # CF Benchmarks latest-values passthrough documented shape.
-    payload=obj.get('payload')
-    candidates=[]
-    if isinstance(payload,dict):
-        latest=payload.get('latest_values')
-        if isinstance(latest,dict):candidates.append(latest.get('BRTI'))
-        if payload.get('id')=='BRTI':candidates.append(payload)
-        if isinstance(payload.get('BRTI'),dict):candidates.append(payload['BRTI'])
-    if isinstance(obj.get('latest_values'),dict):candidates.append(obj['latest_values'].get('BRTI'))
-    if obj.get('id')=='BRTI':candidates.append(obj)
-    if isinstance(obj.get('BRTI'),dict):candidates.append(obj['BRTI'])
-    # Some passthrough endpoints wrap the latest tick in a list.
-    if isinstance(payload,list):candidates.extend(x for x in payload if isinstance(x,dict) and x.get('id')=='BRTI')
-    for item in candidates:
-        if not isinstance(item,dict):continue
+    data=obj.get('data')
+    payload=data.get('payload') if isinstance(data,dict) else None
+    if not isinstance(payload,list) or not payload:
+        raise ValueError('BRTI data.payload missing or empty')
+    now=time.time()
+    valid=[]
+    for item in payload:
+        if not isinstance(item,dict) or item.get('repeatOfPreviousValue') is True:
+            continue
         price=number(item.get('value'))
         stamp=number(item.get('time'))
-        if price is None or stamp is None or not 10000<price<1000000 or not math.isfinite(price):continue
+        if price is None or stamp is None or not math.isfinite(price) or not math.isfinite(stamp):
+            continue
+        if not 10000 < price < 1000000:
+            continue
         stamp_seconds=stamp/1000 if stamp>1e11 else stamp
-        age=time.time()-stamp_seconds
-        if item.get('repeatOfPreviousValue') is True:raise ValueError('BRTI repeated previous value')
-        if not -5<=age<=BRTI_MAX_AGE:raise ValueError(f'BRTI stale ({age:.0f}s)')
-        return price,stamp_seconds
-    raise ValueError('Unrecognized BRTI response shape (no verified value/time)')
+        age=now-stamp_seconds
+        if -5<=age<=BRTI_MAX_AGE:
+            valid.append((stamp_seconds,price))
+    if not valid:
+        raise ValueError('No fresh valid BRTI tick (time/value validation failed)')
+    stamp_seconds,price=max(valid,key=lambda x:x[0])
+    return price,stamp_seconds
 
 def assessment(m,btc,candles,brti=None):
     now=int(time.time())

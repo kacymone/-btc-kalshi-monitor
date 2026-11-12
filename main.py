@@ -2,6 +2,7 @@ import os
 import time
 import sqlite3
 import requests
+import json
 from datetime import datetime, timezone
 
 # =========================================================
@@ -694,23 +695,63 @@ def telegram_url(method):
     return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
 
 
-def send_telegram(message):
+TELEGRAM_KEYBOARD = {
+    "keyboard": [
+        [{"text": "👀 STATUS"}, {"text": "📊 STATS"}],
+        [{"text": "🕒 LAST"}, {"text": "🧠 MARKET READ"}],
+        [{"text": "🟢 START"}, {"text": "🔴 STOP"}],
+    ],
+    "resize_keyboard": True,
+    "is_persistent": True,
+    "input_field_placeholder": "Tap a watcher control…",
+}
+
+
+def send_telegram(message, show_keyboard=True):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram variables missing.")
         return
 
     try:
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+        }
+        if show_keyboard:
+            data["reply_markup"] = json.dumps(TELEGRAM_KEYBOARD)
+
         response = requests.post(
             telegram_url("sendMessage"),
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message
-            },
+            data=data,
             timeout=10
         )
         response.raise_for_status()
     except Exception as e:
         print("Telegram send error:", e)
+
+
+def register_telegram_commands():
+    """Populate Telegram's built-in slash-command menu as a backup to the tap buttons."""
+    if not TELEGRAM_TOKEN:
+        return
+
+    commands = [
+        {"command": "start", "description": "Start the watcher"},
+        {"command": "stop", "description": "Stop the watcher"},
+        {"command": "status", "description": "Current market read"},
+        {"command": "stats", "description": "Performance stats"},
+        {"command": "last", "description": "Last ENTER call"},
+    ]
+
+    try:
+        response = requests.post(
+            telegram_url("setMyCommands"),
+            data={"commands": json.dumps(commands)},
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        print("Telegram command-menu registration error:", e)
 
 
 def initialize_telegram_offset():
@@ -778,6 +819,17 @@ def check_telegram_commands():
                 continue
 
             text = message.get("text", "").strip().lower()
+
+            # Persistent keyboard buttons are shortcuts for the same slash commands.
+            button_commands = {
+                "🔴 stop": "/stop",
+                "🟢 start": "/start",
+                "👀 status": "/status",
+                "📊 stats": "/stats",
+                "🕒 last": "/last",
+                "🧠 market read": "/status",
+            }
+            text = button_commands.get(text, text)
 
             if text.startswith("/stop"):
                 watcher_enabled = False
@@ -2401,6 +2453,7 @@ def main():
 
     init_db()
     load_logged_signal_keys()
+    register_telegram_commands()
     initialize_telegram_offset()
 
     send_telegram(

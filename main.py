@@ -17,7 +17,10 @@ TOKEN=os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT=os.getenv('TELEGRAM_CHAT_ID')
 DATA_DIR=os.getenv('DATA_DIR','/data')
 DB_NAME='kate_btc_watcher.db'
-CHECK_EVERY=10
+CHECK_EVERY=5
+HEARTBEAT_SECONDS=60
+THREAT_SIGNAL=0.20
+THREAT_COOLDOWN=90
 GRADE_EVERY=60
 GRADE_BATCH=12
 MAX_DATA_AGE=75
@@ -32,7 +35,9 @@ BRTI_MAX_AGE=30
 session=requests.Session()
 state={'ticker':None,'last_alert':None,'last_sent':0,'last_side':None,'last_read':None,
        'enabled':True,'offset':None,'entry_side':None,'entry_at':None,'last_btc':None,
-       'last_btc_at':None,'last_poll':0,'last_grade':0}
+       'last_btc_at':None,'last_poll':0,'last_grade':0,
+       'heartbeat_ticker':None,'heartbeat_at':0,'threat_ticker':None,
+       'threat_side':None,'threat_at':0}
 
 # Do not silently fall back to an ephemeral disk after a volume has been attached.
 def database_path():
@@ -305,7 +310,9 @@ def assessment(m,btc,candles,brti=None):
             'distance':distance,'favored':favored,'trend':trend,'delta1':delta1,
             'delta3':delta3,'volatility':typical_range,'confidence':confidence,
             'decision':decision,'reason':'; '.join(reasons),'bids':bids,'asks':asks,
-            'predicted':side,'score':score,'multiplier':multiple,'indicators':indicators}
+            'predicted':side,'score':score,'multiplier':multiple,'indicators':indicators,
+            'brti_stamp':state.get('current_brti_stamp'),
+            'market_close':m.get('close_time')}
 
 def record_v53(a):
     # First WATCH and first PAPER BUY per side per contract; immutable first-call record.
@@ -527,10 +534,14 @@ def format_read(a, headline=None):
     strength=f'{abs(signal):.2f}' if signal is not None else 'n/a'
     delta=a.get('distance')
     distance=f'{delta:+,.2f}' if delta is not None else 'n/a'
+    stamp=a.get('brti_stamp')
+    feed_age=f'{max(0,time.time()-stamp):.1f}s' if stamp is not None else 'unknown'
+    updated=datetime.fromtimestamp(a.get('at',time.time()),timezone.utc).strftime('%H:%M:%S UTC')
     return (f'{label}\n🎯 Target: {target}\n'
             f'⏱ {mm}:{ss:02d} • {side or "NO PICK"} {mult}\n'
             f'📍 BRTI vs target: ${distance} • Signal {strength}\n'
             f'Latest evidence: {forecast or "unavailable"} • Experimental, not a probability\n'
+            f'📡 BRTI age: {feed_age} • Read: {updated}\n'
             'Manual trades only')
 
 def safe_shape(value, depth=0):
@@ -622,6 +633,33 @@ def export_research():
 def send_stats():
     send(grade_summary())
 
+def fresh_status():
+    """Fetch a new market and BRTI tick for STATUS; do not change prediction state."""
+    try:
+        market=get_market()
+        if not market:
+            return '👀 No currently open BTC 15-minute contract.'
+        btc,candles=kraken_data()
+        if time.time()-(candles[-1]['time']+60)>MAX_DATA_AGE:
+            return '⚠️ Kraken candle is stale. No reliable fresh STATUS available.'
+        brti,stamp=brti_live()
+        state['current_brti_stamp']=stamp
+        a=assessment(market,btc,candles,brti)
+        # Keep the current stored thesis, without triggering any prediction event.
+        if state.get('v56_ticker')==a['ticker']:
+            side=state.get('v56',{}).get('side')
+        else:
+            side=load_v56(a['ticker'])['side']
+        a['v56_side']=side
+        sig=settlement_signal(a)
+        a['v56_signal']=sig
+        a['v56_candidate']='UP' if sig is not None and sig>0 else ('DOWN' if sig is not None and sig<0 else None)
+        state['last_read']=a
+        return format_read(a)
+    except Exception as exc:
+        LOG.warning('Fresh STATUS failed: %s',type(exc).__name__)
+        return '⚠️ Could not retrieve a fresh market reading. Please retry; no stale price is being presented as live.'
+
 def telegram_commands():
     if not TOKEN or not CHAT:return
     try:
@@ -640,7 +678,7 @@ def telegram_commands():
             elif cmd.startswith('/start'):
                 state['enabled']=True;send('🟢 Settlement alerts ON.')
             elif cmd.startswith('/status'):
-                send(format_read(state['last_read']) if state['last_read'] else 'Waiting for fresh market data.')
+                send(fresh_status())
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/last'):send_last()
             elif cmd.startswith('/brti'):run_brti_test()
@@ -656,7 +694,7 @@ def initialize_telegram():
         tg('setMyCommands',commands=json.dumps([
             {'command':'start','description':'Resume settlement alerts'},
             {'command':'stop','description':'Pause alerts; keep recording'},
-            {'command':'status','description':'Latest settlement read'},
+            {'command':'status','description':'Fetch fresh settlement read'},
             {'command':'stats','description':'Settlement research counts'},
             {'command':'last','description':'Last settlement ENTER'},
             {'command':'brti','description':'Test read-only Kalshi BRTI access'},
@@ -727,6 +765,40 @@ def process_v56(a,new_contract):
         record_v56(a,'REVERSAL',candidate,old,'Strong opposite settlement signal')
         if state['enabled']:send(format_read(a,f'🔄 PREDICTION REVERSED: {old} → {candidate}'))
 
+def proactive_updates(a, new_contract):
+    """Send a new-contract notice, at-most-once-per-minute heartbeat, and meaningful risk alert."""
+    if not state['enabled'] or a['source']!='BRTI':
+        return
+    ticker=a['ticker']; now=time.time()
+    if new_contract or state.get('heartbeat_ticker')!=ticker:
+        state['heartbeat_ticker']=ticker
+        state['heartbeat_at']=now
+        state['threat_ticker']=ticker
+        state['threat_side']=None
+        state['threat_at']=0
+        send(format_read(a,'🆕 NEW CONTRACT • Monitoring'))
+        return
+    side=a.get('v56_side')
+    signal=a.get('v56_signal')
+    candidate=a.get('v56_candidate')
+    # Warn only when contrary evidence has meaningful strength; avoid repeating
+    # the same warning until evidence recovers or the thesis changes.
+    threatened=(side in ('UP','DOWN') and candidate in ('UP','DOWN')
+                and candidate!=side and signal is not None
+                and abs(signal)>=THREAT_SIGNAL)
+    if not threatened:
+        state['threat_side']=None
+    elif (state.get('threat_side')!=side and
+          now-state.get('threat_at',0)>=THREAT_COOLDOWN):
+        state['threat_side']=side
+        state['threat_at']=now
+        state['heartbeat_at']=now
+        send(format_read(a,f'⚠️ {side} PICK AT RISK • Evidence favors {candidate}'))
+        return
+    if now-state.get('heartbeat_at',0)>=HEARTBEAT_SECONDS:
+        state['heartbeat_at']=now
+        send(format_read(a,'📡 LIVE UPDATE • '+(side or 'ANALYZING')))
+
 def send_last():
     with connect() as c:
         row=c.execute("SELECT * FROM keke_v56_forecasts WHERE event IN ('INITIAL','REVERSAL') ORDER BY id DESC LIMIT 1").fetchone()
@@ -739,7 +811,7 @@ def main():
     initialize_telegram()
     LOG.info('KeKe V5.6 Settlement Forecast starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.6 settlement forecast alerts online. '
+    send('🧠 KeKe V5.6 live monitoring patch online. '
          'BRTI for target distance; Kraken for momentum. Persistent /data database. '
          'Automatic official-result grading active. No trades. /stats' )
     while True:
@@ -757,9 +829,11 @@ def main():
                     raise ValueError('Stale completed Kraken candle; skipping decisions')
                 try:
                     brti,brti_stamp=brti_live()
+                    state['current_brti_stamp']=brti_stamp
                     state['brti_error_at']=0
                 except Exception as exc:
                     brti=None
+                    state['current_brti_stamp']=None
                     if time.time()-state.get('brti_error_at',0)>600:
                         LOG.warning('BRTI unavailable: %s',str(exc)[:160])
                         state['brti_error_at']=time.time()
@@ -772,7 +846,11 @@ def main():
                     state['ticker']=a['ticker']
                     state['last_alert']=None
                     state['entry_side']=None
+                if new:
+                    proactive_updates(a,True)
                 process_v56(a,new)
+                if not new:
+                    proactive_updates(a,False)
                 state['last_read']=a
                 LOG.info('%s %s BRTI %s Kraken %.2f target %s',a['ticker'],a['decision'],brti,btc,a['target'])
             else:LOG.info('No active BTC 15m contract')

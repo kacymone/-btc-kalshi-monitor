@@ -73,7 +73,7 @@ formation_state = {
 active_position = {
     "ticker": None, "side": None, "entry_price": None, "entered_at": None,
     "entry_btc": None, "entry_target_distance": None, "best_bid": None,
-    "last_status": None, "last_sent_at": 0, "source_setup": None
+    "last_status": None, "last_sent_at": 0, "source_setup": None, "peak_profit_cents": None
 }
 
 watcher_enabled = True
@@ -870,6 +870,9 @@ def synthesize_market_briefing(ticker, analysis):
     trajectory = memory.get("trajectory", "FLAT")
     w60 = memory.get("w60", {})
     distance = analysis.get("target_distance")
+    live_price = analysis.get("live_btc_price") or analysis.get("btc_price")
+    if live_price is not None and analysis.get("contract_target") is not None:
+        distance = float(live_price) - float(analysis["contract_target"])
     seconds = int(analysis.get("seconds_left") or 0)
     side = settlement.get("side", "UNKNOWN")
     ask = analysis.get("yes_ask") if side == "UP" else analysis.get("no_ask")
@@ -943,7 +946,10 @@ def send_status():
     trigger_text = "\n".join("• " + t for t in briefing["triggers"]) or "• Levels unavailable"
     position_text = ""
     if active_position.get("ticker") == ticker:
-        position_text = f"\n💰 Monitored bot-call position: {active_position.get('side')} (not verified as your actual trade)."
+        position_read = trader_position_read({"ticker": ticker}, analysis, None)
+        position_text = (f"\n💰 MONITORED SCALP: {position_read['status']}\n"
+                         f"Peak sellable profit: {active_position.get('peak_profit_cents')}¢\n"
+                         "This is a bot-call simulation, not a verified personal trade.") if position_read else ""
     send_telegram(
         "👀 LIVE CONTRACT BRIEFING\n"
         f"{freshness}\n"
@@ -2191,7 +2197,7 @@ def clear_active_position():
     active_position.update({
         "ticker": None, "side": None, "entry_price": None, "entered_at": None,
         "entry_btc": None, "entry_target_distance": None, "best_bid": None,
-        "last_status": None, "last_sent_at": 0, "source_setup": None
+        "last_status": None, "last_sent_at": 0, "source_setup": None, "peak_profit_cents": None
     })
 
 
@@ -2209,7 +2215,7 @@ def activate_position_from_enter(ticker, analysis):
         "ticker": ticker, "side": side, "entry_price": float(analysis["entry_price"]),
         "entered_at": int(time.time()), "entry_btc": analysis.get("live_btc_price") or analysis.get("btc_price"),
         "entry_target_distance": analysis.get("target_distance"), "best_bid": bid,
-        "last_status": None, "last_sent_at": 0, "source_setup": analysis.get("setup")
+        "last_status": None, "last_sent_at": 0, "source_setup": analysis.get("setup"), "peak_profit_cents": None
     })
     return True
 
@@ -2308,6 +2314,18 @@ def trader_position_read(market, analysis, shadow):
     if bid is not None and entry is not None:
         scalp_cents = round((float(bid) - float(entry)) * 100, 1)
 
+    # Scalp-first, symmetric for UP and DOWN. Use SELLABLE BID, not ask.
+    # Peak tracking is an alert aid, not an automatic trade or guaranteed fill.
+    peak = active_position.get("peak_profit_cents")
+    if scalp_cents is not None:
+        peak = scalp_cents if peak is None else max(float(peak), scalp_cents)
+        active_position["peak_profit_cents"] = peak
+    giveback = max(0.0, float(peak) - scalp_cents) if peak is not None and scalp_cents is not None else 0.0
+    profitable_giveback = (peak is not None and peak >= 5 and
+                           giveback >= max(3.0, peak * 0.30))
+    # Meaningful deterioration rather than a single contrary candle.
+    reversal_developing = (opp_score >= own_score + 2 and
+                           (side_momentum < -15 or side_cushion_change < -15))
     target_lost = signed_cushion is not None and signed_cushion <= 0
     hard_opposition = opp_score >= max(5, own_score + 3)
     sustained_against = side_momentum < -25 and side_cushion_change < -20
@@ -2316,7 +2334,9 @@ def trader_position_read(market, analysis, shadow):
 
     if (target_lost and (hard_opposition or sustained_against)) or structure_broken:
         status = "EXIT"
-    elif hard_opposition or sustained_against or settle_side != side and settle_strength in ("STRONG", "VERY STRONG") and side_momentum < -15:
+    elif profitable_giveback or (scalp_cents is not None and scalp_cents >= 3 and reversal_developing):
+        status = "TAKE_PROFIT"
+    elif hard_opposition or sustained_against or (settle_side != side and settle_strength in ("STRONG", "VERY STRONG") and side_momentum < -15):
         status = "PROTECT"
     else:
         status = "HOLD"
@@ -2342,6 +2362,9 @@ def trader_position_read(market, analysis, shadow):
     if status == "EXIT":
         header = f"🚨 EXIT {side}"
         action = "The original thesis is materially invalidated."
+    elif status == "TAKE_PROFIT":
+        header = f"💰 CONSIDER TAKING {side} SCALP PROFIT"
+        action = "Sellable profit has pulled back from its peak or reversal pressure is building. Consider locking in gains; evaluate the opposite side as a NEW, independent setup."
     elif status == "PROTECT":
         header = f"⚠️ {side} WEAKENING — PROTECT PROFIT"
         action = "Opposing pressure is becoming meaningful; don't treat the original ENTER as unchanged."
@@ -2360,6 +2383,8 @@ def trader_position_read(market, analysis, shadow):
             f"🎯 Target cushion: {cushion_text}\n"
             f"📈 Momentum: {momentum_text}\n\n"
             f"💰 Scalp read: {scalp_read}\n"
+            f"📊 Peak scalp: {f'{peak:+.1f}¢' if peak is not None else 'n/a'} | Giveback: {giveback:.1f}¢\n"
+            f"🔄 Opposite setup: {'DEVELOPING — evaluate separately' if reversal_developing else 'not independently confirmed'}\n"
             f"⏳ Settlement read: {settlement} | reversal difficulty {settlement_market.get('reversal_difficulty','UNKNOWN')}\n"
             f"🧠 Contract thesis: {memory.get('thesis','NEUTRAL')} — {memory.get('strength','WEAK')} | {memory.get('trajectory','FLAT')}\n\n"
             f"{action}"
@@ -2558,7 +2583,7 @@ def main():
     global last_market
     global last_analysis
 
-    print("Kate's BTC Watcher V4.8 Integrated Quiet Read starting...")
+    print("Kate's BTC Watcher V4.9 Scalp-First Dual Read starting...")
     print("Stats database:", DB_PATH)
 
     init_db()
@@ -2567,7 +2592,7 @@ def main():
     initialize_telegram_offset()
 
     send_telegram(
-        "🧠 KATE'S BTC WATCHER V4.8 INTEGRATED QUIET READ IS ONLINE.\n\n"
+        "🧠 KATE'S BTC WATCHER V4.9 SCALP-FIRST DUAL READ IS ONLINE.\n\n"
         "Commands:\n"
         "/start — turn alerts ON\n"
         "/stop — turn alerts OFF\n"

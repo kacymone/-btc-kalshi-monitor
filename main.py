@@ -905,12 +905,13 @@ def synthesize_market_briefing(ticker, analysis):
     else:
         action = f"WATCH {thesis}: thesis is developing, but this briefing alone is NOT an ENTER call."
     triggers = []
-    if analysis.get("support") is not None:
-        triggers.append(f"Support ${analysis['support']:,.2f}: a sustained break weakens UP")
-    if analysis.get("resistance") is not None:
-        triggers.append(f"Resistance ${analysis['resistance']:,.2f}: a sustained reclaim strengthens UP")
     if analysis.get("contract_target") is not None:
-        triggers.append(f"Target ${analysis['contract_target']:,.2f}: watch crosses and failed reclaims")
+        triggers.append(f"Target ${analysis['contract_target']:,.2f}: watch crosses, holds and failed reclaims")
+    btc_now = analysis.get("live_btc_price") or analysis.get("btc_price")
+    for key, label in (("support", "Support"), ("resistance", "Resistance")):
+        level = analysis.get(key)
+        if level is not None and btc_now is not None and abs(level - btc_now) <= 150:
+            triggers.append(f"{label} ${level:,.2f}: monitor a sustained test, not one tick")
     if w60.get("samples", 0) < 2:
         interpretation += " Recent-window evidence is insufficient."
     return {"memory": memory, "settlement": settlement, "observations": observations,
@@ -920,10 +921,10 @@ def synthesize_market_briefing(ticker, analysis):
 
 def send_status():
     if not watcher_enabled:
-        send_telegram("💤 WATCHER STATUS: OFF\\n\\nSend /start when you're ready.")
+        send_telegram("💤 WATCHER STATUS: OFF\n\nSend /start when you're ready.")
         return
     if not last_analysis or not last_market:
-        send_telegram("🟢 WATCHER STATUS: ON\\n\\nWaiting for a current market snapshot.")
+        send_telegram("🟢 WATCHER STATUS: ON\n\nWaiting for a current market snapshot.")
         return
     analysis = last_analysis
     ticker = last_market
@@ -936,28 +937,28 @@ def send_status():
     freshness = f"Data age: {age}s" if age is not None else "Data freshness: UNKNOWN"
     if age is None or age > max(45, CHECK_EVERY * 3):
         freshness += " ⚠️ STALE — do not act on this briefing"
-    observations = "\\n".join("• " + item for item in briefing["observations"]) or "• Not enough history yet"
+    observations = "\n".join("• " + item for item in briefing["observations"]) or "• Not enough history yet"
     dist = analysis.get("target_distance")
     cushion = f"${abs(dist):,.2f} {'above' if dist >= 0 else 'below'} target" if dist is not None else "unknown"
     trigger_text = "\n".join("• " + t for t in briefing["triggers"]) or "• Levels unavailable"
     position_text = ""
     if active_position.get("ticker") == ticker:
-        position_text = f"\\n💰 Monitored bot-call position: {active_position.get('side')} (not verified as your actual trade)."
+        position_text = f"\n💰 Monitored bot-call position: {active_position.get('side')} (not verified as your actual trade)."
     send_telegram(
-        "👀 LIVE CONTRACT BRIEFING\\n"
-        f"{freshness}\\n"
-        f"⏱ {seconds//60}:{seconds%60:02d} left\\n\\n"
-        f"🧠 CONTRACT THESIS: {memory.get('thesis', 'NEUTRAL')} — {memory.get('strength', 'WEAK')}\\n"
-        f"{briefing['interpretation']}\\n\\n"
-        f"📍 OBSERVED\\n{observations}\\n"
-        f"BTC: ${analysis.get('live_btc_price') or analysis.get('btc_price') or 0:,.2f}\\n"
-        f"UP ask: {analysis.get('yes_ask')} | DOWN ask: {analysis.get('no_ask')}\\n\\n"
-        f"🏁 SETTLEMENT: {settlement.get('side')} — {settlement.get('strength')}\\n"
-        f"Cushion: {cushion}\\n"
-        f"Reversal difficulty: {settlement.get('reversal_difficulty')} (heuristic, uncalibrated)\\n\\n"
-        f"🎯 NEXT: {briefing['action']}\\n"
+        "👀 LIVE CONTRACT BRIEFING\n"
+        f"{freshness}\n"
+        f"⏱ {seconds//60}:{seconds%60:02d} left\n\n"
+        f"🧠 CONTRACT THESIS: {memory.get('thesis', 'NEUTRAL')} — {memory.get('strength', 'WEAK')}\n"
+        f"{briefing['interpretation']}\n\n"
+        f"📍 OBSERVED\n{observations}\n"
+        f"BTC: ${analysis.get('live_btc_price') or analysis.get('btc_price') or 0:,.2f}\n"
+        f"UP ask: {analysis.get('yes_ask')} | DOWN ask: {analysis.get('no_ask')}\n\n"
+        f"🏁 SETTLEMENT: {settlement.get('side')} — {settlement.get('strength')}\n"
+        f"Cushion: {cushion}\n"
+        f"Reversal difficulty: {settlement.get('reversal_difficulty')} (heuristic, uncalibrated)\n\n"
+        f"🎯 NEXT: {briefing['action']}\n"
         f"📍 WATCH LEVELS\n{trigger_text}\n"
-        f"Official entry signal: {analysis.get('action')}\\n"
+        f"Official entry signal: {analysis.get('action')}\n"
         f"{position_text}"
     )
 
@@ -1927,6 +1928,11 @@ def strong_promotion(shadow, analysis):
         return False
     if not opportunity_ok(analysis, direction):
         return False
+    shared = analysis.get("shared_briefing") or {}
+    mem = shared.get("memory") or {}
+    if (mem.get("strength") == "STRONG" and mem.get("thesis") in ("UP", "DOWN")
+            and mem.get("thesis") != direction and shadow.get("target_cross") != direction):
+        return False
     reasons = " ".join(shadow.get("reasons", [])).lower()
     # Require a meaningful trigger, not merely a pile of correlated candle points.
     trigger = (shadow.get("target_cross") == direction or
@@ -1934,6 +1940,23 @@ def strong_promotion(shadow, analysis):
                (direction == "UP" and shadow.get("target_delta") is not None and shadow["target_delta"] >= 8) or
                (direction == "DOWN" and shadow.get("target_delta") is not None and shadow["target_delta"] <= -8))
     return bool(trigger)
+
+
+# Contract-scoped alert memory; never affects historical snapshot recording.
+formation_notice_memory = {"ticker": None, "last_ready": {"UP": 0, "DOWN": 0},
+                           "fades": 0, "last_direction": None}
+READY_COOLDOWN_SECONDS = 60
+FADE_CONFIRM_SNAPSHOTS = 2
+
+def quiet_ready_notice(ticker, direction):
+    now = int(time.time())
+    if formation_notice_memory["ticker"] != ticker:
+        formation_notice_memory.update({"ticker": ticker, "last_ready": {"UP": 0, "DOWN": 0},
+                                        "fades": 0, "last_direction": None})
+    if now - formation_notice_memory["last_ready"].get(direction, 0) < READY_COOLDOWN_SECONDS:
+        return False
+    formation_notice_memory["last_ready"][direction] = now
+    return True
 
 
 def apply_fast_brain(market, analysis, shadow):
@@ -1954,16 +1977,24 @@ def apply_fast_brain(market, analysis, shadow):
         old_score = shadow.get("down_score" if old_dir == "DOWN" else "up_score", 0) if shadow else 0
         opp_score = shadow.get("up_score" if old_dir == "DOWN" else "down_score", 0) if shadow else 0
         if old_score < GET_READY_SCORE or opp_score >= old_score:
-            notices.append(f"⚠️ {old_dir} SETUP FADING\n\nEvidence lost its edge. Back to WATCH.")
+            formation_notice_memory["fades"] += 1
+        else:
+            formation_notice_memory["fades"] = 0
+        if formation_notice_memory["fades"] >= FADE_CONFIRM_SNAPSHOTS:
+            formation_notice_memory["fades"] = 0
+            # Quietly retire a transient formation. This is NOT a contract-thesis reversal.
+            # The state machine and database continue updating; no noisy Telegram fade alert.
             reset_formation(ticker)
 
+    if direction == old_dir:
+        formation_notice_memory["fades"] = 0
     if not direction:
         return notices
 
     if formation_state["direction"] is None:
         formation_state.update({"direction": direction, "stage": "GET_READY", "first_score": score,
                                 "peak_score": score, "started_at": int(time.time())})
-        if get_ready_actionable(analysis, direction):
+        if get_ready_actionable(analysis, direction) and quiet_ready_notice(ticker, direction):
             notices.append(build_shadow_message(analysis, shadow))
     elif formation_state["direction"] == direction:
         old_peak = formation_state["peak_score"]
@@ -2527,7 +2558,7 @@ def main():
     global last_market
     global last_analysis
 
-    print("Kate's BTC Watcher V4.7 Shared Trader Read starting...")
+    print("Kate's BTC Watcher V4.8 Integrated Quiet Read starting...")
     print("Stats database:", DB_PATH)
 
     init_db()
@@ -2536,7 +2567,7 @@ def main():
     initialize_telegram_offset()
 
     send_telegram(
-        "🧠 KATE'S BTC WATCHER V4.7 SHARED TRADER READ IS ONLINE.\n\n"
+        "🧠 KATE'S BTC WATCHER V4.8 INTEGRATED QUIET READ IS ONLINE.\n\n"
         "Commands:\n"
         "/start — turn alerts ON\n"
         "/stop — turn alerts OFF\n"

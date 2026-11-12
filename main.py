@@ -528,6 +528,7 @@ def tg(method,**data):
 
 KEYBOARD={'keyboard':[[{'text':'👀 STATUS'},{'text':'📊 STATS'}],
                       [{'text':'🕒 LAST'},{'text':'🧠 MARKET READ'}],
+                      [{'text':'💰 POSITION'}],
                       [{'text':'🟢 START'},{'text':'🔴 STOP'}]],
           'resize_keyboard':True,'is_persistent':True}
 
@@ -679,7 +680,7 @@ def fresh_status():
         a['v56_signal']=sig
         a['v56_candidate']='UP' if sig is not None and sig>0 else ('DOWN' if sig is not None and sig<0 else None)
         state['last_read']=a
-        return format_read(a)
+        return format_read(a)+dual_text(dual_read(a,candles))
     except Exception as exc:
         LOG.warning('Fresh STATUS failed: %s',type(exc).__name__)
         return '⚠️ Could not retrieve a fresh market reading. Please retry; no stale price is being presented as live.'
@@ -696,7 +697,7 @@ def telegram_commands():
             if str((msg.get('chat') or {}).get('id'))!=str(CHAT):continue
             cmd=str(msg.get('text') or '').strip().lower()
             cmd={'👀 status':'/status','🧠 market read':'/status','📊 stats':'/stats',
-                 '🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop'}.get(cmd,cmd)
+                 '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop'}.get(cmd,cmd)
             if cmd.startswith('/stop'):
                 state['enabled']=False;send('🔴 Alerts paused. Data collection continues. /start resumes alerts.')
             elif cmd.startswith('/start'):
@@ -704,6 +705,7 @@ def telegram_commands():
             elif cmd.startswith('/status'):
                 send(fresh_status())
             elif cmd.startswith('/stats'):send_stats()
+            elif cmd.startswith('/position'):send(portfolio_status())
             elif cmd.startswith('/last'):send_last()
             elif cmd.startswith('/brti'):run_brti_test()
             elif cmd == '/export':export_research()
@@ -722,7 +724,8 @@ def initialize_telegram():
             {'command':'stats','description':'Settlement research counts'},
             {'command':'last','description':'Last settlement ENTER'},
             {'command':'brti','description':'Test read-only Kalshi BRTI access'},
-            {'command':'export','description':'Download research CSV archive'}]))
+            {'command':'export','description':'Download research CSV archive'},
+            {'command':'position','description':'Current Kalshi BTC position'}]))
     except Exception:LOG.exception('Telegram setup error')
 
 # V5.6 uses BRTI distance relative to volatility and time to settlement.
@@ -787,6 +790,174 @@ def record_shadow(a):
                 (a['ticker'],checkpoint,a['at'],a['seconds'],side,score,reason,
                  a['asks'].get(side),a['btc'],a['target']))
 
+
+# V5.7 observational multi-timeframe and portfolio extension. GET requests only.
+PORTFOLIO_POLL_SECONDS=20
+POSITION_ALERT_COOLDOWN=180
+portfolio_state={'last_poll':0,'positions':{},'alert_at':{},'error_at':0}
+
+def authenticated_get(path,params=None):
+    key_id=os.getenv('KALSHI_API_KEY_ID','').strip()
+    pem=os.getenv('KALSHI_PRIVATE_KEY','').replace('\\n','\n').strip()
+    pem_path=os.getenv('KALSHI_PRIVATE_KEY_PATH','').strip()
+    if not key_id or not (pem or pem_path):
+        raise ValueError('Kalshi API credentials missing')
+    key_bytes=open(pem_path,'rb').read() if pem_path else pem.encode()
+    key=serialization.load_pem_private_key(key_bytes,password=None)
+    timestamp=str(int(time.time()*1000))
+    signed=(timestamp+'GET'+'/trade-api/v2'+path).encode()
+    if isinstance(key,ed25519.Ed25519PrivateKey):
+        sig=key.sign(signed)
+    else:
+        sig=key.sign(signed,padding.PSS(mgf=padding.MGF1(hashes.SHA256()),salt_length=padding.PSS.DIGEST_LENGTH),hashes.SHA256())
+    headers={'KALSHI-ACCESS-KEY':key_id,'KALSHI-ACCESS-TIMESTAMP':timestamp,
+             'KALSHI-ACCESS-SIGNATURE':base64.b64encode(sig).decode()}
+    r=session.get(BASE+path,params=params,headers=headers,timeout=10)
+    r.raise_for_status()
+    obj=r.json()
+    if not isinstance(obj,dict) or obj.get('error'):
+        raise ValueError('Invalid Kalshi portfolio response')
+    return obj
+
+def completed_timeframes(candles,minutes):
+    """UTC-aligned complete OHLCV bars only; incomplete buckets are excluded."""
+    if minutes==1:return list(candles)
+    width=minutes*60; buckets={}
+    for c in candles:
+        bucket=(int(c['time'])//width)*width
+        buckets.setdefault(bucket,[]).append(c)
+    out=[]
+    for t,rows in sorted(buckets.items()):
+        rows=sorted(rows,key=lambda x:x['time'])
+        if len(rows)!=minutes or any(int(row['time'])!=t+i*60 for i,row in enumerate(rows)):
+            continue
+        out.append({'time':t,'open':rows[0]['open'],'high':max(x['high'] for x in rows),
+                    'low':min(x['low'] for x in rows),'close':rows[-1]['close'],
+                    'volume':sum(x['volume'] for x in rows)})
+    return out
+
+def timeframe_signal(rows,live):
+    if len(rows)<4:return 'N/A',0
+    last=rows[-1];prev=rows[-2]
+    slope=last['close']-rows[-4]['close']
+    direction='UP' if slope>0 else ('DOWN' if slope<0 else 'FLAT')
+    # Simple structure confirmation: candle direction and closing trend must agree.
+    if direction=='UP' and last['close']<last['open'] and last['close']<prev['close']:
+        direction='MIXED'
+    elif direction=='DOWN' and last['close']>last['open'] and last['close']>prev['close']:
+        direction='MIXED'
+    return direction,slope
+
+def dual_read(a,candles):
+    frames={}
+    for minutes in (1,3,15):
+        rows=completed_timeframes(candles,minutes)
+        direction,slope=timeframe_signal(rows,a['kraken'])
+        frames[minutes]=direction
+    short,mid,long=frames[1],frames[3],frames[15]
+    if short in ('UP','DOWN') and short==mid:
+        scalp=short
+    else:
+        scalp='WAIT'
+    if long in ('UP','DOWN') and scalp not in ('WAIT',long):
+        label='COUNTERTREND / HIGH RISK'
+    elif scalp=='WAIT':
+        label='NO ENTRY: mixed or insufficient candles'
+    else:
+        label='WATCH ONLY: confirmation needed'
+    # No calibrated price forecast: this is a descriptive research reading.
+    return {'scalp':scalp,'frames':frames,'label':label}
+
+def dual_text(read):
+    f=read['frames']
+    return (f"\n⚡ SHORT-TERM WATCH: {read['scalp']} (not a buy call)"
+            f"\n📊 1m {f[1]} • 3m {f[3]} • 15m {f[15]}"
+            f"\n{read['label']}")
+
+def fill_price(fill,side):
+    # Kalshi fills use yes_price/no_price (cents) or *_price_dollars.
+    prefix='yes' if side=='UP' else 'no'
+    value=number(fill.get(prefix+'_price_dollars'))
+    if value is None:
+        cents=number(fill.get(prefix+'_price'))
+        value=cents/100 if cents is not None else None
+    return value if value is not None and 0<=value<=1 else None
+
+def get_open_position(m):
+    """Conservative: require current net quantity and matching BUY fills for basis."""
+    ticker=m['ticker']
+    data=authenticated_get('/portfolio/positions',{'ticker':ticker,'limit':100})
+    positions=data.get('market_positions')
+    if not isinstance(positions,list):raise ValueError('Portfolio positions response has no market_positions')
+    row=next((p for p in positions if p.get('ticker')==ticker),None)
+    if row is None:return None
+    signed=number(row.get('position'))
+    if signed is None:raise ValueError('Position quantity missing')
+    signed=int(signed)
+    if signed==0:return None
+    side='UP' if signed>0 else 'DOWN'
+    qty=abs(signed)
+    # Portfolio market_exposure represents the remaining basis on Kalshi's side.
+    basis=number(row.get('market_exposure_dollars'))
+    if basis is None:
+        cents=number(row.get('market_exposure'))
+        basis=cents/100 if cents is not None else None
+    if basis is not None and not (0<=basis<=qty):basis=None
+    avg=basis/qty if basis is not None else None
+    bid=quote(m,side,'bid')
+    ask=quote(m,side,'ask')
+    gross=(qty*bid-basis) if bid is not None and basis is not None else None
+    return {'ticker':ticker,'side':side,'qty':qty,'basis':basis,'avg':avg,
+            'bid':bid,'ask':ask,'gross':gross}
+
+def portfolio_poll(m,a,read):
+    now=time.time()
+    if now-portfolio_state['last_poll']<PORTFOLIO_POLL_SECONDS:return
+    portfolio_state['last_poll']=now
+    try:
+        position=get_open_position(m)
+    except Exception as exc:
+        if now-portfolio_state['error_at']>600:
+            portfolio_state['error_at']=now
+            LOG.warning('Read-only portfolio check failed (%s); position alerts unavailable',type(exc).__name__)
+            if state['enabled']:send('⚠️ Kalshi account position read unavailable. No position-based exit alerts until restored.')
+        return
+    if position is None:
+        portfolio_state['positions'].pop(m['ticker'],None)
+        return
+    old=portfolio_state['positions'].get(m['ticker'])
+    portfolio_state['positions'][m['ticker']]=position
+    if not state['enabled']:return
+    new=(old is None or (old['side'],old['qty'])!=(position['side'],position['qty']))
+    counter=read['scalp'] in ('UP','DOWN') and read['scalp']!=position['side']
+    pnl=position['gross']
+    material=(pnl is not None and position['basis'] and abs(pnl/position['basis'])>=.15)
+    if not (new or counter or material):return
+    if not new and now-portfolio_state['alert_at'].get(m['ticker'],0)<POSITION_ALERT_COOLDOWN:return
+    portfolio_state['alert_at'][m['ticker']]=now
+    avg=ask_text(position['avg']); bid=ask_text(position['bid'])
+    gross=f'${pnl:+.2f}' if pnl is not None else 'unknown'
+    headline='💰 POSITION DETECTED' if new else '⚠️ POSITION WATCH'
+    flag='\n⚠️ Short-term chart read opposes your position.' if counter else ''
+    send(f"{headline}\n{position['qty']} {position['side']} • Basis/contract: {avg}"
+         f"\nCurrent bid: {bid} • Estimated gross P/L: {gross}"
+         f"\n{a['seconds']//60}:{a['seconds']%60:02d} left{flag}"
+         "\nGross estimate excludes fees, slippage and liquidity. No trades placed.")
+
+def portfolio_status():
+    try:
+        m=get_market()
+        if not m:return '💰 No open BTC15m market to inspect.'
+        p=get_open_position(m)
+        if not p:return '💰 No active position in the current BTC15m contract.'
+        pnl=f'${p["gross"]:+.2f}' if p['gross'] is not None else 'unknown'
+        return (f"💰 {p['qty']} {p['side']} • Cost basis/contract {ask_text(p['avg'])}"
+                f"\nSell bid {ask_text(p['bid'])} • Gross P/L {pnl}"
+                "\nExcludes fees and slippage; current contract only.")
+    except Exception as exc:
+        LOG.warning('Position command failed: %s',type(exc).__name__)
+        return '⚠️ Could not read your Kalshi position. Check Railway logs for an account-access error.'
+
 def load_v56(ticker):
     with connect() as c:
         rows=c.execute("SELECT * FROM keke_v56_forecasts WHERE ticker=? ORDER BY id",(ticker,)).fetchall()
@@ -841,7 +1012,7 @@ def proactive_updates(a, new_contract):
         state['threat_ticker']=ticker
         state['threat_side']=None
         state['threat_at']=0
-        send(format_read(a,'🆕 NEW CONTRACT • Monitoring'))
+        send(format_read(a,'🆕 NEW CONTRACT • Monitoring')+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
         return
     side=a.get('v56_side')
     signal=a.get('v56_signal')
@@ -862,7 +1033,7 @@ def proactive_updates(a, new_contract):
         return
     if now-state.get('heartbeat_at',0)>=HEARTBEAT_SECONDS:
         state['heartbeat_at']=now
-        send(format_read(a,'📡 LIVE UPDATE • '+(side or 'ANALYZING')))
+        send(format_read(a,'📡 LIVE UPDATE • '+(side or 'ANALYZING'))+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
 
 def send_last():
     with connect() as c:
@@ -874,9 +1045,9 @@ def send_last():
 def main():
     init_db()
     initialize_telegram()
-    LOG.info('KeKe V5.6 Settlement Forecast starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.7 dual-read portfolio monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.6 live monitoring patch online. '
+    send('🧠 KeKe V5.7 observational dual-read online. '
          'BRTI for target distance; Kraken for momentum. Persistent /data database. '
          'Automatic official-result grading active. No trades. /stats' )
     while True:
@@ -906,6 +1077,9 @@ def main():
                 record(a)
                 record_early_prediction(a)
                 record_v53(a)
+                quick=dual_read(a,candles)
+                a['dual_read']=quick
+                portfolio_poll(market,a,quick)
                 try:
                     record_shadow(a)
                 except Exception:

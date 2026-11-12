@@ -102,6 +102,14 @@ def init_db():
             target REAL, brti REAL, reason TEXT,
             official_side TEXT, grade TEXT DEFAULT 'PENDING', graded_at INTEGER)''')
         c.execute('CREATE INDEX IF NOT EXISTS idx_v56_forecasts ON keke_v56_forecasts(ticker,captured_at)')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_shadow_predictions (
+            ticker TEXT NOT NULL, checkpoint INTEGER NOT NULL,
+            captured_at INTEGER NOT NULL, seconds_left INTEGER NOT NULL,
+            side TEXT NOT NULL, score REAL NOT NULL, reason TEXT,
+            ask REAL, brti REAL, target REAL,
+            official_side TEXT, grade TEXT DEFAULT 'PENDING', graded_at INTEGER,
+            PRIMARY KEY(ticker,checkpoint))''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_shadow_grade ON keke_shadow_predictions(grade,ticker)')
 
 
 def http_json(url,params=None,timeout=6):
@@ -393,6 +401,7 @@ def grade_settlements():
             UNION SELECT ticker FROM v53_opportunities WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_thesis_events WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_v56_forecasts WHERE grade='PENDING'
+            UNION SELECT ticker FROM keke_shadow_predictions WHERE grade='PENDING'
         ) ORDER BY ticker LIMIT ?''',(GRADE_BATCH,)).fetchall()
     verified_now=0
     newly_finalized=[]
@@ -414,6 +423,7 @@ def grade_settlements():
                 c.execute("UPDATE v53_opportunities SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE keke_thesis_events SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE keke_v56_forecasts SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
+                c.execute("UPDATE keke_shadow_predictions SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 continue
             c.execute('''INSERT INTO settlement_results(ticker,settled_side,source,recorded_at,verified)
                 VALUES (?,?,?,?,1) ON CONFLICT(ticker) DO UPDATE SET
@@ -435,6 +445,10 @@ def grade_settlements():
             new_v56=c.execute("SELECT * FROM keke_v56_forecasts WHERE ticker=? AND grade='PENDING' ORDER BY id",(ticker,)).fetchall()
             c.execute('''UPDATE keke_v56_forecasts SET grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
                 official_side=?,graded_at=? WHERE ticker=? AND grade='PENDING' ''',(outcome,outcome,now,ticker))
+            c.execute("""UPDATE keke_shadow_predictions
+                SET grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
+                    official_side=?,graded_at=? WHERE ticker=? AND grade='PENDING'""",
+                (outcome,outcome,now,ticker))
             if new_v56:
                 first=next((r for r in new_v56 if r['event']=='INITIAL'),None)
                 last=new_v56[-1]
@@ -460,6 +474,7 @@ def grade_summary():
         returns=c.execute("SELECT ask,result FROM settlement_calls WHERE result IN ('WIN','LOSS') AND ask IS NOT NULL AND ask>0 AND ask<1").fetchall()
         thesis=c.execute("SELECT event,grade,ask FROM keke_thesis_events").fetchall()
         v56=c.execute("SELECT event,grade,ask FROM keke_v56_forecasts").fetchall()
+        shadow_rows=c.execute("SELECT checkpoint,grade FROM keke_shadow_predictions").fetchall()
     call_counts={r['result']:r['n'] for r in calls}
     pred_counts={r['grade']:r['n'] for r in predictions}
     cw=call_counts.get('WIN',0);cl=call_counts.get('LOSS',0)
@@ -483,7 +498,15 @@ def grade_summary():
         rows=[r for r in v56 if r['event']==event]
         w=sum(r['grade']=='WIN' for r in rows);l=sum(r['grade']=='LOSS' for r in rows)
         return f'V5.6 {event}: {w}W/{l}L • {pct(w,l)} • pending {sum(r["grade"]=="PENDING" for r in rows)}'
-    return (f'📊 KEKE REPORT CARD\n'
+    shadow_lines=[]
+    for checkpoint in SHADOW_CHECKPOINTS:
+        rows=[r for r in shadow_rows if r['checkpoint']==checkpoint]
+        w=sum(r['grade']=='WIN' for r in rows)
+        l=sum(r['grade']=='LOSS' for r in rows)
+        pending=sum(r['grade']=='PENDING' for r in rows)
+        shadow_lines.append(f'Shadow {checkpoint//60}m: {w}W/{l}L • {pct(w,l)} • pending {pending}')
+    shadow_report='\n'.join(shadow_lines)
+    return (f'📊 KEKE REPORT CARD\n' 
             f'Contracts {contracts} • Snapshots {observations} • Official results {verified}\n'
             f'🚨 ENTER: {cw}W / {cl}L • {pct(cw,cl)} • pending {call_counts.get("PENDING",0)}\n'
             f'🔎 EARLY LEAN: {pw}W / {pl}L • {pct(pw,pl)} • pending {pred_counts.get("PENDING",0)}\n'
@@ -493,6 +516,7 @@ def grade_summary():
             f'Legacy {event_line("FINAL")}\n'
             f'{v56_line("INITIAL")}\n'
             f'{v56_line("REVERSAL")}\n'
+             f'{shadow_report}\n'
             f'Illustrative ENTER gross: ${gross:+.2f} across {len(returns)} graded calls (1 contract each; NO fees/fills)\n'
             'Official outcomes only • No real trades placed')
 
@@ -722,6 +746,47 @@ def settlement_signal(a):
     drift=max(-0.35,min(0.35,0.18*momentum/scale))
     return a['distance']/scale + drift
 
+# Silent experimental model: NEVER changes the live V5.6 predictions or alerts.
+SHADOW_CHECKPOINTS=(720,540,360)  # 12, 9, and 6 minutes left
+SHADOW_MIN_SCORE=1.25
+
+def shadow_score(a):
+    if a['source']!='BRTI' or a['distance'] is None or a['target'] is None:
+        return None,None,'BRTI unavailable'
+    i=a['indicators']; price=a['kraken']; score=0.0; reasons=[]
+    if price>i['ema5']>i['ema13']:
+        score+=1.0; reasons.append('rising short-term trend')
+    elif price<i['ema5']<i['ema13']:
+        score-=1.0; reasons.append('falling short-term trend')
+    score+=0.5 if price>i['vwap15'] else -0.5
+    if i['momentum3']>0 and i['momentum5']>0:
+        score+=0.8; reasons.append('upward momentum')
+    elif i['momentum3']<0 and i['momentum5']<0:
+        score-=0.8; reasons.append('downward momentum')
+    if i['rsi14']>=60: score+=0.45
+    elif i['rsi14']<=40: score-=0.45
+    if i['vol_ratio']>=1.2:
+        if price>i['resistance15']:
+            score+=0.8; reasons.append('upside breakout on higher volume')
+        elif price<i['support15']:
+            score-=0.8; reasons.append('downside breakout on higher volume')
+    scale=max(25.0,float(a['volatility'] or 0)*math.sqrt(max(a['seconds'],60)/60))
+    score+=max(-1.0,min(1.0,a['distance']/scale))
+    return score,('UP' if score>0 else 'DOWN'),'; '.join(reasons) or 'mixed indicators'
+
+def record_shadow(a):
+    if not 0<a['seconds']<=900: return
+    score,side,reason=shadow_score(a)
+    if score is None or abs(score)<SHADOW_MIN_SCORE: return
+    for checkpoint in SHADOW_CHECKPOINTS:
+        if not checkpoint-45<=a['seconds']<=checkpoint: continue
+        with connect() as c:
+            c.execute("""INSERT OR IGNORE INTO keke_shadow_predictions
+                (ticker,checkpoint,captured_at,seconds_left,side,score,reason,ask,brti,target)
+                VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (a['ticker'],checkpoint,a['at'],a['seconds'],side,score,reason,
+                 a['asks'].get(side),a['btc'],a['target']))
+
 def load_v56(ticker):
     with connect() as c:
         rows=c.execute("SELECT * FROM keke_v56_forecasts WHERE ticker=? ORDER BY id",(ticker,)).fetchall()
@@ -841,6 +906,10 @@ def main():
                 record(a)
                 record_early_prediction(a)
                 record_v53(a)
+                try:
+                    record_shadow(a)
+                except Exception:
+                    LOG.exception('Silent shadow-model recording failed')
                 new=state['ticker']!=a['ticker']
                 if new:
                     state['ticker']=a['ticker']

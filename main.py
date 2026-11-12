@@ -1,4 +1,4 @@
-"""KeKe V5.1 diagnostic — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.1 record diagnostic — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -329,6 +329,19 @@ def safe_shape(value, depth=0):
         return f'list[{len(value)}] ' + (safe_shape(value[0],depth+1) if value and depth<3 else '')
     return type(value).__name__
 
+def brti_record_shape():
+    """Report BRTI record field names/types only, never API keys or values."""
+    obj=brti_raw()
+    data=obj.get('data')
+    payload=data.get('payload') if isinstance(data,dict) else None
+    if not isinstance(payload,list) or not payload:
+        return 'Unexpected response wrapper: '+safe_shape(obj)
+    samples=[('FIRST',payload[0]),('LATEST',payload[-1])]
+    lines=[f'BRTI records: {len(payload)}']
+    for label,item in samples:
+        lines.append(f'{label} record: {safe_shape(item,0)}')
+    return '\n'.join(lines)
+
 def run_brti_test():
     try:
         price,stamp=brti_live()
@@ -336,8 +349,8 @@ def run_brti_test():
     except Exception as exc:
         LOG.warning('BRTI test failed: %s',type(exc).__name__)
         try:
-            shape=safe_shape(brti_raw())
-            send('🔎 BRTI RESPONSE STRUCTURE (field names/types only):\n'+shape[:1100]+'\n⚪ Settlement ENTER remains disabled.')
+            shape=brti_record_shape()
+            send('🔎 BRTI RECORD FIELDS (names/types only):\n'+shape[:1600]+'\n⚪ Settlement ENTER remains disabled.')
         except Exception as diag_exc:
             send(f'🔴 BRTI TEST FAILED: {type(exc).__name__}\nDiagnostic fetch: {type(diag_exc).__name__}\nNo settlement ENTER.')
 

@@ -992,7 +992,7 @@ def health_status():
 
 
 def send_stats():
-    send(prospective_early_summary()+'\n\n'+early_pick_stats_summary()+'\n\n'+brti_stats_summary()+'\n\n'+paper_scalps_summary()+'\n\n'+range_stats_summary())
+    send(prospective_early_summary()+'\n\n'+early_pick_stats_summary()+'\n\n'+brti_stats_summary()+'\n\n📦 Scalp tracking paused; historical records preserved.')
 
 def fresh_status():
     """Fetch a new market and BRTI tick for STATUS; do not change prediction state."""
@@ -1017,9 +1017,10 @@ def fresh_status():
         a['v56_side']=side
         sig=settlement_signal(a)
         a['v56_signal']=sig
+        sig=settlement_signal(a)
         a['v56_candidate']='UP' if sig is not None and sig>0 else ('DOWN' if sig is not None and sig<0 else None)
         state['last_read']=a
-        return format_read(a)+dual_text(dual_read(a,candles))
+        return format_read(a)+'\n\n🎯 Settlement-only monitoring • scalp signals paused'
     except Exception as exc:
         LOG.warning('Fresh STATUS failed: %s',type(exc).__name__)
         return '⚠️ Could not retrieve a fresh market reading. Please retry; no stale price is being presented as live.'
@@ -1066,7 +1067,7 @@ def initialize_telegram():
             {'command':'start','description':'Resume KeKe alerts'},
             {'command':'stop','description':'Pause alerts; keep recording'},
             {'command':'status','description':'Bot health, BRTI freshness and database'},
-            {'command':'market','description':'Fresh BRTI and scalp context'},
+            {'command':'market','description':'Fresh BRTI settlement context'},
             {'command':'stats','description':'BRTI-only prediction report card'},
             {'command':'legacy','description':'Historical and lifetime research stats'},
             {'command':'last','description':'Last settlement pick'},
@@ -1218,7 +1219,7 @@ def dual_read(a,candles):
         label='NO ENTRY: mixed or insufficient candles'
     else:
         label='WATCH ONLY: confirmation needed'
-    # No calibrated price forecast: this is a descriptive research reading.
+    # Momentum is descriptive only and does not enter settlement_signal().
     return {'scalp':scalp,'frames':frames,'label':label,'range':range_pattern(candles)}
 
 def dual_text(read):
@@ -1227,7 +1228,7 @@ def dual_text(read):
     frames='  •  '.join(f'{m}m {symbols.get(f.get(m),f.get(m,"?"))}' for m in (1,3,15))
     r=read.get('range')
     extra=(f"\n↔ RANGE: {r['pattern']} • S ${r['support']:,.0f} / R ${r['resistance']:,.0f}" if r else "")
-    return f"\n\n⚡ SCALP: {read['scalp']}\n📊 {frames}{extra}"
+    return f"\n\n📊 BRTI momentum: {frames}"
 
 # V5.14: BRTI-only range and breakout research, isolated from settlement picks.
 RANGE_LOOKBACK=12
@@ -1588,7 +1589,6 @@ def compact_update(a):
             f'BRTI {delta} vs target | {trend}\n\n'
             f'🎯 Target {money_text(a.get("target"))}\n'
             f'📍 BRTI {money_text(a.get("btc"))}\n'
-            f'⚡ Scalp watch: {read.get("scalp","WAIT")} (not an entry)\n'
             f'{a.get("brti_levels", "S/R collecting")}')
 
 def proactive_updates(a, new_contract):
@@ -1612,7 +1612,7 @@ def proactive_updates(a, new_contract):
         send(f'⚠️ {side} PICK AT RISK\nOpposite signal strengthening\n\n'+compact_update(a))
         return
     # Only send a routine update if the displayed direction or scalp state changes.
-    status=(a.get('v56_side') or 'WAIT',(a.get('dual_read') or {}).get('scalp','WAIT'))
+    status=(a.get('v56_side') or 'WAIT',)
     if now-state.get('heartbeat_at',0)>=HEARTBEAT_SECONDS and status!=state.get('heartbeat_status'):
         state['heartbeat_at']=now
         state['heartbeat_status']=status
@@ -1633,11 +1633,11 @@ def main():
     state['enabled']=runtime_get('alerts_enabled',True)
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
-    LOG.info('KeKe V5.19 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.20 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    if state['enabled']:send('🧠 KeKe V5.18 BRTI-only entry/exit watch online. '
+    if state['enabled']:send('🎯 KeKe V5.20 BRTI settlement predictions online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
-         'Official-result grading active. No trades. /stats for BRTI-only, /legacy for history' )
+         'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     while True:
         started=time.monotonic()
         try:
@@ -1662,7 +1662,7 @@ def main():
                 candles=brti_candles()
                 # No synthetic prices or Kraken fallback. The bot keeps collecting
                 # until five contiguous completed BRTI minutes are available; longer frames remain collecting.
-                if len(candles)<15 or any(candles[-i]['time']-candles[-i-1]['time']!=60 for i in range(1,15)):
+                if len(candles)<5 or any(candles[-i]['time']-candles[-i-1]['time']!=60 for i in range(1,5)):
                     # Portfolio reads must keep working while BRTI history warms up.
                     portfolio_poll(market,{'seconds':seconds_remaining(market)}, {'scalp':'WAIT'})
                     opening_seen(market['ticker'],seconds_remaining(market),False)
@@ -1691,11 +1691,9 @@ def main():
                 record_v53(a)
                 quick=dual_read(a,candles)
                 a['dual_read']=quick
-                portfolio_poll(market,a,quick)
-                paper_scalps_update(market,a,quick)
-                range_update_exits(market,a,quick)
-                range_strategy(market,a,candles,quick)
-                entry_opportunity(a,quick)
+                portfolio_poll(market,a,{'scalp':'WAIT'})
+                # Settlement-only mode: no paper scalp entries, exits, or range alerts.
+                # Legacy scalp history remains untouched in SQLite.
                 try:
                     record_shadow(a)
                 except Exception:

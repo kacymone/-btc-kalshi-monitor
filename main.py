@@ -1,4 +1,4 @@
-"""KeKe V5.26 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.27 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -483,6 +483,7 @@ def grade_settlements():
             UNION SELECT ticker FROM keke_thesis_events WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_v56_forecasts WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_shadow_predictions WHERE grade='PENDING'
+            UNION SELECT ticker FROM keke_v527_checkpoints WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_locked_forecasts WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_consensus_predictions WHERE grade='PENDING'
         ) ORDER BY ticker LIMIT ?''',(GRADE_BATCH,)).fetchall()
@@ -502,6 +503,7 @@ def grade_settlements():
         with connect() as c:
             if outcome=='UNGRADABLE':
                 research_grade(ticker,outcome,now)
+                c.execute("UPDATE keke_v527_checkpoints SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE settlement_calls SET result='UNGRADABLE',result_source='Kalshi market result' WHERE ticker=? AND result='PENDING'",(ticker,))
                 c.execute("UPDATE settlement_predictions SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE v53_opportunities SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
@@ -510,6 +512,7 @@ def grade_settlements():
                 c.execute("UPDATE keke_shadow_predictions SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 continue
             research_grade(ticker,outcome,now)
+            v527_grade(ticker,outcome,now)
             c.execute('''INSERT INTO settlement_results(ticker,settled_side,source,recorded_at,verified)
                 VALUES (?,?,?,?,1) ON CONFLICT(ticker) DO UPDATE SET
                 settled_side=excluded.settled_side,source=excluded.source,
@@ -871,7 +874,10 @@ def export_research():
     if not TOKEN or not CHAT:
         return
     tables=('settlement_observations','settlement_calls','settlement_results',
-            'settlement_predictions','v53_opportunities','keke_thesis_events','keke_v56_forecasts')
+            'settlement_predictions','v53_opportunities','keke_thesis_events','keke_v56_forecasts',
+            'keke_v527_checkpoints','keke_v527_warnings',
+            'keke_exchange_samples','keke_contract_transitions','keke_transition_snapshots',
+            'keke_locked_forecasts','keke_consensus_predictions')
     try:
         # SQLite online backup takes a consistent snapshot, including WAL changes.
         snapshot=sqlite3.connect(':memory:')
@@ -1064,6 +1070,7 @@ def telegram_commands():
             elif cmd.startswith('/lead'):send(exchange_research_report())
             elif cmd.startswith('/audit'):send(audit_report())
             elif cmd.startswith('/research'):send(research_stats_report())
+            elif cmd.startswith('/scorecard'):send(v527_scorecard())
             elif cmd.startswith('/preview'):send(preview_report())
             elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
             elif cmd.startswith('/position'):send(portfolio_status())
@@ -1091,6 +1098,7 @@ def initialize_telegram():
             {'command':'last','description':'Last settlement pick'},
             {'command':'brti','description':'Test read-only Kalshi BRTI access'},
             {'command':'export','description':'Download research CSV archive'},
+            {'command':'scorecard','description':'Rolling 24-hour early forecast scorecard'},
             {'command':'position','description':'Current Kalshi BTC position'}]))
     except Exception:LOG.exception('Telegram setup error')
 
@@ -1099,6 +1107,9 @@ def initialize_telegram():
 V56_FIRST_MIN_SECONDS=600
 V56_INITIAL_SIGNAL=0.45
 INITIAL_PICK_MIN_SECONDS=780  # opening two minutes of each 900-second contract
+V527_EARLY_COVERAGE_GOAL=.60
+V527_EARLY_ACCURACY_GOAL=.75
+V527_REPORT_WINDOW=86400
 V56_REVERSAL_SIGNAL=0.95
 V56_FAST_REVERSAL_SIGNAL=1.8
 V56_REVERSAL_CONFIRM=2
@@ -1740,6 +1751,7 @@ def proactive_updates(a, new_contract):
     if not threatened:state['threat_side']=None
     elif state.get('threat_side')!=side and now-state.get('threat_at',0)>=THREAT_COOLDOWN:
         state['threat_side']=side;state['threat_at']=now;state['heartbeat_at']=now
+        v527_warning(a,side,candidate,signal)
         send(f'⚠️ {side} PICK AT RISK\nOpposite signal strengthening\n\n'+compact_update(a))
         return
     # Only send a routine update if the displayed direction or scalp state changes.
@@ -1941,6 +1953,96 @@ def exchange_report():
 
 # V5.26: Additive, research-only audit / consensus / target-publication instrumentation.
 # Historical scores remain intact. No experimental input enters settlement_signal().
+# V5.27: observational scorecard and immutable checkpoint. No signal threshold changes.
+def v527_init():
+    with connect() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_v527_checkpoints (
+          ticker TEXT PRIMARY KEY, captured_at INTEGER NOT NULL,
+          seconds_left INTEGER NOT NULL, side TEXT, signal REAL,
+          target REAL, brti REAL, official_side TEXT,
+          grade TEXT NOT NULL DEFAULT 'PENDING', graded_at INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_v527_warnings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL,
+          captured_at INTEGER NOT NULL, seconds_left INTEGER NOT NULL,
+          held_side TEXT NOT NULL, candidate_side TEXT NOT NULL,
+          signal REAL NOT NULL, target REAL, brti REAL)''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_v527_warning ON keke_v527_warnings(ticker,captured_at)')
+
+def v527_checkpoint(a):
+    # Record first available observation at/below 5 minutes, including WAIT.
+    if not (0 < a['seconds'] <= 300):return
+    side=a.get('v56_side')
+    if side not in ('UP','DOWN'):side=None
+    with connect() as c:
+        c.execute('''INSERT OR IGNORE INTO keke_v527_checkpoints
+          (ticker,captured_at,seconds_left,side,signal,target,brti)
+          VALUES(?,?,?,?,?,?,?)''',
+          (a['ticker'],a['at'],a['seconds'],side,a.get('v56_signal'),a.get('target'),a.get('btc')))
+
+def v527_warning(a,held_side,candidate,signal):
+    # Persist only when the existing warning mechanism actually alerts.
+    with connect() as c:
+        c.execute('''INSERT INTO keke_v527_warnings
+          (ticker,captured_at,seconds_left,held_side,candidate_side,signal,target,brti)
+          VALUES(?,?,?,?,?,?,?,?)''',
+          (a['ticker'],a['at'],a['seconds'],held_side,candidate,signal,a.get('target'),a.get('btc')))
+
+def v527_grade(ticker,outcome,now=None):
+    if outcome not in ('UP','DOWN'):return
+    now=int(time.time()) if now is None else now
+    with connect() as c:
+        c.execute("""UPDATE keke_v527_checkpoints SET official_side=?,
+          grade=CASE WHEN side IS NULL THEN 'WAIT' WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
+          graded_at=? WHERE ticker=? AND grade='PENDING'""" ,(outcome,outcome,now,ticker))
+
+def v527_scorecard(now=None):
+    now=int(time.time()) if now is None else int(now)
+    start=now-V527_REPORT_WINDOW
+    with connect() as c:
+        # First-seen openings are the coverage denominator. Exclude openings first
+        # observed after the 120-second window and unfinished/unverified markets.
+        rows=c.execute('''SELECT h.ticker,h.first_seconds,r.settled_side,
+          (SELECT f.side FROM keke_v56_forecasts f WHERE f.ticker=h.ticker
+           AND f.event='INITIAL' AND f.seconds_left BETWEEN 780 AND 900
+           ORDER BY f.captured_at,f.id LIMIT 1) early_side,
+          (SELECT MIN(f.seconds_left) FROM keke_v56_forecasts f WHERE f.ticker=h.ticker
+           AND f.event='INITIAL' AND f.seconds_left BETWEEN 780 AND 900) early_seconds
+          FROM keke_opening_health h JOIN settlement_results r ON r.ticker=h.ticker
+          WHERE h.first_seen>=? AND h.first_seen<=? AND r.verified=1
+            AND h.first_seconds BETWEEN 780 AND 900''',(start,now)).fetchall()
+        checkpoints=c.execute("""SELECT grade,seconds_left FROM keke_v527_checkpoints
+            WHERE captured_at BETWEEN ? AND ? AND grade!='PENDING'""" ,(start,now)).fetchall()
+        warnings=c.execute('''SELECT COUNT(*) n FROM keke_v527_warnings
+            WHERE captured_at BETWEEN ? AND ?''',(start,now)).fetchone()['n']
+    total=len(rows)
+    picks=[r for r in rows if r['early_side'] in ('UP','DOWN')]
+    wins=sum(r['early_side']==r['settled_side'] for r in picks)
+    cp=[r for r in checkpoints if r['grade'] in ('WIN','LOSS')]
+    cpw=sum(r['grade']=='WIN' for r in cp)
+    waits=sum(r['grade']=='WAIT' for r in checkpoints)
+    pct=lambda n,d:f'{100*n/d:.1f}%' if d else 'n/a'
+    return (f'📋 KEKE V5.27 • ROLLING 24H SCORECARD\n'
+            f'Eligible completed openings: {total} (late first-seen excluded)\n'
+            f'Early calls: {len(picks)} • coverage {pct(len(picks),total)} (goal ≥60%)\n'
+            f'Early correct: {wins}/{len(picks)} • accuracy {pct(wins,len(picks))} (goal ≥75%)\n'
+            f'5m checkpoint: {cpw}/{len(cp)} • accuracy {pct(cpw,len(cp))} • WAIT {waits}\n'
+            f'Weakening warnings logged: {warnings}\n'
+            '24h is an initial review, not proof of a predictive edge.\n'
+            'V5.26 thresholds unchanged; no automatic trading.')
+
+def v527_daily_report(now=None):
+    now=int(time.time()) if now is None else int(now)
+    started=runtime_get('v527_started_at',None)
+    if started is None:
+        runtime_set('v527_started_at',now)
+        return
+    last=runtime_get('v527_last_report_at',started)
+    if now-int(last)<V527_REPORT_WINDOW:return
+    # Advance report time only after a successful Telegram send.
+    if state['enabled'] and TOKEN and CHAT:
+        send(v527_scorecard(now))
+        runtime_set('v527_last_report_at',now)
+
 def research_init():
     with connect() as c:
         c.execute('''CREATE TABLE IF NOT EXISTS keke_contract_transitions (
@@ -2116,14 +2218,16 @@ def main():
     init_db()
     exchange_init()
     research_init()
+    v527_init()
+    v527_daily_report()
     if os.getenv("KEKE_EXCHANGE_OBSERVER","1")=="1":
         threading.Thread(target=exchange_worker,daemon=True,name="exchange-observer").start()
     state['enabled']=runtime_get('alerts_enabled',True)
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
-    LOG.info('KeKe V5.26 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.27 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    if state['enabled']:send('🎯 KeKe V5.26 BRTI settlement predictions online. '
+    if state['enabled']:send('🎯 KeKe V5.27 BRTI settlement predictions online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     while True:
@@ -2133,6 +2237,7 @@ def main():
             if time.monotonic()-state['last_grade']>=GRADE_EVERY:
                 state['last_grade']=time.monotonic()
                 grade_settlements()
+                v527_daily_report()
             market=get_market()
             if market:
                 try:
@@ -2162,6 +2267,7 @@ def main():
                         opening_seen(a['ticker'],a['seconds'],True)
                         process_v56(a,new)
                         lock_forecast(a)
+                        v527_checkpoint(a)
                         portfolio_poll(market,a,{'scalp':'WAIT'})
                         state['last_read']=a
                         time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
@@ -2215,6 +2321,7 @@ def main():
                     proactive_updates(a,True)
                 process_v56(a,new)
                 lock_forecast(a)
+                v527_checkpoint(a)
                 portfolio_poll(market,a,{'scalp':'WAIT'})
                 if not new:
                     proactive_updates(a,False)

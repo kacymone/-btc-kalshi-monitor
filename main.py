@@ -1,4 +1,4 @@
-"""KeKe V5.19 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.22 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -128,6 +128,7 @@ def init_db():
         c.execute('INSERT OR IGNORE INTO keke_model_epochs(version,started_at) VALUES (?,?)',('5.16-EARLY-PICKS',int(time.time())))
         c.execute('INSERT OR IGNORE INTO keke_model_epochs(version,started_at) VALUES (?,?)',('5.19-REPAIRED',int(time.time())))
         c.execute('CREATE TABLE IF NOT EXISTS keke_runtime (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_retest_alerts (ticker TEXT NOT NULL, break_time INTEGER NOT NULL, event TEXT NOT NULL, level REAL NOT NULL, confirmed_at INTEGER NOT NULL, PRIMARY KEY(ticker,break_time,event))''')
         c.execute('''CREATE TABLE IF NOT EXISTS keke_signal_state (
           ticker TEXT NOT NULL, strategy TEXT NOT NULL, side TEXT NOT NULL,
           candle_time INTEGER NOT NULL, captured_at INTEGER NOT NULL,
@@ -135,6 +136,8 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS keke_early_opportunities (
           ticker TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, first_seconds INTEGER,
           had_history INTEGER NOT NULL DEFAULT 0)''')
+        c.execute('CREATE TABLE IF NOT EXISTS keke_position_snapshots (ticker TEXT PRIMARY KEY, side TEXT NOT NULL, qty REAL NOT NULL, basis REAL, bid REAL, updated_at INTEGER NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS keke_position_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL, event TEXT NOT NULL, side TEXT, old_qty REAL, new_qty REAL, recorded_at INTEGER NOT NULL, UNIQUE(ticker,event,recorded_at))')
         c.execute('CREATE TABLE IF NOT EXISTS keke_opening_health (ticker TEXT PRIMARY KEY, first_seen INTEGER, first_seconds INTEGER, had_history INTEGER NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS keke_v518_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL, event TEXT NOT NULL, captured_at INTEGER NOT NULL, detail TEXT)')
 
@@ -332,10 +335,10 @@ def assessment(m,btc,candles,brti=None):
     bids={side:quote(m,side,'bid') for side in ('UP','DOWN')}
     asks={side:quote(m,side,'ask') for side in ('UP','DOWN')}
     closes=[c['close'] for c in candles]
-    delta1=btc-closes[-1];delta3=btc-closes[-3]
+    delta1=btc-closes[-1];delta3=btc-closes[-min(3,len(closes))]
     ranges=[c['high']-c['low'] for c in candles[-12:]]
     typical_range=sum(ranges)/len(ranges)
-    trend='UP' if closes[-1]>closes[-6] and closes[-3]>closes[-9] else ('DOWN' if closes[-1]<closes[-6] and closes[-3]<closes[-9] else 'MIXED')
+    trend='UP' if len(closes)>=9 and closes[-1]>closes[-min(6,len(closes))] and closes[-3]>closes[-9] else ('DOWN' if len(closes)>=9 and closes[-1]<closes[-6] and closes[-3]<closes[-9] else 'MIXED')
     distance=brti-target if brti is not None and target is not None else None
     favored='UP' if distance is not None and distance>0 else ('DOWN' if distance is not None and distance<0 else None)
     # Completed 1-minute BRTI candles; history is accumulated persistently.
@@ -343,7 +346,7 @@ def assessment(m,btc,candles,brti=None):
     r=rsi(closes)
     vol=[c['volume'] for c in candles[-21:]]
     vol_ratio=None  # BRTI index has no trade volume
-    recent=candles[-16:-1] if len(candles)>=17 else candles[:-1]
+    recent=candles[-16:-1] if len(candles)>=17 else candles[:-1] or candles
     resistance=max(c['high'] for c in recent)
     support=min(c['low'] for c in recent)
     vwap_num=sum(((c['high']+c['low']+c['close'])/3)*c['volume'] for c in candles[-15:])
@@ -355,7 +358,7 @@ def assessment(m,btc,candles,brti=None):
     score+=1.0 if e5>e13 else -1.0
     # No volume-weighted indicators on BRTI
     score+=.75 if delta3>0 else -.75
-    score+=.5 if closes[-1]>closes[-6] else -.5
+    score+=.5 if closes[-1]>closes[-min(6,len(closes))] else -.5
     score+=.5 if r>55 else (-.5 if r<45 else 0)
     if btc>resistance:score+=.5
     if btc<support:score-=.5
@@ -389,7 +392,7 @@ def assessment(m,btc,candles,brti=None):
                 'vwap15':None,'vol_ratio':None,
                 'support15':round(support,2),'resistance15':round(resistance,2),
                 'momentum1':round(delta1,2),'momentum3':round(delta3,2),
-                'momentum5':round(btc-closes[-5],2),'momentum15':round(btc-closes[-15],2)}
+                'momentum5':round(btc-closes[-min(5,len(closes))],2),'momentum15':round(btc-closes[-min(15,len(closes))],2)}
     return {'ticker':m['ticker'],'at':now,'seconds':seconds,'btc':brti,'kraken':btc, # legacy field name; value is BRTI, never Kraken
             'source':'BRTI' if brti is not None else 'UNAVAILABLE','target':target,
             'distance':distance,'favored':favored,'trend':trend,'delta1':delta1,
@@ -1004,7 +1007,12 @@ def fresh_status():
         state['current_brti_stamp']=stamp
         candles=brti_candles()
         levels=brti_opening_levels(candles,brti)
-        if len(candles)<5 or any(candles[-i]['time']-candles[-i-1]['time']!=60 for i in range(1,5)):
+        if len(candles)<15:
+            a=fast_opening_assessment(market,brti)
+            if a is not None:
+                a['brti_levels']=levels
+                a['v56_side']=load_v56(a['ticker'])['side']
+                return format_read(a)+'\n\n📊 Opening BRTI read; longer candles collecting'
             return (f'📡 BRTI ${brti:,.2f} • Target {money_text(target_of(market))}\n'
                     +levels+'\n⚪ Collecting verified BRTI candles; no trade signal')
         a=assessment(market,brti,candles,brti)
@@ -1017,7 +1025,6 @@ def fresh_status():
         a['v56_side']=side
         sig=settlement_signal(a)
         a['v56_signal']=sig
-        sig=settlement_signal(a)
         a['v56_candidate']='UP' if sig is not None and sig>0 else ('DOWN' if sig is not None and sig<0 else None)
         state['last_read']=a
         return format_read(a)+'\n\n🎯 Settlement-only monitoring • scalp signals paused'
@@ -1084,6 +1091,29 @@ INITIAL_PICK_MIN_SECONDS=780  # opening two minutes of each 900-second contract
 V56_REVERSAL_SIGNAL=0.95
 V56_FAST_REVERSAL_SIGNAL=1.8
 V56_REVERSAL_CONFIRM=2
+
+def fast_opening_assessment(m, brti):
+    """Provisional opening signal from actual BRTI ticks, before 1m candles exist.
+    Uses target distance; volatility estimated only from observed prices.
+    """
+    target=target_of(m)
+    if target is None:return None
+    now=int(time.time()); seconds=seconds_remaining(m)
+    if not 0<seconds<=900:return None
+    with connect() as c:
+        rows=c.execute('SELECT price FROM keke_brti_ticks WHERE timestamp>=? ORDER BY timestamp',
+                       (now-90,)).fetchall()
+    if len(rows)<3:return None
+    prices=[float(r['price']) for r in rows]
+    volatility=max(12.0,max(prices)-min(prices))
+    distance=brti-target
+    return {'ticker':m['ticker'],'at':now,'seconds':seconds,'btc':brti,
+            'source':'BRTI','target':target,'distance':distance,
+            'volatility':volatility,'delta3':prices[-1]-prices[0],
+            'asks':{side:quote(m,side,'ask') for side in ('UP','DOWN')},
+            'brti_levels':'📊 Completed candles collecting',
+            'favored':'UP' if distance>0 else 'DOWN' if distance<0 else None}
+
 
 def settlement_signal(a):
     if a['source']!='BRTI' or a['distance'] is None:
@@ -1278,6 +1308,76 @@ def range_pattern(candles):
     return {'pattern':'CONSOLIDATING','side':'WAIT','support':support,'resistance':resistance}
 
 
+# Market-structure observations only. This never opens simulated or real trades.
+def detect_retest(candles, tolerance_fraction=0.12):
+    """Confirm a prior range break and its subsequent retest using closed 1m bars.
+
+    The baseline ends BEFORE the breakout; levels are frozen for the event.
+    A retest is not the same thing as merely being beyond the old level.
+    """
+    if len(candles)<9:return None
+    rows=candles[-40:]
+    # Reject gaps: an unobserved minute could invalidate the sequence.
+    if any(int(rows[i+1]['time'])-int(rows[i]['time'])!=60 for i in range(len(rows)-1)):
+        return None
+    last=rows[-1]
+    # Break happened 1-5 bars ago, and the final bar is the confirmation.
+    for b in range(len(rows)-2,max(5,len(rows)-7),-1):
+        base=rows[b-6:b]
+        if len(base)!=6:continue
+        floor=min(x['low'] for x in base)
+        ceiling=max(x['high'] for x in base)
+        width=ceiling-floor
+        if width<8 or width>500:continue
+        tol=max(5.0,min(35.0,width*tolerance_fraction))
+        breakout=rows[b]
+        after=rows[b+1:]
+        if len(after)<1:continue
+        # Closing beyond the previous six-bar range establishes a candidate break.
+        if breakout['close']>ceiling+tol:
+            level=ceiling
+            # Subsequent candle must test the frozen level and finish above it.
+            tests=[x for x in after if x['low']<=level+tol and x['high']>=level-tol]
+            if tests and last['close']>level+tol and last['close']>last['open']:
+                return {'event':'RESISTANCE RETEST HELD','side':'UP','level':level,
+                        'break_time':breakout['time'],'confirmed_at':last['time']}
+            if last['close']<level-tol:
+                return {'event':'FAILED UPSIDE BREAKOUT','side':'DOWN','level':level,
+                        'break_time':breakout['time'],'confirmed_at':last['time']}
+        if breakout['close']<floor-tol:
+            level=floor
+            tests=[x for x in after if x['high']>=level-tol and x['low']<=level+tol]
+            if tests and last['close']<level-tol and last['close']<last['open']:
+                return {'event':'SUPPORT RETEST REJECTED','side':'DOWN','level':level,
+                        'break_time':breakout['time'],'confirmed_at':last['time']}
+            if last['close']>level+tol:
+                return {'event':'FAILED DOWNSIDE BREAKDOWN','side':'UP','level':level,
+                        'break_time':breakout['time'],'confirmed_at':last['time']}
+    return None
+
+
+def market_structure_alert(m,a,candles):
+    """Persistent deduplication; no scalp quote, entry, or paper trade."""
+    pattern=detect_retest(candles)
+    if not pattern:return None
+    # Only report confirmations occurring in the current contract.
+    seconds=a.get('seconds')
+    if seconds is None:return None
+    contract_start=int(time.time())-(900-int(seconds))
+    if pattern['confirmed_at']+60<contract_start:return None
+    with connect() as c:
+        cur=c.execute("""INSERT OR IGNORE INTO keke_retest_alerts
+            (ticker,break_time,event,level,confirmed_at) VALUES(?,?,?,?,?)""",
+            (m['ticker'],pattern['break_time'],pattern['event'],pattern['level'],pattern['confirmed_at']))
+        fresh=cur.rowcount==1
+    if fresh and state['enabled']:
+        send(f"📍 KEKE • {pattern['event']}\n"
+             f"Frozen level ${pattern['level']:,.2f} • BRTI ${a['btc']:,.2f}\n"
+             f"Confirmed by completed 1m candle • {seconds//60}:{seconds%60:02d} left\n"
+             'Market structure only • not a scalp entry or guaranteed settlement pick')
+    return pattern
+
+
 def range_update_exits(m,a,read):
     """Close simulated positions using an observed sell bid; no settlement assumptions."""
     with connect() as c:
@@ -1418,7 +1518,7 @@ def position_exit_alert(position,a,read):
     qty=position['qty']; avg=position['avg']; bid=position['bid']
     if avg is None or bid is None or qty<=0:return
     move=bid-avg
-    against=read.get('scalp') in ('UP','DOWN') and read['scalp']!=side
+    against=read.get('settlement_side') in ('UP','DOWN') and read['settlement_side']!=side
     if move>=TAKE_PROFIT_CENTS:
         category='TAKE PROFIT WATCH'
     elif move<=-STOP_WARNING_CENTS or against:
@@ -1430,7 +1530,7 @@ def position_exit_alert(position,a,read):
     if now-trade_alert_state['last_exit'].get(key,0)<POSITION_ALERT_COOLDOWN:return
     trade_alert_state['last_exit'][key]=now
     gross=position['gross']
-    detail=' • Momentum opposing' if against else ''
+    detail=' • Settlement forecast opposes holding' if against else ''
     send(f'{"💰 SELL WATCH" if category=="TAKE PROFIT WATCH" else "🚨 EXIT WATCH"} {side} • {ask_text(bid)}\n'
          f'⏱ {a["seconds"]//60}:{a["seconds"]%60:02d} left\n'
          f'Entry {ask_text(avg)} → Sell bid {ask_text(bid)}\n'
@@ -1478,39 +1578,59 @@ def get_open_position(m):
             'bid':bid,'ask':ask,'gross':gross}
 
 def portfolio_poll(m,a,read):
+    """Monitor actual account holdings independently of disabled scalp entries.
+    Persist observed position changes across restarts; never claim a sale was filled
+    without confirmed execution history.
+    """
     now=time.time()
     if now-portfolio_state['last_poll']<PORTFOLIO_POLL_SECONDS:return
     portfolio_state['last_poll']=now
+    ticker=m['ticker']
     try:
         position=get_open_position(m)
     except Exception as exc:
         if now-portfolio_state['error_at']>600:
             portfolio_state['error_at']=now
-            LOG.warning('Read-only portfolio check failed (%s); position alerts unavailable',type(exc).__name__)
-            if state['enabled']:send('⚠️ Kalshi account position read unavailable. No position-based exit alerts until restored.')
+            LOG.warning('Position read failed: %s',type(exc).__name__)
+            if state['enabled']:send('⚠️ Kalshi position unavailable; exit monitoring temporarily unverified.')
         return
-    if position is None:
-        portfolio_state['positions'].pop(m['ticker'],None)
+    with connect() as c:
+        old=c.execute('SELECT * FROM keke_position_snapshots WHERE ticker=?',(ticker,)).fetchone()
+        old=dict(old) if old else None
+        if position:
+            c.execute("""INSERT INTO keke_position_snapshots(ticker,side,qty,basis,bid,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET
+                side=excluded.side,qty=excluded.qty,basis=excluded.basis,
+                bid=excluded.bid,updated_at=excluded.updated_at""",
+                (ticker,position['side'],position['qty'],position['basis'],position['bid'],int(now)))
+        elif old:
+            c.execute('DELETE FROM keke_position_snapshots WHERE ticker=?',(ticker,))
+        event=None
+        if old and not position:event='POSITION CLOSED / NO LONGER HELD'
+        elif old and position and old['side']!=position['side']:event='POSITION SIDE CHANGED'
+        elif old and position and position['qty']<old['qty']-1e-8:event='POSITION REDUCED'
+        elif old and position and position['qty']>old['qty']+1e-8:event='POSITION INCREASED'
+        elif position and not old:event='POSITION DETECTED'
+        if event:
+            c.execute('INSERT INTO keke_position_events(ticker,event,side,old_qty,new_qty,recorded_at) VALUES(?,?,?,?,?,?)',
+                      (ticker,event,old['side'] if old else position['side'],old['qty'] if old else 0,
+                       position['qty'] if position else 0,int(now)))
+    if event and state['enabled']:
+        if position is None:
+            send(f'✅ {event} • {ticker}\nPreviously {old["qty"]:g} {old["side"]}; now 0.\nExit detected from holdings, NOT verified realized P/L.')
+        else:
+            send(f'💰 {event} • {ticker}\n{position["qty"]:g} {position["side"]} '
+                 f'• bid {ask_text(position["bid"])}\nGross P/L {tiny_money(position["gross"])} '
+                 '(estimated; fees/fills unverified).')
+    if not position:
+        portfolio_state['positions'].pop(ticker,None)
         return
-    old=portfolio_state['positions'].get(m['ticker'])
-    portfolio_state['positions'][m['ticker']]=position
-    position_exit_alert(position,a,read)
-    if not state['enabled']:return
-    new=(old is None or (old['side'],old['qty'])!=(position['side'],position['qty']))
-    counter=read['scalp'] in ('UP','DOWN') and read['scalp']!=position['side']
-    pnl=position['gross']
-    material=(pnl is not None and position['basis'] and abs(pnl/position['basis'])>=.15)
-    if not (new or counter or material):return
-    if not new and now-portfolio_state['alert_at'].get(m['ticker'],0)<POSITION_ALERT_COOLDOWN:return
-    portfolio_state['alert_at'][m['ticker']]=now
-    avg=ask_text(position['avg']); bid=ask_text(position['bid'])
-    gross=tiny_money(pnl)
-    headline='💰 POSITION DETECTED' if new else '⚠️ POSITION WATCH'
-    flag='\n⚠️ Short-term chart read opposes your position.' if counter else ''
-    send(f"{headline}\n{position['qty']} {position['side']} • Basis/contract: {avg}"
-         f"\nTotal cost: {total_money(position['basis'])} • Current bid: {bid} • Estimated gross P/L: {gross}"
-         f"\n{a['seconds']//60}:{a['seconds']%60:02d} left{flag}"
-         "\nGross estimate excludes fees, slippage and liquidity. No trades placed.")
+    portfolio_state['positions'][ticker]=position
+    # Compare the position to the SETTLEMENT prediction, not the disabled scalp model.
+    prediction=state.get('v56') or {}
+    predicted=prediction.get('side') if state.get('v56_ticker')==ticker else None
+    position_exit_alert(position,a,{'settlement_side':predicted})
+
 
 def portfolio_status():
     try:
@@ -1601,7 +1721,7 @@ def proactive_updates(a, new_contract):
         state['threat_ticker']=ticker
         state['threat_side']=None
         state['threat_at']=0
-        send(banner_levels(a)+'\n'+format_read(a,'🆕 NEW CONTRACT')+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
+        send(banner_levels(a)+'\n'+format_read(a,'🆕 NEW CONTRACT'))
         return
     side=a.get('v56_side');signal=a.get('v56_signal');candidate=a.get('v56_candidate')
     threatened=(side in ('UP','DOWN') and candidate in ('UP','DOWN')
@@ -1633,9 +1753,9 @@ def main():
     state['enabled']=runtime_get('alerts_enabled',True)
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
-    LOG.info('KeKe V5.20 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.22 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    if state['enabled']:send('🎯 KeKe V5.20 BRTI settlement predictions online. '
+    if state['enabled']:send('🎯 KeKe V5.22 BRTI settlement predictions online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     while True:
@@ -1660,9 +1780,22 @@ def main():
                 if brti is None:
                     raise ValueError('BRTI unavailable; no candle/settlement signal')
                 candles=brti_candles()
-                # No synthetic prices or Kraken fallback. The bot keeps collecting
-                # until five contiguous completed BRTI minutes are available; longer frames remain collecting.
-                if len(candles)<5 or any(candles[-i]['time']-candles[-i-1]['time']!=60 for i in range(1,5)):
+                # Never fabricate candles; evaluate early forecasts with available verified ticks.
+                if not candles:
+                    # First minute: use verified recent BRTI ticks for a provisional
+                    # settlement forecast. Never manufacture completed candles.
+                    a=fast_opening_assessment(market,brti)
+                    if a is not None:
+                        new=state['ticker']!=a['ticker']
+                        state['ticker']=a['ticker']
+                        a['dual_read']={'frames':{1:'COLLECTING',3:'COLLECTING',15:'COLLECTING'},'scalp':'WAIT'}
+                        opening_seen(a['ticker'],a['seconds'],True)
+                        process_v56(a,new)
+                        portfolio_poll(market,a,{'scalp':'WAIT'})
+                        state['last_read']=a
+                        time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
+                        continue
+                if not candles:
                     # Portfolio reads must keep working while BRTI history warms up.
                     portfolio_poll(market,{'seconds':seconds_remaining(market)}, {'scalp':'WAIT'})
                     opening_seen(market['ticker'],seconds_remaining(market),False)
@@ -1683,19 +1816,23 @@ def main():
                 if time.time()-(candles[-1]['time']+60)>MAX_DATA_AGE:
                     raise ValueError('BRTI candles stale; no directional read')
                 btc=brti
-                a=assessment(market,btc,candles,brti)
+                a=assessment(market,btc,candles,brti) if len(candles)>=15 else fast_opening_assessment(market,brti)
+                if a is None: raise ValueError('Insufficient observed BRTI samples')
                 a['brti_levels']=brti_opening_levels(candles,brti)
                 opening_seen(a['ticker'],a['seconds'],True)
-                record(a)
-                record_early_prediction(a)
-                record_v53(a)
-                quick=dual_read(a,candles)
+                if len(candles)>=15:
+                    record(a)
+                    record_early_prediction(a)
+                    record_v53(a)
+                quick=dual_read(a,candles) if len(candles)>=15 else {'scalp':'WAIT','frames':{1:'COLLECTING',3:'COLLECTING',15:'COLLECTING'}}
                 a['dual_read']=quick
-                portfolio_poll(market,a,{'scalp':'WAIT'})
-                # Settlement-only mode: no paper scalp entries, exits, or range alerts.
+                # Independent retest observations remain active in settlement-only mode.
+                market_structure_alert(market,a,candles)
+                # Position monitoring runs after settlement forecast updates.
+                # Settlement-only mode: no paper scalp entries, exits, or range-trading alerts.
                 # Legacy scalp history remains untouched in SQLite.
                 try:
-                    record_shadow(a)
+                    if len(candles)>=15: record_shadow(a)
                 except Exception:
                     LOG.exception('Silent shadow-model recording failed')
                 new=state['ticker']!=a['ticker']
@@ -1706,10 +1843,11 @@ def main():
                 if new:
                     proactive_updates(a,True)
                 process_v56(a,new)
+                portfolio_poll(market,a,{'scalp':'WAIT'})
                 if not new:
                     proactive_updates(a,False)
                 state['last_read']=a
-                LOG.info('%s %s BRTI %s target %s',a['ticker'],a['decision'],brti,a['target'])
+                LOG.info('%s settlement %s BRTI %s target %s',a['ticker'],a.get('v56_side'),brti,a['target'])
             else:LOG.info('No active BTC 15m contract')
         except Exception:LOG.exception('Monitor loop error; will retry')
         time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))

@@ -1,4 +1,4 @@
-"""KeKe V5.14 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.15 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -934,6 +934,7 @@ def initialize_telegram():
 # This is a directional research signal, NOT a calibrated win probability.
 V56_FIRST_MIN_SECONDS=600
 V56_INITIAL_SIGNAL=0.45
+INITIAL_PICK_MIN_SECONDS=780  # opening two minutes of each 900-second contract
 V56_REVERSAL_SIGNAL=0.95
 V56_FAST_REVERSAL_SIGNAL=1.8
 V56_REVERSAL_CONFIRM=2
@@ -1389,7 +1390,7 @@ def process_v56(a,new_contract):
     candidate=a['v56_candidate']
     if t['side'] is None:
         # Make a qualifying early call, but don't force a coin-flip on a flat signal.
-        if a['seconds']>=90 and abs(signal)>=V56_INITIAL_SIGNAL:
+        if INITIAL_PICK_MIN_SECONDS<=a['seconds']<=900 and abs(signal)>=V56_INITIAL_SIGNAL:
             t['side']=candidate
             a['v56_side']=candidate
             record_v56(a,'INITIAL',candidate,reason='First qualifying settlement signal')
@@ -1409,13 +1410,15 @@ def compact_update(a):
     """First two lines fit Telegram notification previews; detail follows on opening."""
     seconds=max(0,int(a['seconds']))
     mm,ss=divmod(seconds,60)
-    side=a.get('v56_side') or 'ANALYZING'
+    side=a.get('v56_side') or 'NO EARLY PICK'
     distance=a.get('distance')
     delta=f'${distance:+,.2f}' if distance is not None else 'n/a'
     read=a.get('dual_read') or {}
     frames=read.get('frames') or {}
     arrows={'UP':'↑','DOWN':'↓','MIXED':'↔','FLAT':'→','COLLECTING':'⏳','N/A':'⏳'}
     trend=' '.join(f'{m}m{arrows.get(frames.get(m),"⏳")}' for m in (1,3))
+    if side=='NO EARLY PICK' and seconds<INITIAL_PICK_MIN_SECONDS:
+        side='NO EARLY PICK'
     return (f'📡 {side} • {mm}:{ss:02d} LEFT\n'
             f'BRTI {delta} vs target | {trend}\n\n'
             f'🎯 Target {money_text(a.get("target"))}\n'
@@ -1457,9 +1460,9 @@ def send_last():
 def main():
     init_db()
     initialize_telegram()
-    LOG.info('KeKe V5.14 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.15 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.14 BRTI-only entry/exit watch online. '
+    send('🧠 KeKe V5.15 BRTI-only entry/exit watch online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. No trades. /stats for BRTI-only, /legacy for history' )
     while True:

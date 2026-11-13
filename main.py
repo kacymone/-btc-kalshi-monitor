@@ -1,4 +1,4 @@
-"""KeKe V5.6 settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.9 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 LOG = logging.getLogger('keke')
 BASE='https://external-api.kalshi.com/trade-api/v2'
 SERIES='KXBTC15M'
-KRAKEN='https://api.kraken.com/0/public'
+# BRTI is the sole BTC price source; no exchange-price fallback.
 TOKEN=os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT=os.getenv('TELEGRAM_CHAT_ID')
 DATA_DIR=os.getenv('DATA_DIR','/data')
@@ -110,6 +110,9 @@ def init_db():
             official_side TEXT, grade TEXT DEFAULT 'PENDING', graded_at INTEGER,
             PRIMARY KEY(ticker,checkpoint))''')
         c.execute('CREATE INDEX IF NOT EXISTS idx_shadow_grade ON keke_shadow_predictions(grade,ticker)')
+        c.execute('CREATE TABLE IF NOT EXISTS keke_brti_ticks (timestamp INTEGER PRIMARY KEY, price REAL NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS keke_model_epochs (version TEXT PRIMARY KEY, started_at INTEGER NOT NULL)')
+        c.execute('INSERT OR IGNORE INTO keke_model_epochs(version,started_at) VALUES (?,?)',('5.9-BRTI-STATS',int(time.time())))
 
 
 def http_json(url,params=None,timeout=6):
@@ -162,27 +165,49 @@ def seconds_remaining(m):
     close=datetime.fromisoformat(m['close_time'].replace('Z','+00:00'))
     return max(0,int((close-datetime.now(timezone.utc)).total_seconds()))
 
-def kraken_data():
-    # One-minute candles include history BEFORE this Kalshi contract began.
-    obj=http_json(KRAKEN+'/OHLC',{'pair':'XBTUSD','interval':1})
-    results=obj.get('result',{})
-    key=next((k for k in results if k!='last'),None)
-    if not key: raise ValueError('No Kraken OHLC series')
-    now=time.time()
+def save_brti_ticks():
+    """Persist authentic index observations, including any history in the response."""
+    obj=brti_raw()
+    data=obj.get('data')
+    payload=data.get('payload') if isinstance(data,dict) else None
+    if not isinstance(payload,list) or not payload:
+        raise ValueError('No BRTI payload')
+    now=time.time(); ticks=[]
+    for item in payload:
+        if not isinstance(item,dict) or item.get('repeatOfPreviousValue') is True:continue
+        price=number(item.get('value'));stamp=number(item.get('time'))
+        if price is None or stamp is None or not math.isfinite(price) or not math.isfinite(stamp) or not (10000<price<1000000):continue
+        ts=stamp/1000 if stamp>1e11 else stamp
+        if not -5<=now-ts<=7200:continue
+        ticks.append((int(ts),price))
+    if not ticks:raise ValueError('No valid BRTI observations')
+    with connect() as c:
+        c.executemany('INSERT OR REPLACE INTO keke_brti_ticks(timestamp,price) VALUES (?,?)',ticks)
+        c.execute('DELETE FROM keke_brti_ticks WHERE timestamp<?',(int(now)-86400,))
+    latest_ts,latest_price=max(ticks)
+    if now-latest_ts>BRTI_MAX_AGE:raise ValueError('Stale BRTI feed')
+    return latest_price,latest_ts
+
+def brti_candles():
+    """Only complete UTC minutes with observed data near both minute boundaries.
+    Missing minutes are never interpolated or silently filled.
+    """
+    now=int(time.time());cutoff=now//60*60
+    with connect() as c:
+        rows=c.execute('SELECT timestamp,price FROM keke_brti_ticks WHERE timestamp>=? AND timestamp<? ORDER BY timestamp',
+                       (cutoff-7200,cutoff)).fetchall()
+    buckets={}
+    for row in rows:
+        minute=row['timestamp']//60*60
+        buckets.setdefault(minute,[]).append((row['timestamp'],row['price']))
     candles=[]
-    for r in results[key]:
-        try:
-            t=int(float(r[0]))
-            if t+60<=now:
-                candles.append({'time':t,'open':float(r[1]),'high':float(r[2]),
-                                'low':float(r[3]),'close':float(r[4]),'volume':float(r[6]) if len(r)>6 else 0.0})
-        except (IndexError,TypeError,ValueError): pass
-    if len(candles)<12: raise ValueError('Not enough completed 1m candles')
-    obj=http_json(KRAKEN+'/Ticker',{'pair':'XBTUSD'})
-    ticker=next(iter(obj.get('result',{}).values()),None)
-    if not ticker: raise ValueError('Kraken ticker unavailable')
-    live=float(ticker['c'][0])
-    return live,candles
+    for t,values in sorted(buckets.items()):
+        # Require actual samples from both halves of each completed minute.
+        if values[0][0]>t+20 or values[-1][0]<t+40:continue
+        prices=[v[1] for v in values]
+        candles.append({'time':t,'open':prices[0],'high':max(prices),
+                        'low':min(prices),'close':prices[-1],'volume':0.0})
+    return candles
 
 def brti_raw():
     """Fetch authenticated index response; do not log credentials or payload."""
@@ -261,28 +286,28 @@ def assessment(m,btc,candles,brti=None):
     trend='UP' if closes[-1]>closes[-6] and closes[-3]>closes[-9] else ('DOWN' if closes[-1]<closes[-6] and closes[-3]<closes[-9] else 'MIXED')
     distance=brti-target if brti is not None and target is not None else None
     favored='UP' if distance is not None and distance>0 else ('DOWN' if distance is not None and distance<0 else None)
-    # Completed 1-minute Kraken candles; pre-contract candles available immediately.
+    # Completed 1-minute BRTI candles; history is accumulated persistently.
     e5=ema(closes[-50:],5);e13=ema(closes[-50:],13)
     r=rsi(closes)
     vol=[c['volume'] for c in candles[-21:]]
-    vol_ratio=vol[-1]/max(sum(vol[:-1])/max(1,len(vol)-1),.000001)
-    recent=candles[-16:-1]
+    vol_ratio=None  # BRTI index has no trade volume
+    recent=candles[-16:-1] if len(candles)>=17 else candles[:-1]
     resistance=max(c['high'] for c in recent)
     support=min(c['low'] for c in recent)
     vwap_num=sum(((c['high']+c['low']+c['close'])/3)*c['volume'] for c in candles[-15:])
     vwap_den=sum(c['volume'] for c in candles[-15:])
-    vwap=vwap_num/vwap_den if vwap_den else closes[-1]
+    vwap=None  # BRTI has no exchange volume; do not mislabel an average as VWAP
     # A directional research score, NOT a probability or claimed statistical edge.
     score=0.0
     score+=1.0 if btc>e5 else -1.0
     score+=1.0 if e5>e13 else -1.0
-    score+=.75 if btc>vwap else -.75
+    # No volume-weighted indicators on BRTI
     score+=.75 if delta3>0 else -.75
     score+=.5 if closes[-1]>closes[-6] else -.5
     score+=.5 if r>55 else (-.5 if r<45 else 0)
-    if btc>resistance and vol_ratio>1.15:score+=1.0
-    if btc<support and vol_ratio>1.15:score-=1.0
-    # Distance is BRTI-based; never replace settlement source with Kraken.
+    if btc>resistance:score+=.5
+    if btc<support:score-=.5
+    # Both candle structure and target distance use BRTI.
     if distance is not None:
         normalized=distance/max(typical_range*max(seconds/60,1)**.5,10)
         score+=max(-2.0,min(2.0,normalized))
@@ -309,11 +334,11 @@ def assessment(m,btc,candles,brti=None):
     else:
         reasons.append('Mixed directional evidence')
     indicators={'ema5':round(e5,2),'ema13':round(e13,2),'rsi14':round(r,1),
-                'vwap15':round(vwap,2),'vol_ratio':round(vol_ratio,2),
+                'vwap15':None,'vol_ratio':None,
                 'support15':round(support,2),'resistance15':round(resistance,2),
                 'momentum1':round(delta1,2),'momentum3':round(delta3,2),
                 'momentum5':round(btc-closes[-5],2),'momentum15':round(btc-closes[-15],2)}
-    return {'ticker':m['ticker'],'at':now,'seconds':seconds,'btc':brti,'kraken':btc,
+    return {'ticker':m['ticker'],'at':now,'seconds':seconds,'btc':brti,'kraken':btc, # legacy field name; value is BRTI, never Kraken
             'source':'BRTI' if brti is not None else 'UNAVAILABLE','target':target,
             'distance':distance,'favored':favored,'trend':trend,'delta1':delta1,
             'delta3':delta3,'volatility':typical_range,'confidence':confidence,
@@ -343,7 +368,7 @@ def record(a):
           (a['at'],a['ticker'],a['seconds'],a['btc'],a['target'],a['distance'],
            a['bids']['UP'],a['asks']['UP'],a['bids']['DOWN'],a['asks']['DOWN'],
            a['trend'],a['delta1'],a['delta3'],a['volatility'],a['favored'],
-           a['confidence'],a['decision'],a['reason'],'5.5-THESIS'))
+           a['confidence'],a['decision'],a['reason'],'5.9-BRTI'))
         if a['decision'].startswith('ENTER '):
             side=a['decision'].split()[-1]
             c.execute('''INSERT OR IGNORE INTO settlement_calls
@@ -463,6 +488,43 @@ def grade_settlements():
                  f'Final {last}: {"WIN" if last==outcome else "LOSS"}\nKalshi official market result')
 
 
+def stats_epoch():
+    with connect() as c:
+        row=c.execute('SELECT started_at FROM keke_model_epochs WHERE version=?',('5.9-BRTI-STATS',)).fetchone()
+    return int(row['started_at'])
+
+
+def brti_stats_summary():
+    cutoff=stats_epoch()
+    with connect() as c:
+        obs=c.execute('SELECT COUNT(*) n, COUNT(DISTINCT ticker) contracts FROM settlement_observations WHERE model_version=? AND captured_at>=?',('5.9-BRTI',cutoff)).fetchone()
+        forecasts=c.execute('SELECT ticker,event,side,grade,ask FROM keke_v56_forecasts WHERE captured_at>=? ORDER BY ticker,id',(cutoff,)).fetchall()
+        paper=c.execute('SELECT stage,grade,ask FROM v53_opportunities WHERE captured_at>=?',(cutoff,)).fetchall()
+    def summary(rows):
+        wins=sum(r['grade']=='WIN' for r in rows)
+        losses=sum(r['grade']=='LOSS' for r in rows)
+        pending=sum(r['grade']=='PENDING' for r in rows)
+        rate=f'{100*wins/(wins+losses):.1f}%' if wins+losses else 'n/a'
+        return f'{wins}W / {losses}L • {rate} • pending {pending}'
+    initial=[r for r in forecasts if r['event']=='INITIAL']
+    reversal=[r for r in forecasts if r['event']=='REVERSAL']
+    # Grade only the latest prediction per contract as the final directional call.
+    latest={}
+    for r in forecasts:latest[r['ticker']]=r
+    final=list(latest.values())
+    paper_buy=[r for r in paper if r['stage']=='PAPER_BUY']
+    # These are model outcomes, not executed fills or realized trading returns.
+    return (f'📊 KEKE V5.9 • BRTI-ONLY\n'
+            f'Contracts observed: {obs["contracts"]} • Snapshots: {obs["n"]}\n'
+            f'🎯 Initial settlement: {summary(initial)}\n'
+            f'🔄 Reversals: {summary(reversal)}\n'
+            f'🏁 Last settlement pick: {summary(final)}\n'
+            f'🧪 Paper entries: {summary(paper_buy)}\n'
+            'Scalp realized P/L: not tracked yet\n'
+            'Previous model history preserved • /legacy for historical report\n'
+            'Win rates reflect official settled outcomes, not actual trade profits.')
+
+
 def grade_summary():
     with connect() as c:
         observations=c.execute('SELECT COUNT(*) FROM settlement_observations').fetchone()[0]
@@ -542,6 +604,32 @@ def send(message):
 def money_text(x): return f'${x:,.2f}' if x is not None else 'UNKNOWN'
 def ask_text(x): return f'{x*100:.1f}¢' if x is not None else 'n/a'
 
+def tiny_money(x):
+    if x is None:return 'unknown'
+    return f'${x:+.4f}' if abs(x)<.01 else f'${x:+.2f}'
+
+def total_money(x):
+    if x is None:return 'unknown'
+    return f'${x:.4f}' if 0<=x<.01 else f'${x:.2f}'
+
+
+def brti_opening_levels(candles,live):
+    # Levels are always from verified completed BRTI minutes, not an exchange.
+    if not candles:return '🟡 Support/resistance: collecting BRTI history'
+    latest=candles[-1]['time']
+    recent=[c for c in candles if latest-c['time']<=900]
+    if len(recent)<5:return '🟡 Support/resistance: collecting BRTI history'
+    if any(recent[i]['time']-recent[i-1]['time']!=60 for i in range(1,len(recent))):
+        return '🟡 Support/resistance: gaps in BRTI history'
+    low=min(c['low'] for c in recent)
+    high=max(c['high'] for c in recent)
+    window=f'{len(recent)}m' if len(recent)<15 else '15m'
+    return (f'🟢 BRTI support ({window}): ${low:,.2f} (BRTI − support: ${live-low:+.2f})\n'
+            f'🔴 BRTI resistance ({window}): ${high:,.2f} (resistance − BRTI: ${high-live:+.2f})')
+
+def brti_levels_text(a):
+    return a.get('brti_levels','🟡 BRTI levels unavailable')
+
 def format_read(a, headline=None):
     mm,ss=divmod(max(0,int(a['seconds'])),60)
     target=money_text(a.get('target'))
@@ -562,10 +650,11 @@ def format_read(a, headline=None):
     stamp=a.get('brti_stamp')
     feed_age=f'{max(0,time.time()-stamp):.1f}s' if stamp is not None else 'unknown'
     updated=datetime.fromtimestamp(a.get('at',time.time()),timezone.utc).strftime('%H:%M:%S UTC')
-    return (f'{label}\n🎯 Target: {target}\n'
+    levels=brti_levels_text(a)
+    return (f'{label}\n🎯 Target: {target}\n'+levels+'\n'
             f'⏱ {mm}:{ss:02d} • {side or "NO PICK"} {mult}\n'
             f'📍 BRTI vs target: ${distance} • Signal {strength}\n'
-            f'Latest evidence: {forecast or "unavailable"} • Experimental, not a probability\n'
+            f'Latest evidence: {forecast or "unavailable"}\n'
             f'📡 BRTI age: {feed_age} • Read: {updated}\n'
             'Manual trades only')
 
@@ -600,7 +689,7 @@ def brti_record_shape():
 def run_brti_test():
     try:
         price,stamp=brti_live()
-        send(f'🟢 BRTI LIVE: ${price:,.2f}\nFeed age: {time.time()-stamp:.0f}s\nSettlement reads use BRTI; Kraken for trend.')
+        send(f'🟢 BRTI LIVE: ${price:,.2f}\nFeed age: {time.time()-stamp:.0f}s\nSettlement and chart readings use BRTI.')
     except Exception as exc:
         LOG.warning('BRTI test failed: %s',type(exc).__name__)
         try:
@@ -656,7 +745,7 @@ def export_research():
         send('⚠️ Export failed. Your existing database was not changed.')
 
 def send_stats():
-    send(grade_summary())
+    send(brti_stats_summary())
 
 def fresh_status():
     """Fetch a new market and BRTI tick for STATUS; do not change prediction state."""
@@ -664,12 +753,15 @@ def fresh_status():
         market=get_market()
         if not market:
             return '👀 No currently open BTC 15-minute contract.'
-        btc,candles=kraken_data()
-        if time.time()-(candles[-1]['time']+60)>MAX_DATA_AGE:
-            return '⚠️ Kraken candle is stale. No reliable fresh STATUS available.'
-        brti,stamp=brti_live()
+        brti,stamp=save_brti_ticks()
         state['current_brti_stamp']=stamp
-        a=assessment(market,btc,candles,brti)
+        candles=brti_candles()
+        levels=brti_opening_levels(candles,brti)
+        if len(candles)<15 or any(candles[-i]['time']-candles[-i-1]['time']!=60 for i in range(1,15)):
+            return (f'📡 BRTI ${brti:,.2f} • Target {money_text(target_of(market))}\n'
+                    +levels+'\n⚪ Collecting verified BRTI candles; no trade signal')
+        a=assessment(market,brti,candles,brti)
+        a['brti_levels']=levels
         # Keep the current stored thesis, without triggering any prediction event.
         if state.get('v56_ticker')==a['ticker']:
             side=state.get('v56',{}).get('side')
@@ -705,6 +797,7 @@ def telegram_commands():
             elif cmd.startswith('/status'):
                 send(fresh_status())
             elif cmd.startswith('/stats'):send_stats()
+            elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
             elif cmd.startswith('/position'):send(portfolio_status())
             elif cmd.startswith('/last'):send_last()
             elif cmd.startswith('/brti'):run_brti_test()
@@ -721,7 +814,8 @@ def initialize_telegram():
             {'command':'start','description':'Resume settlement alerts'},
             {'command':'stop','description':'Pause alerts; keep recording'},
             {'command':'status','description':'Fetch fresh settlement read'},
-            {'command':'stats','description':'Settlement research counts'},
+            {'command':'stats','description':'V5.9 BRTI-only report card'},
+            {'command':'legacy','description':'Historical and lifetime research stats'},
             {'command':'last','description':'Last settlement ENTER'},
             {'command':'brti','description':'Test read-only Kalshi BRTI access'},
             {'command':'export','description':'Download research CSV archive'},
@@ -740,7 +834,7 @@ def settlement_signal(a):
     if a['source']!='BRTI' or a['distance'] is None:
         return None
     seconds=max(30,a['seconds'])
-    # Completed Kraken candle high-low range approximates 1m variability.
+    # Completed BRTI candle high-low range approximates 1m variability.
     # The floor prevents tiny measured ranges from creating false certainty.
     range1=max(12.0,float(a['volatility'] or 0))
     scale=max(18.0,range1*math.sqrt(seconds/60))
@@ -761,18 +855,16 @@ def shadow_score(a):
         score+=1.0; reasons.append('rising short-term trend')
     elif price<i['ema5']<i['ema13']:
         score-=1.0; reasons.append('falling short-term trend')
-    score+=0.5 if price>i['vwap15'] else -0.5
     if i['momentum3']>0 and i['momentum5']>0:
         score+=0.8; reasons.append('upward momentum')
     elif i['momentum3']<0 and i['momentum5']<0:
         score-=0.8; reasons.append('downward momentum')
     if i['rsi14']>=60: score+=0.45
     elif i['rsi14']<=40: score-=0.45
-    if i['vol_ratio']>=1.2:
-        if price>i['resistance15']:
-            score+=0.8; reasons.append('upside breakout on higher volume')
-        elif price<i['support15']:
-            score-=0.8; reasons.append('downside breakout on higher volume')
+    if price>i['resistance15']:
+        score+=0.5; reasons.append('BRTI above recent resistance')
+    elif price<i['support15']:
+        score-=0.5; reasons.append('BRTI below recent support')
     scale=max(25.0,float(a['volatility'] or 0)*math.sqrt(max(a['seconds'],60)/60))
     score+=max(-1.0,min(1.0,a['distance']/scale))
     return score,('UP' if score>0 else 'DOWN'),'; '.join(reasons) or 'mixed indicators'
@@ -844,7 +936,7 @@ def completed_timeframes(candles,minutes):
     return out
 
 def timeframe_signal(rows,live):
-    if len(rows)<4:return 'N/A',0
+    if len(rows)<4:return 'COLLECTING',0
     last=rows[-1];prev=rows[-2]
     slope=last['close']-rows[-4]['close']
     direction='UP' if slope>0 else ('DOWN' if slope<0 else 'FLAT')
@@ -930,7 +1022,7 @@ def portfolio_poll(m,a,read):
     except Exception as exc:
         if now-portfolio_state['error_at']>600:
             portfolio_state['error_at']=now
-            LOG.warning('Read-only portfolio check failed: %s: %s; position alerts unavailable',type(exc).__name__,str(exc)[:150])
+            LOG.warning('Read-only portfolio check failed (%s); position alerts unavailable',type(exc).__name__)
             if state['enabled']:send('⚠️ Kalshi account position read unavailable. No position-based exit alerts until restored.')
         return
     if position is None:
@@ -947,11 +1039,11 @@ def portfolio_poll(m,a,read):
     if not new and now-portfolio_state['alert_at'].get(m['ticker'],0)<POSITION_ALERT_COOLDOWN:return
     portfolio_state['alert_at'][m['ticker']]=now
     avg=ask_text(position['avg']); bid=ask_text(position['bid'])
-    gross=f'${pnl:+.2f}' if pnl is not None else 'unknown'
+    gross=tiny_money(pnl)
     headline='💰 POSITION DETECTED' if new else '⚠️ POSITION WATCH'
     flag='\n⚠️ Short-term chart read opposes your position.' if counter else ''
     send(f"{headline}\n{position['qty']} {position['side']} • Basis/contract: {avg}"
-         f"\nCurrent bid: {bid} • Estimated gross P/L: {gross}"
+         f"\nTotal cost: {total_money(position['basis'])} • Current bid: {bid} • Estimated gross P/L: {gross}"
          f"\n{a['seconds']//60}:{a['seconds']%60:02d} left{flag}"
          "\nGross estimate excludes fees, slippage and liquidity. No trades placed.")
 
@@ -961,9 +1053,9 @@ def portfolio_status():
         if not m:return '💰 No open BTC15m market to inspect.'
         p=get_open_position(m)
         if not p:return '💰 No active position in the current BTC15m contract.'
-        pnl=f'${p["gross"]:+.2f}' if p['gross'] is not None else 'unknown'
+        pnl=tiny_money(p['gross'])
         return (f"💰 {p['qty']} {p['side']} • Cost basis/contract {ask_text(p['avg'])}"
-                f"\nSell bid {ask_text(p['bid'])} • Gross P/L {pnl}"
+                f"\nTotal cost {total_money(p['basis'])} • Sell bid {ask_text(p['bid'])} • Gross P/L {pnl}"
                 "\nExcludes fees and slippage; current contract only.")
     except Exception as exc:
         LOG.warning('Position command failed: %s: %s',type(exc).__name__,str(exc)[:150])
@@ -1057,11 +1149,11 @@ def send_last():
 def main():
     init_db()
     initialize_telegram()
-    LOG.info('KeKe V5.7 dual-read portfolio monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.9 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.7 observational dual-read online. '
-         'BRTI for target distance; Kraken for momentum. Persistent /data database. '
-         'Automatic official-result grading active. No trades. /stats' )
+    send('🧠 KeKe V5.9 BRTI-only dual-read online. '
+         'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
+         'Automatic official-result grading active. No trades. /stats for V5.9, /legacy for history' )
     while True:
         started=time.monotonic()
         try:
@@ -1071,12 +1163,8 @@ def main():
                 grade_settlements()
             market=get_market()
             if market:
-                btc,candles=kraken_data()
-                # Reject stale OHLC before making decisions.
-                if time.time()-(candles[-1]['time']+60)>MAX_DATA_AGE:
-                    raise ValueError('Stale completed Kraken candle; skipping decisions')
                 try:
-                    brti,brti_stamp=brti_live()
+                    brti,brti_stamp=save_brti_ticks()
                     state['current_brti_stamp']=brti_stamp
                     state['brti_error_at']=0
                 except Exception as exc:
@@ -1085,7 +1173,32 @@ def main():
                     if time.time()-state.get('brti_error_at',0)>600:
                         LOG.warning('BRTI unavailable: %s',str(exc)[:160])
                         state['brti_error_at']=time.time()
+                if brti is None:
+                    raise ValueError('BRTI unavailable; no candle/settlement signal')
+                candles=brti_candles()
+                # No synthetic prices or Kraken fallback. The bot keeps collecting
+                # until 15 continuous completed BRTI minutes are available.
+                if len(candles)<15 or any(candles[-i]['time']-candles[-i-1]['time']!=60 for i in range(1,15)):
+                    # Portfolio reads must keep working while BRTI history warms up.
+                    portfolio_poll(market,{'seconds':seconds_remaining(market)}, {'scalp':'WAIT'})
+                    new=state['ticker']!=market['ticker']
+                    if new:
+                        state['ticker']=market['ticker']
+                        state['last_alert']=None
+                        state['entry_side']=None
+                        if state['enabled']:
+                            level=brti_opening_levels(candles,brti)
+                            send(f'🆕 NEW CONTRACT • BRTI ${brti:,.2f} • Target {money_text(target_of(market))}\n'
+                                 +level+'\n📊 1m/3m/15m: collecting verified BRTI candles\n'
+                                 +'⚪ NO TRADE SIGNAL • Insufficient BRTI history')
+                    state['last_read']=None
+                    time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
+                    continue
+                if time.time()-(candles[-1]['time']+60)>MAX_DATA_AGE:
+                    raise ValueError('BRTI candles stale; no directional read')
+                btc=brti
                 a=assessment(market,btc,candles,brti)
+                a['brti_levels']=brti_opening_levels(candles,brti)
                 record(a)
                 record_early_prediction(a)
                 record_v53(a)
@@ -1107,7 +1220,7 @@ def main():
                 if not new:
                     proactive_updates(a,False)
                 state['last_read']=a
-                LOG.info('%s %s BRTI %s Kraken %.2f target %s',a['ticker'],a['decision'],brti,btc,a['target'])
+                LOG.info('%s %s BRTI %s target %s',a['ticker'],a['decision'],brti,a['target'])
             else:LOG.info('No active BTC 15m contract')
         except Exception:LOG.exception('Monitor loop error; will retry')
         time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))

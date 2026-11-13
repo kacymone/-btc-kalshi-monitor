@@ -1,4 +1,4 @@
-"""KeKe V5.23 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.24 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -1057,6 +1057,7 @@ def telegram_commands():
                 send(fresh_status())
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/exchange'):send(exchange_report())
+            elif cmd.startswith('/lead'):send(exchange_research_report())
             elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
             elif cmd.startswith('/position'):send(portfolio_status())
             elif cmd.startswith('/last'):send_last()
@@ -1824,6 +1825,63 @@ def exchange_worker():
         except Exception:LOG.exception('Exchange observer cycle failed')
         time.sleep(EXCHANGE_POLL_SECONDS)
 
+def exchange_lead_research(window_seconds=30, horizon_seconds=30, lookback_hours=24):
+    """Exploratory, non-overlapping directional follow-through, NOT measured latency.
+
+    At sample t: exchange change over preceding window; BRTI change over next
+    horizon. BRTI anchor must be observed at or before t, never in the future.
+    This cannot establish causality or a tradable Kalshi edge.
+    """
+    import bisect
+    now_ms=int(time.time()*1000)
+    cutoff_ms=now_ms-lookback_hours*3600000
+    with connect() as c:
+        exchanges=c.execute('SELECT exchange,received_at_ms,price FROM keke_exchange_samples WHERE received_at_ms>=? ORDER BY exchange,received_at_ms',(cutoff_ms,)).fetchall()
+        brti=c.execute('SELECT timestamp,price FROM keke_brti_ticks WHERE timestamp>=? ORDER BY timestamp',(cutoff_ms//1000-120,)).fetchall()
+    bt=[int(r['timestamp'])*1000 for r in brti]
+    bp=[float(r['price']) for r in brti]
+    grouped={name:[] for name in EXCHANGE_NAMES}
+    for r in exchanges:grouped[r['exchange']].append((int(r['received_at_ms']),float(r['price'])))
+    output={}
+    for name,points in grouped.items():
+        if len(points)<3 or len(bt)<3:
+            output[name]={'count':0,'hits':0,'rate':None};continue
+        ts=[x[0] for x in points];prices=[x[1] for x in points]
+        hits=count=0
+        last_event=-10**20
+        for t,price in points:
+            if t-last_event < horizon_seconds*1000:continue
+            prior=bisect.bisect_right(ts,t-window_seconds*1000)-1
+            anchor=bisect.bisect_right(bt,t)-1
+            future=bisect.bisect_right(bt,t+horizon_seconds*1000)-1
+            if prior<0 or anchor<0 or future<=anchor:continue
+            # Reject stale anchor, missing history and partial future windows.
+            if t-ts[prior]>(window_seconds+12)*1000:continue
+            if t-bt[anchor]>4000:continue
+            if abs(bt[future]-(t+horizon_seconds*1000))>4000:continue
+            delta=price-prices[prior]
+            brti_delta=bp[future]-bp[anchor]
+            if abs(delta)<10:continue # filter insignificant exchange movements
+            count+=1;last_event=t
+            if (delta>0 and brti_delta>0) or (delta<0 and brti_delta<0):hits+=1
+        output[name]={'count':count,'hits':hits,'rate':hits/count if count else None}
+    return output
+
+
+def exchange_research_report():
+    stats=exchange_lead_research()
+    lines=['🧪 KEKE • EXCHANGE RESEARCH',
+           '30s exchange momentum → next 30s BRTI direction',
+           'Last 24h • non-overlapping events • $10 minimum move']
+    for name in EXCHANGE_NAMES:
+        d=stats[name]
+        if d['count']<30:lines.append(f'{name}: {d["count"]} events • insufficient data')
+        else:lines.append(f'{name}: {d["rate"]:.0%} follow-through • {d["hits"]}/{d["count"]}')
+    lines.extend(['⚠️ Exploratory only: 5s HTTP polling, no synchronized trade timestamps.',
+                  'Not a measured lead in seconds, prediction accuracy, or trading profit.',
+                  'No impact on settlement picks.'])
+    return '\n'.join(lines)
+
 def exchange_report():
     with connect() as c:
         rows={r['exchange']:r for r in c.execute('SELECT * FROM keke_exchange_health').fetchall()}
@@ -1836,6 +1894,7 @@ def exchange_report():
         elif r['status']=='OK' and now-r['checked_at_ms']>30000:label='STALE'
         else:label=r['status']
         lines.append(f'{name}: {label} • {counts.get(name,0)} samples')
+    lines.append('Use /lead for exploratory directional follow-through')
     lines.append('Lead/lag and net profitability: NOT YET VALIDATED')
     lines.append('Poll intervals and HTTP delays cannot prove second-level lead; timestamped trades/WebSockets required.')
     return '\n'.join(lines)
@@ -1848,9 +1907,9 @@ def main():
     state['enabled']=runtime_get('alerts_enabled',True)
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
-    LOG.info('KeKe V5.23 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.24 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    if state['enabled']:send('🎯 KeKe V5.23 BRTI settlement predictions online. '
+    if state['enabled']:send('🎯 KeKe V5.24 BRTI settlement predictions online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     while True:

@@ -1,4 +1,4 @@
-"""KeKe V5.25 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.26 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -483,6 +483,8 @@ def grade_settlements():
             UNION SELECT ticker FROM keke_thesis_events WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_v56_forecasts WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_shadow_predictions WHERE grade='PENDING'
+            UNION SELECT ticker FROM keke_locked_forecasts WHERE grade='PENDING'
+            UNION SELECT ticker FROM keke_consensus_predictions WHERE grade='PENDING'
         ) ORDER BY ticker LIMIT ?''',(GRADE_BATCH,)).fetchall()
     verified_now=0
     newly_finalized=[]
@@ -499,6 +501,7 @@ def grade_settlements():
         now=int(time.time())
         with connect() as c:
             if outcome=='UNGRADABLE':
+                research_grade(ticker,outcome,now)
                 c.execute("UPDATE settlement_calls SET result='UNGRADABLE',result_source='Kalshi market result' WHERE ticker=? AND result='PENDING'",(ticker,))
                 c.execute("UPDATE settlement_predictions SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE v53_opportunities SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
@@ -506,6 +509,7 @@ def grade_settlements():
                 c.execute("UPDATE keke_v56_forecasts SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE keke_shadow_predictions SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 continue
+            research_grade(ticker,outcome,now)
             c.execute('''INSERT INTO settlement_results(ticker,settled_side,source,recorded_at,verified)
                 VALUES (?,?,?,?,1) ON CONFLICT(ticker) DO UPDATE SET
                 settled_side=excluded.settled_side,source=excluded.source,
@@ -574,13 +578,13 @@ def brti_stats_summary():
     return (f'📊 KEKE • BRTI-ONLY\n\n'
             f'🎯 Initial: {summary(initial)}\n'
             f'📡 Late: {summary(late)}\n'
-            f'🏁 Final: {summary(list(latest.values()))}\n'
+            f'🏁 Last recorded (not an early forecast): {summary(list(latest.values()))}\n'
             f'🔄 Reversals: {summary(reversal)}\n\n'
             f'🧪 Paper outcomes: {summary(paper_buy)}\n'
             '💰 Actual realized scalp P/L: requires verified fills\n\n'
             f'📋 {obs["contracts"]} contracts • {obs["n"]} snapshots\n'
             '📚 /legacy = previous model history\n\n'
-            '⚠️ Accuracy ≠ trading profit. Paper outcomes are NOT fill-based scalp results.')
+            '⚠️ Last-recorded accuracy includes reversals and late calls. /audit /research for frozen checkpoints. Accuracy ≠ trading profit.')
 
 
 def early_pick_stats_summary(now=None):
@@ -1058,6 +1062,9 @@ def telegram_commands():
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/exchange'):send(exchange_report())
             elif cmd.startswith('/lead'):send(exchange_research_report())
+            elif cmd.startswith('/audit'):send(audit_report())
+            elif cmd.startswith('/research'):send(research_stats_report())
+            elif cmd.startswith('/preview'):send(preview_report())
             elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
             elif cmd.startswith('/position'):send(portfolio_status())
             elif cmd.startswith('/last'):send_last()
@@ -1931,17 +1938,192 @@ def exchange_report():
     lines.append('Poll intervals and HTTP delays cannot prove second-level lead; timestamped trades/WebSockets required.')
     return '\n'.join(lines)
 
+
+# V5.26: Additive, research-only audit / consensus / target-publication instrumentation.
+# Historical scores remain intact. No experimental input enters settlement_signal().
+def research_init():
+    with connect() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_contract_transitions (
+          ticker TEXT PRIMARY KEY, first_seen_ms INTEGER NOT NULL,
+          first_target_ms INTEGER, first_target REAL, first_quote_ms INTEGER,
+          first_yes_ask REAL, first_no_ask REAL, first_brti REAL,
+          first_brti_ms INTEGER, first_consensus TEXT, first_direction TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_transition_snapshots (
+          ticker TEXT NOT NULL, observed_ms INTEGER NOT NULL,
+          seconds_left INTEGER, target REAL, brti REAL, brti_ms INTEGER,
+          up_ask REAL, down_ask REAL, up_bid REAL, down_bid REAL,
+          bullish INTEGER, bearish INTEGER, neutral INTEGER,
+          momentum_pct REAL, preliminary_side TEXT,
+          PRIMARY KEY(ticker,observed_ms))''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_transition_snapshots ON keke_transition_snapshots(ticker,observed_ms)')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_locked_forecasts (
+          ticker TEXT PRIMARY KEY, captured_at INTEGER NOT NULL,
+          seconds_left INTEGER NOT NULL, side TEXT NOT NULL,
+          brti REAL, target REAL, up_ask REAL, down_ask REAL,
+          official_side TEXT, grade TEXT NOT NULL DEFAULT 'PENDING', graded_at INTEGER)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_consensus_predictions (
+          ticker TEXT PRIMARY KEY, captured_at INTEGER NOT NULL,
+          seconds_left INTEGER, preliminary_side TEXT NOT NULL,
+          bullish INTEGER, bearish INTEGER, neutral INTEGER,
+          mean_pct REAL, target_at_prediction REAL,
+          official_side TEXT, grade TEXT NOT NULL DEFAULT 'PENDING', graded_at INTEGER)''')
+
+def exchange_consensus(now_ms=None, lookback_s=30):
+    # Compare each venue to itself: no averaging heterogeneous price levels.
+    now_ms=int(time.time()*1000) if now_ms is None else now_ms
+    with connect() as c:
+        rows=c.execute('''SELECT exchange,received_at_ms,price FROM keke_exchange_samples
+                          WHERE received_at_ms>=? AND received_at_ms<=?
+                          ORDER BY exchange,received_at_ms''',
+                       (now_ms-(lookback_s+20)*1000,now_ms)).fetchall()
+    grouped={name:[] for name in EXCHANGE_NAMES}
+    for r in rows: grouped[r['exchange']].append(r)
+    bull=bear=neutral=0;changes=[];available=[]
+    for name,points in grouped.items():
+        if not points:continue
+        latest=points[-1]
+        if now_ms-latest['received_at_ms']>15000:continue
+        baseline=min(points,key=lambda r:abs(r['received_at_ms']-(now_ms-lookback_s*1000)))
+        if abs(baseline['received_at_ms']-(now_ms-lookback_s*1000))>10000:continue
+        if baseline['received_at_ms']>=latest['received_at_ms'] or baseline['price']<=0:continue
+        pct=100*(latest['price']/baseline['price']-1)
+        changes.append(pct);available.append(name)
+        if pct>0.015:bull+=1
+        elif pct< -0.015:bear+=1
+        else:neutral+=1
+    direction='UP' if bull>=5 and bull>bear else ('DOWN' if bear>=5 and bear>bull else 'WAIT')
+    return {'bullish':bull,'bearish':bear,'neutral':neutral,'available':len(changes),
+            'mean_pct':sum(changes)/len(changes) if changes else None,
+            'direction':direction,'venues':available}
+
+def observe_transition(m, brti=None, brti_stamp=None):
+    ticker=m.get('ticker')
+    if not ticker:return
+    now_ms=int(time.time()*1000)
+    remaining=seconds_remaining(m)
+    # Observe only near the opening to reduce writes; no fabricated TBD state.
+    if remaining<720 or remaining>920:return
+    target=target_of(m)
+    up_ask=quote(m,'UP','ask');down_ask=quote(m,'DOWN','ask')
+    up_bid=quote(m,'UP','bid');down_bid=quote(m,'DOWN','bid')
+    consensus=exchange_consensus(now_ms)
+    try: bstamp=int(float(brti_stamp)*1000) if brti_stamp is not None else None
+    except (TypeError,ValueError):bstamp=None
+    # Never treat BRTI as fresh when its own timestamp is stale.
+    if bstamp is not None and (bstamp>now_ms+2000 or now_ms-bstamp>30000):brti=None
+    with connect() as c:
+        c.execute('''INSERT OR IGNORE INTO keke_contract_transitions
+                     (ticker,first_seen_ms,first_consensus,first_direction)
+                     VALUES(?,?,?,?)''',
+                  (ticker,now_ms,json.dumps(consensus),consensus['direction']))
+        if target is not None:
+            c.execute('''UPDATE keke_contract_transitions SET first_target_ms=?,first_target=?
+                         WHERE ticker=? AND first_target_ms IS NULL''',(now_ms,target,ticker))
+        if up_ask is not None or down_ask is not None:
+            c.execute('''UPDATE keke_contract_transitions SET first_quote_ms=?,first_yes_ask=?,first_no_ask=?
+                         WHERE ticker=? AND first_quote_ms IS NULL''',
+                      (now_ms,up_ask,down_ask,ticker))
+        if brti is not None:
+            c.execute('''UPDATE keke_contract_transitions SET first_brti=?,first_brti_ms=?
+                         WHERE ticker=? AND first_brti_ms IS NULL''',(brti,bstamp or now_ms,ticker))
+        c.execute('''INSERT OR IGNORE INTO keke_transition_snapshots
+            (ticker,observed_ms,seconds_left,target,brti,brti_ms,up_ask,down_ask,up_bid,down_bid,
+             bullish,bearish,neutral,momentum_pct,preliminary_side)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (ticker,now_ms,remaining,target,brti,bstamp,up_ask,down_ask,up_bid,down_bid,
+             consensus['bullish'],consensus['bearish'],consensus['neutral'],consensus['mean_pct'],consensus['direction']))
+        if consensus['direction']!='WAIT' and consensus['available']>=5:
+            c.execute('''INSERT OR IGNORE INTO keke_consensus_predictions
+                (ticker,captured_at,seconds_left,preliminary_side,bullish,bearish,neutral,mean_pct,target_at_prediction)
+                VALUES(?,?,?,?,?,?,?,?,?)''',
+                (ticker,now_ms//1000,remaining,consensus['direction'],consensus['bullish'],
+                 consensus['bearish'],consensus['neutral'],consensus['mean_pct'],target))
+
+def lock_forecast(a):
+    # Freeze first available thesis with 5 minutes OR LESS remaining, never revise. Late captures are labeled by seconds_left.
+    if not (0<a['seconds']<=300):return
+    side=a.get('v56_side')
+    if side not in ('UP','DOWN'):return
+    with connect() as c:
+        c.execute('''INSERT OR IGNORE INTO keke_locked_forecasts
+            (ticker,captured_at,seconds_left,side,brti,target,up_ask,down_ask)
+            VALUES(?,?,?,?,?,?,?,?)''',
+            (a['ticker'],a['at'],a['seconds'],side,a['btc'],a['target'],a['asks'].get('UP'),a['asks'].get('DOWN')))
+
+def research_grade(ticker,outcome,now=None):
+    if outcome not in ('UP','DOWN','UNGRADABLE'):return
+    now=int(time.time()) if now is None else now
+    with connect() as c:
+        for table,field in [('keke_locked_forecasts','side'),('keke_consensus_predictions','preliminary_side')]:
+            if outcome=='UNGRADABLE':
+                c.execute(f"UPDATE {table} SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
+            else:
+                c.execute(f'''UPDATE {table} SET grade=CASE WHEN {field}=? THEN 'WIN' ELSE 'LOSS' END,
+                             official_side=?,graded_at=? WHERE ticker=? AND grade='PENDING' ''',
+                          (outcome,outcome,now,ticker))
+
+def audit_report(limit=8):
+    with connect() as c:
+        rows=c.execute('''SELECT r.ticker,r.settled_side,
+          (SELECT side FROM keke_v56_forecasts f WHERE f.ticker=r.ticker ORDER BY id ASC LIMIT 1) first_side,
+          (SELECT seconds_left FROM keke_v56_forecasts f WHERE f.ticker=r.ticker ORDER BY id ASC LIMIT 1) first_secs,
+          (SELECT side FROM keke_v56_forecasts f WHERE f.ticker=r.ticker ORDER BY id DESC LIMIT 1) last_side,
+          (SELECT seconds_left FROM keke_v56_forecasts f WHERE f.ticker=r.ticker ORDER BY id DESC LIMIT 1) last_secs,
+          l.side locked_side,l.seconds_left locked_secs
+          FROM settlement_results r LEFT JOIN keke_locked_forecasts l ON l.ticker=r.ticker
+          WHERE r.verified=1 ORDER BY r.recorded_at DESC LIMIT ?''',(limit,)).fetchall()
+    if not rows:return '🧾 No verified contracts yet.'
+    lines=['🧾 KEKE • CONTRACT AUDIT (newest first)','First / Locked ≤5m / Last vs official']
+    for r in rows:
+        def fmt(side,sec):return (f'{side} @{sec}s '+('✓' if side==r['settled_side'] else '✗')) if side else '—'
+        lines.append(f"{r['ticker']} • official {r['settled_side']}\n"
+                     f"First {fmt(r['first_side'],r['first_secs'])} | "
+                     f"Locked {fmt(r['locked_side'],r['locked_secs'])} | "
+                     f"Last {fmt(r['last_side'],r['last_secs'])}")
+    lines.append('Frozen forecasts begin after deployment; capture may occur later than 5m if no earlier signal. Historical records not reconstructed.')
+    return '\n'.join(lines)
+
+def research_stats_report():
+    with connect() as c:
+        data={}
+        for table in ('keke_locked_forecasts','keke_consensus_predictions'):
+            rows=c.execute(f'SELECT grade FROM {table}').fetchall()
+            w=sum(r['grade']=='WIN' for r in rows);l=sum(r['grade']=='LOSS' for r in rows)
+            data[table]=f'{w}W/{l}L ({100*w/(w+l):.1f}%)' if w+l else 'awaiting completed contracts'
+        transition=c.execute('SELECT COUNT(*) n, SUM(CASE WHEN first_target_ms>first_seen_ms THEN 1 ELSE 0 END) delayed FROM keke_contract_transitions').fetchone()
+    return ('🔬 KEKE • V5.26 RESEARCH\n'
+            f"Frozen at ≤5m: {data['keke_locked_forecasts']}\n"
+            f"Preliminary exchange consensus: {data['keke_consensus_predictions']}\n"
+            f"Transitions observed: {transition['n']}\n"
+            'TBD cannot be inferred from a missing target alone; API first-seen timing is not app display latency.\n'
+            'No live trades or verified net trading edge.')
+
+def preview_report():
+    cns=exchange_consensus()
+    with connect() as c:
+        row=c.execute('SELECT * FROM keke_contract_transitions ORDER BY first_seen_ms DESC LIMIT 1').fetchone()
+    label=(row['ticker'] if row else 'waiting for first contract')
+    target=(f"${row['first_target']:,.2f}" if row and row['first_target'] is not None else 'TBD / not observed')
+    mean=f"{cns['mean_pct']:+.4f}%" if cns['mean_pct'] is not None else 'n/a'
+    return (f'🔮 KEKE • NEXT CONTRACT RESEARCH\nContract: {label}\n'
+            f"7-exchange consensus: {cns['bullish']} bullish / {cns['bearish']} bearish / {cns['neutral']} flat "
+            f"({cns['available']}/7 usable)\nMean 30s move: {mean}\n"
+            f"Preliminary: {cns['direction']} (research only)\n"
+            f"First API-observed target: {target}\n"
+            'Target and tradable quote timing may differ. No automatic orders or changes to settlement picks.')
+
 def main():
     init_db()
     exchange_init()
+    research_init()
     if os.getenv("KEKE_EXCHANGE_OBSERVER","1")=="1":
         threading.Thread(target=exchange_worker,daemon=True,name="exchange-observer").start()
     state['enabled']=runtime_get('alerts_enabled',True)
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
-    LOG.info('KeKe V5.24 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.26 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    if state['enabled']:send('🎯 KeKe V5.24 BRTI settlement predictions online. '
+    if state['enabled']:send('🎯 KeKe V5.26 BRTI settlement predictions online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     while True:
@@ -1963,6 +2145,8 @@ def main():
                     if time.time()-state.get('brti_error_at',0)>600:
                         LOG.warning('BRTI unavailable: %s',str(exc)[:160])
                         state['brti_error_at']=time.time()
+                try: observe_transition(market,brti,brti_stamp)
+                except Exception: LOG.exception("Transition observer failed")
                 if brti is None:
                     raise ValueError('BRTI unavailable; no candle/settlement signal')
                 candles=brti_candles()
@@ -1977,6 +2161,7 @@ def main():
                         a['dual_read']={'frames':{1:'COLLECTING',3:'COLLECTING',15:'COLLECTING'},'scalp':'WAIT'}
                         opening_seen(a['ticker'],a['seconds'],True)
                         process_v56(a,new)
+                        lock_forecast(a)
                         portfolio_poll(market,a,{'scalp':'WAIT'})
                         state['last_read']=a
                         time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
@@ -2029,6 +2214,7 @@ def main():
                 if new:
                     proactive_updates(a,True)
                 process_v56(a,new)
+                lock_forecast(a)
                 portfolio_poll(market,a,{'scalp':'WAIT'})
                 if not new:
                     proactive_updates(a,False)

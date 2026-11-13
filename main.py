@@ -1,4 +1,4 @@
-"""KeKe V5.22 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.23 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -7,6 +7,7 @@ from cryptography.hazmat.primitives.asymmetric import padding, ed25519
 from datetime import datetime, timezone
 import requests
 import csv, io, zipfile
+import threading
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 LOG = logging.getLogger('keke')
@@ -1055,6 +1056,7 @@ def telegram_commands():
             elif cmd.startswith('/market'):
                 send(fresh_status())
             elif cmd.startswith('/stats'):send_stats()
+            elif cmd.startswith('/exchange'):send(exchange_report())
             elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
             elif cmd.startswith('/position'):send(portfolio_status())
             elif cmd.startswith('/last'):send_last()
@@ -1077,6 +1079,7 @@ def initialize_telegram():
             {'command':'market','description':'Fresh BRTI settlement context'},
             {'command':'stats','description':'BRTI-only prediction report card'},
             {'command':'legacy','description':'Historical and lifetime research stats'},
+            {'command':'exchange','description':'Seven-exchange research feed health'},
             {'command':'last','description':'Last settlement pick'},
             {'command':'brti','description':'Test read-only Kalshi BRTI access'},
             {'command':'export','description':'Download research CSV archive'},
@@ -1748,14 +1751,106 @@ def send_last():
     send(f'🕒 {label} • {row["ticker"]}\nLAST THESIS: {row["side"]} ({row["event"]})\n🎯 Target: {money_text(row["target"])}\n'
          f'⏱ At {row["seconds_left"]}s remaining • {ask_text(row["ask"])}\nResult: {row["grade"]}')
 
+# Exchange lead/lag experiment — strictly observational, never used by settlement_signal.
+# The feeds below are public endpoints; access and instrument availability vary.
+EXCHANGE_NAMES=('Coinbase','Kraken','Bitstamp','Gemini','LMAX Digital','Bullish','Crypto.com')
+EXCHANGE_POLL_SECONDS=5
+EXCHANGE_URLS={
+    'Coinbase':'https://api.exchange.coinbase.com/products/BTC-USD/ticker',
+    'Kraken':'https://api.kraken.com/0/public/Ticker?pair=XBTUSD',
+    'Bitstamp':'https://www.bitstamp.net/api/v2/ticker/btcusd/',
+    'Gemini':'https://api.gemini.com/v1/pubticker/btcusd',
+    'Crypto.com':'https://api.crypto.com/exchange/v1/public/get-tickers?instrument_name=BTC_USD',
+    # LMAX Digital and Bullish require separately verified, authorized market-data endpoints.
+    # Set KEKE_LMAX_URL / KEKE_BULLISH_URL only for an endpoint returning JSON with a
+    # numeric last/price field for a genuine BTC/USD instrument.
+}
+
+def exchange_price(name, data):
+    if name=='Coinbase': return float(data['price'])
+    if name=='Kraken': return float(next(iter(data['result'].values()))['c'][0])
+    if name=='Bitstamp': return float(data['last'])
+    if name=='Gemini': return float(data['last'])
+    if name=='Crypto.com':
+        item=data['result']['data'][0]
+        if item.get('i') not in ('BTC_USD','BTCUSD'):raise ValueError('Wrong instrument')
+        return float(item['a'])  # last traded price, NOT best ask
+    if name in ('LMAX Digital','Bullish'):
+        return float(data.get('last',data.get('price')))
+    raise ValueError('Unknown exchange')
+
+def exchange_init():
+    with connect() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_exchange_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, exchange TEXT NOT NULL,
+            received_at_ms INTEGER NOT NULL, source_at_ms INTEGER,
+            price REAL NOT NULL, instrument TEXT NOT NULL DEFAULT 'BTC/USD',
+            UNIQUE(exchange,received_at_ms))''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_exchange_samples ON keke_exchange_samples(exchange,received_at_ms)')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_exchange_health (
+            exchange TEXT PRIMARY KEY, checked_at_ms INTEGER NOT NULL,
+            status TEXT NOT NULL, detail TEXT)''')
+
+def exchange_sample(name, data, received_at_ms=None):
+    price=exchange_price(name,data)
+    if not math.isfinite(price) or not 1000<price<10000000:raise ValueError('Invalid BTC price')
+    received_at_ms=received_at_ms or int(time.time()*1000)
+    with connect() as c:
+        c.execute('INSERT OR IGNORE INTO keke_exchange_samples(exchange,received_at_ms,price) VALUES (?,?,?)',(name,received_at_ms,price))
+        c.execute('INSERT OR REPLACE INTO keke_exchange_health VALUES (?,?,?,?)',(name,received_at_ms,'OK','Public last-trade snapshot'))
+    return price
+
+def exchange_cycle(get=None):
+    # Separate session and thread: exchange outages must not block Kalshi predictions.
+    get=get or requests.get
+    for name in EXCHANGE_NAMES:
+        url=EXCHANGE_URLS.get(name)
+        if name=='LMAX Digital':url=os.getenv('KEKE_LMAX_URL','').strip() or None
+        if name=='Bullish':url=os.getenv('KEKE_BULLISH_URL','').strip() or None
+        if not url:
+            with connect() as c:c.execute('INSERT OR REPLACE INTO keke_exchange_health VALUES (?,?,?,?)',(name,int(time.time()*1000),'UNCONFIGURED','Verified BTC/USD data endpoint required'))
+            continue
+        try:
+            response=get(url,timeout=3)
+            response.raise_for_status()
+            received=int(time.time()*1000)
+            exchange_sample(name,response.json(),received)
+        except Exception as exc:
+            with connect() as c:c.execute('INSERT OR REPLACE INTO keke_exchange_health VALUES (?,?,?,?)',(name,int(time.time()*1000),'ERROR',type(exc).__name__))
+
+def exchange_worker():
+    while True:
+        try:exchange_cycle()
+        except Exception:LOG.exception('Exchange observer cycle failed')
+        time.sleep(EXCHANGE_POLL_SECONDS)
+
+def exchange_report():
+    with connect() as c:
+        rows={r['exchange']:r for r in c.execute('SELECT * FROM keke_exchange_health').fetchall()}
+        counts={r['exchange']:r['n'] for r in c.execute('SELECT exchange,COUNT(*) n FROM keke_exchange_samples GROUP BY exchange').fetchall()}
+    now=int(time.time()*1000)
+    lines=['🔬 KEKE • 7-EXCHANGE OBSERVER','Research only • no influence on settlement picks']
+    for name in EXCHANGE_NAMES:
+        r=rows.get(name)
+        if r is None:label='NOT CHECKED'
+        elif r['status']=='OK' and now-r['checked_at_ms']>30000:label='STALE'
+        else:label=r['status']
+        lines.append(f'{name}: {label} • {counts.get(name,0)} samples')
+    lines.append('Lead/lag and net profitability: NOT YET VALIDATED')
+    lines.append('Poll intervals and HTTP delays cannot prove second-level lead; timestamped trades/WebSockets required.')
+    return '\n'.join(lines)
+
 def main():
     init_db()
+    exchange_init()
+    if os.getenv("KEKE_EXCHANGE_OBSERVER","1")=="1":
+        threading.Thread(target=exchange_worker,daemon=True,name="exchange-observer").start()
     state['enabled']=runtime_get('alerts_enabled',True)
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
-    LOG.info('KeKe V5.22 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.23 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    if state['enabled']:send('🎯 KeKe V5.22 BRTI settlement predictions online. '
+    if state['enabled']:send('🎯 KeKe V5.23 BRTI settlement predictions online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     while True:

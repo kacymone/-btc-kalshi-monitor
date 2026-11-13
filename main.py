@@ -813,10 +813,17 @@ def authenticated_get(path,params=None):
     headers={'KALSHI-ACCESS-KEY':key_id,'KALSHI-ACCESS-TIMESTAMP':timestamp,
              'KALSHI-ACCESS-SIGNATURE':base64.b64encode(sig).decode()}
     r=session.get(BASE+path,params=params,headers=headers,timeout=10)
-    r.raise_for_status()
-    obj=r.json()
-    if not isinstance(obj,dict) or obj.get('error'):
-        raise ValueError('Invalid Kalshi portfolio response')
+    # Diagnostic includes only HTTP status and safe response structure, never secrets.
+    if r.status_code >= 400:
+        raise RuntimeError(f'Kalshi portfolio HTTP {r.status_code} on {path}')
+    try:
+        obj=r.json()
+    except ValueError:
+        raise RuntimeError('Kalshi portfolio returned non-JSON response')
+    if not isinstance(obj,dict):
+        raise RuntimeError('Kalshi portfolio response was not an object')
+    if obj.get('error'):
+        raise RuntimeError('Kalshi portfolio API returned an error object')
     return obj
 
 def completed_timeframes(candles,minutes):
@@ -884,11 +891,11 @@ def fill_price(fill,side):
     return value if value is not None and 0<=value<=1 else None
 
 def get_open_position(m):
-    """Conservative: require current net quantity and matching BUY fills for basis."""
+    """Read net quantity and reported exposure; fill-based basis not yet verified."""
     ticker=m['ticker']
     data=authenticated_get('/portfolio/positions',{'ticker':ticker,'limit':100})
     positions=data.get('market_positions')
-    if not isinstance(positions,list):raise ValueError('Portfolio positions response has no market_positions')
+    if not isinstance(positions,list):raise ValueError('Portfolio response missing market_positions; available fields: '+','.join(k for k in data if k in ('market_positions','event_positions','cursor','error','code','message')))
     row=next((p for p in positions if p.get('ticker')==ticker),None)
     if row is None:return None
     signed=number(row.get('position'))
@@ -919,7 +926,7 @@ def portfolio_poll(m,a,read):
     except Exception as exc:
         if now-portfolio_state['error_at']>600:
             portfolio_state['error_at']=now
-            LOG.warning('Read-only portfolio check failed (%s); position alerts unavailable',type(exc).__name__)
+            LOG.warning('Read-only portfolio check failed: %s: %s; position alerts unavailable',type(exc).__name__,str(exc)[:150])
             if state['enabled']:send('⚠️ Kalshi account position read unavailable. No position-based exit alerts until restored.')
         return
     if position is None:
@@ -955,8 +962,9 @@ def portfolio_status():
                 f"\nSell bid {ask_text(p['bid'])} • Gross P/L {pnl}"
                 "\nExcludes fees and slippage; current contract only.")
     except Exception as exc:
-        LOG.warning('Position command failed: %s',type(exc).__name__)
-        return '⚠️ Could not read your Kalshi position. Check Railway logs for an account-access error.'
+        LOG.warning('Position command failed: %s: %s',type(exc).__name__,str(exc)[:150])
+        detail=str(exc)[:100] if isinstance(exc,(RuntimeError,ValueError)) else type(exc).__name__
+        return '⚠️ Position lookup failed: '+detail+'\nNo orders placed. Check Railway logs.'
 
 def load_v56(ticker):
     with connect() as c:

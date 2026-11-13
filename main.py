@@ -627,6 +627,15 @@ def brti_opening_levels(candles,live):
     return (f'🟢 BRTI support ({window}): ${low:,.2f} (BRTI − support: ${live-low:+.2f})\n'
             f'🔴 BRTI resistance ({window}): ${high:,.2f} (resistance − BRTI: ${high-live:+.2f})')
 
+def banner_levels(a):
+    """First-line levels from completed BRTI candles; never invent missing levels."""
+    raw=a.get('brti_levels') or ''
+    found=re.findall(r'(?:BRTI )?(support|resistance)(?: \([^)]*\))?: \$([\d,]+(?:\.\d+)?)',raw,re.I)
+    values={name.lower():float(value.replace(',','')) for name,value in found}
+    if 'support' in values and 'resistance' in values:
+        return f'🆕 S ${values["support"]:,.0f} | R ${values["resistance"]:,.0f}'
+    return '🆕 BTC OPEN | S/R collecting'
+
 def brti_levels_text(a):
     return a.get('brti_levels','🟡 BRTI levels unavailable')
 
@@ -1024,7 +1033,7 @@ def entry_opportunity(a,read):
     mm,ss=divmod(seconds,60)
     f=read['frames']
     trend={'UP':'↑','DOWN':'↓','MIXED':'↔','COLLECTING':'⏳','N/A':'⏳'}
-    send(f'🟢 ENTRY SETUP • {side}\n'
+    send(f'⚡ SCALP {side} • BUY {ask_text(ask)}\n'
          f'⏱ {mm}:{ss:02d} left • Ask {ask_text(ask)}\n'
          f'📊 1m {trend.get(f.get(1),"?")} • 3m {trend.get(f.get(3),"?")} • 15m {trend.get(f.get(15),"?")}\n\n'
          f'🎯 Target {money_text(a["target"])}\n'
@@ -1052,7 +1061,7 @@ def position_exit_alert(position,a,read):
     trade_alert_state['last_exit'][key]=now
     gross=position['gross']
     detail=' • Momentum opposing' if against else ''
-    send(f'{"💰" if category=="TAKE PROFIT WATCH" else "🚨"} {category} • {side}\n'
+    send(f'{"💰 SELL WATCH" if category=="TAKE PROFIT WATCH" else "🚨 EXIT WATCH"} {side} • {ask_text(bid)}\n'
          f'⏱ {a["seconds"]//60}:{a["seconds"]%60:02d} left\n'
          f'Entry {ask_text(avg)} → Sell bid {ask_text(bid)}\n'
          f'Gross P/L {tiny_money(gross)} • {qty:g} contracts{detail}\n\n'
@@ -1179,7 +1188,7 @@ def process_v56(a,new_contract):
             t['side']=candidate
             a['v56_side']=candidate
             record_v56(a,'INITIAL',candidate,reason='First qualifying settlement signal')
-            if state['enabled']:send(format_read(a,f'{"🟢" if candidate=="UP" else "🔴"} INITIAL PICK: {candidate}'))
+            if state['enabled']:send(format_read(a,f'🎯 SETTLEMENT {candidate} • INITIAL PICK'))
         return
     if candidate==t['side'] or abs(signal)<V56_REVERSAL_SIGNAL:
         t['opposite']=0
@@ -1189,7 +1198,7 @@ def process_v56(a,new_contract):
         old=t['side'];t['side']=candidate;t['opposite']=0
         a['v56_side']=candidate
         record_v56(a,'REVERSAL',candidate,old,'Strong opposite settlement signal')
-        if state['enabled']:send(format_read(a,f'🔄 PREDICTION REVERSED: {old} → {candidate}'))
+        if state['enabled']:send(format_read(a,f'🎯 SETTLEMENT {candidate} • REVERSED {old}'))
 
 def proactive_updates(a, new_contract):
     """Send a new-contract notice, at-most-once-per-minute heartbeat, and meaningful risk alert."""
@@ -1202,7 +1211,7 @@ def proactive_updates(a, new_contract):
         state['threat_ticker']=ticker
         state['threat_side']=None
         state['threat_at']=0
-        send(format_read(a,'🆕 NEW CONTRACT • Monitoring')+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
+        send(banner_levels(a)+'\n'+format_read(a,'🆕 NEW CONTRACT • Monitoring')+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
         return
     side=a.get('v56_side')
     signal=a.get('v56_signal')
@@ -1219,11 +1228,11 @@ def proactive_updates(a, new_contract):
         state['threat_side']=side
         state['threat_at']=now
         state['heartbeat_at']=now
-        send(format_read(a,f'⚠️ {side} PICK AT RISK • Evidence favors {candidate}'))
+        send(format_read(a,f'⚠️ SETTLEMENT {side} AT RISK'))
         return
     if now-state.get('heartbeat_at',0)>=HEARTBEAT_SECONDS:
         state['heartbeat_at']=now
-        send(format_read(a,'📡 LIVE UPDATE • '+(side or 'ANALYZING'))+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
+        send(format_read(a,'📡 UPDATE • '+(side or 'ANALYZING'))+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
 
 def send_last():
     with connect() as c:

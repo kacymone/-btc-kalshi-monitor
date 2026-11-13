@@ -898,9 +898,13 @@ def get_open_position(m):
     if not isinstance(positions,list):raise ValueError('Portfolio response missing market_positions; available fields: '+','.join(k for k in data if k in ('market_positions','event_positions','cursor','error','code','message')))
     row=next((p for p in positions if p.get('ticker')==ticker),None)
     if row is None:return None
-    signed=number(row.get('position'))
-    if signed is None:raise ValueError('Position quantity missing')
-    signed=int(signed)
+    # Kalshi may return fixed-point quantity as position_fp instead of legacy position.
+    signed=number(row.get('position_fp'))
+    if signed is None:
+        signed=number(row.get('position'))
+    if signed is None:
+        safe_fields=','.join(sorted(str(k) for k in row if re.fullmatch(r'[A-Za-z0-9_]{1,60}',str(k))))
+        raise ValueError('Position quantity missing; response fields: '+safe_fields[:350])
     if signed==0:return None
     side='UP' if signed>0 else 'DOWN'
     qty=abs(signed)

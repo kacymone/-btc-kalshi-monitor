@@ -1,4 +1,4 @@
-"""KeKe V5.15 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.16 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -125,6 +125,7 @@ def init_db():
             UNIQUE(ticker,pattern,side))""")
         c.execute('CREATE TABLE IF NOT EXISTS keke_model_epochs (version TEXT PRIMARY KEY, started_at INTEGER NOT NULL)')
         c.execute('INSERT OR IGNORE INTO keke_model_epochs(version,started_at) VALUES (?,?)',('5.9-BRTI-STATS',int(time.time())))
+        c.execute('INSERT OR IGNORE INTO keke_model_epochs(version,started_at) VALUES (?,?)',('5.16-EARLY-PICKS',int(time.time())))
 
 
 def http_json(url,params=None,timeout=6):
@@ -535,6 +536,60 @@ def brti_stats_summary():
             '⚠️ Accuracy ≠ trading profit. Paper outcomes are NOT fill-based scalp results.')
 
 
+def early_pick_stats_summary():
+    """Prospective cohort only: observed opening-window contracts since V5.16."""
+    with connect() as c:
+        epoch=c.execute("SELECT started_at FROM keke_model_epochs WHERE version='5.16-EARLY-PICKS'").fetchone()
+        if not epoch:
+            return '🎯 EARLY-PICK TEST: waiting for V5.16 initialization.'
+        start=int(epoch['started_at'])
+        # Only count contracts actually observed during their first two minutes.
+        # Close time is derived from the observation's recorded remaining seconds.
+        monitored=c.execute("""
+            SELECT ticker, MIN(captured_at-seconds_left+900) AS contract_end
+            FROM settlement_observations
+            WHERE captured_at>=? AND seconds_left BETWEEN 780 AND 900
+              AND model_version='5.9-BRTI'
+            GROUP BY ticker
+        """,(start,)).fetchall()
+        eligible={r['ticker'] for r in monitored if int(time.time()) >= int(r['contract_end'])}
+        if not eligible:
+            return ('🎯 EARLY-PICK TEST • V5.16 onward\\n'
+                    'No completed opening-window contracts yet. Historical picks excluded.')
+        placeholders=','.join('?' for _ in eligible)
+        rows=c.execute(f"""
+            SELECT ticker,event,side,grade,seconds_left,ask
+            FROM keke_v56_forecasts
+            WHERE captured_at>=? AND ticker IN ({placeholders})
+            ORDER BY id
+        """,(start,*sorted(eligible))).fetchall()
+    by_ticker={}
+    for r in rows: by_ticker.setdefault(r['ticker'],[]).append(r)
+    early={}
+    for ticker, events in by_ticker.items():
+        qualifying=[r for r in events if r['event']=='INITIAL' and
+                    r['seconds_left'] is not None and 780<=r['seconds_left']<=900]
+        if qualifying: early[ticker]=qualifying[0]
+    wins=sum(r['grade']=='WIN' for r in early.values())
+    losses=sum(r['grade']=='LOSS' for r in early.values())
+    pending=sum(r['grade']=='PENDING' for r in early.values())
+    ungradable=sum(r['grade']=='UNGRADABLE' for r in early.values())
+    graded=wins+losses
+    accuracy=f'{100*wins/graded:.1f}%' if graded else 'n/a'
+    coverage=f'{100*len(early)/len(eligible):.1f}%'
+    reversed_contracts=sum(any(r['event']=='REVERSAL' for r in by_ticker.get(t,[]))
+                           for t in early)
+    return (f'🎯 EARLY-PICK TEST • V5.16 onward\\n'
+            f'Opening-window contracts: {len(eligible)}\\n'
+            f'Initial picks: {len(early)} • Coverage: {coverage}\\n'
+            f'No early pick: {len(eligible)-len(early)}\\n'
+            f'Accuracy: {wins}W / {losses}L ({accuracy})'
+            f' • {pending} pending • {ungradable} ungradable\\n'
+            f'Reversed after early pick: {reversed_contracts}/{len(early)}\\n'
+            'Only monitored, completed contracts count; no inferred missed contracts.\\n'
+            'Paper accuracy is not realized trading profit.')
+
+
 def grade_summary():
     with connect() as c:
         observations=c.execute('SELECT COUNT(*) FROM settlement_observations').fetchone()[0]
@@ -850,7 +905,7 @@ def health_status():
 
 
 def send_stats():
-    send(brti_stats_summary()+'\n\n'+paper_scalps_summary()+'\n\n'+range_stats_summary())
+    send(early_pick_stats_summary()+'\n\n'+brti_stats_summary()+'\n\n'+paper_scalps_summary()+'\n\n'+range_stats_summary())
 
 def fresh_status():
     """Fetch a new market and BRTI tick for STATUS; do not change prediction state."""
@@ -1460,9 +1515,9 @@ def send_last():
 def main():
     init_db()
     initialize_telegram()
-    LOG.info('KeKe V5.15 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.16 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.15 BRTI-only entry/exit watch online. '
+    send('🧠 KeKe V5.16 BRTI-only entry/exit watch online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. No trades. /stats for BRTI-only, /legacy for history' )
     while True:

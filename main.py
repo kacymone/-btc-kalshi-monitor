@@ -1,4 +1,4 @@
-"""KeKe V5.13 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.14 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -116,6 +116,13 @@ def init_db():
             gross_per_contract REAL, exit_reason TEXT,
             PRIMARY KEY(ticker,side))''')
         c.execute('CREATE TABLE IF NOT EXISTS keke_brti_ticks (timestamp INTEGER PRIMARY KEY, price REAL NOT NULL)')
+        c.execute("""CREATE TABLE IF NOT EXISTS keke_range_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL,
+            created_at INTEGER NOT NULL, pattern TEXT NOT NULL, side TEXT NOT NULL,
+            support REAL NOT NULL, resistance REAL NOT NULL, brti REAL NOT NULL,
+            entry_ask REAL, entry_bid REAL, exit_at INTEGER, exit_bid REAL,
+            gross_per_contract REAL, exit_reason TEXT,
+            UNIQUE(ticker,pattern,side))""")
         c.execute('CREATE TABLE IF NOT EXISTS keke_model_epochs (version TEXT PRIMARY KEY, started_at INTEGER NOT NULL)')
         c.execute('INSERT OR IGNORE INTO keke_model_epochs(version,started_at) VALUES (?,?)',('5.9-BRTI-STATS',int(time.time())))
 
@@ -757,6 +764,21 @@ def export_research():
         LOG.exception('Research export failed')
         send('⚠️ Export failed. Your existing database was not changed.')
 
+def range_stats_summary():
+    with connect() as c:
+        rows=c.execute("SELECT pattern,entry_ask,exit_bid,gross_per_contract,exit_at FROM keke_range_signals").fetchall()
+    entries=[r for r in rows if r['entry_ask'] is not None]
+    closed=[r for r in entries if r['exit_at'] is not None]
+    wins=sum(r['gross_per_contract']>0 for r in closed)
+    losses=sum(r['gross_per_contract']<0 for r in closed)
+    gross=sum(r['gross_per_contract'] for r in closed)
+    return (f'↔ RANGE STRATEGY • Paper only\n'
+            f'Patterns: {len(rows)} • Entries: {len(entries)}\n'
+            f'Closed: {len(closed)} ({wins}W/{losses}L) • Open: {len(entries)-len(closed)}\n'
+            f'Observed gross: ${gross:+.2f} / 1 contract each\n'
+            'Fees and unfilled orders excluded; not realized profit.')
+
+
 def paper_scalps_summary():
     with connect() as c:
         rows=c.execute('SELECT * FROM keke_paper_scalps ORDER BY opened_at DESC').fetchall()
@@ -828,7 +850,7 @@ def health_status():
 
 
 def send_stats():
-    send(brti_stats_summary()+'\n\n'+paper_scalps_summary())
+    send(brti_stats_summary()+'\n\n'+paper_scalps_summary()+'\n\n'+range_stats_summary())
 
 def fresh_status():
     """Fetch a new market and BRTI tick for STATUS; do not change prediction state."""
@@ -1051,13 +1073,119 @@ def dual_read(a,candles):
     else:
         label='WATCH ONLY: confirmation needed'
     # No calibrated price forecast: this is a descriptive research reading.
-    return {'scalp':scalp,'frames':frames,'label':label}
+    return {'scalp':scalp,'frames':frames,'label':label,'range':range_pattern(candles)}
 
 def dual_text(read):
     f=read['frames']
     symbols={'UP':'↑','DOWN':'↓','MIXED':'↔','FLAT':'→','COLLECTING':'⏳','N/A':'⏳'}
     frames='  •  '.join(f'{m}m {symbols.get(f.get(m),f.get(m,"?"))}' for m in (1,3,15))
-    return f"\n\n⚡ SCALP: {read['scalp']}\n📊 {frames}"
+    r=read.get('range')
+    extra=(f"\n↔ RANGE: {r['pattern']} • S ${r['support']:,.0f} / R ${r['resistance']:,.0f}" if r else "")
+    return f"\n\n⚡ SCALP: {read['scalp']}\n📊 {frames}{extra}"
+
+# V5.14: BRTI-only range and breakout research, isolated from settlement picks.
+RANGE_LOOKBACK=12
+RANGE_MIN_WIDTH=35.0
+RANGE_MAX_WIDTH=260.0
+RANGE_TOUCH_FRACTION=.18
+RANGE_MIN_ENTRY_SECONDS=150
+RANGE_MAX_SPREAD=.06
+RANGE_MAX_ASK=.80
+range_alert_state={'seen':{}}
+
+def range_pattern(candles):
+    """Only completed, contiguous 1m BRTI bars. No volume or intrabar guesses."""
+    if len(candles)<RANGE_LOOKBACK+2:return None
+    rows=candles[-(RANGE_LOOKBACK+2):]
+    if any(int(rows[i+1]['time'])-int(rows[i]['time'])!=60 for i in range(len(rows)-1)):
+        return None
+    base=rows[:RANGE_LOOKBACK]
+    last,prev=rows[-1],rows[-2]
+    support=min(c['low'] for c in base)
+    resistance=max(c['high'] for c in base)
+    width=resistance-support
+    if not RANGE_MIN_WIDTH<=width<=RANGE_MAX_WIDTH:return None
+    band=max(8.0,width*RANGE_TOUCH_FRACTION)
+    # Distinct tests of each boundary, separated by at least one minute.
+    def distinct_touches(boundary,kind):
+        indices=[i for i,c in enumerate(base) if (c['low']<=boundary+band if kind=='low' else c['high']>=boundary-band)]
+        count=0;last_i=-3
+        for i in indices:
+            if i-last_i>=2:count+=1;last_i=i
+        return count
+    if distinct_touches(support,'low')<2 or distinct_touches(resistance,'high')<2:
+        return None
+    mid=(support+resistance)/2
+    # Two completed closes beyond the *prior* range confirm a break.
+    if prev['close']>resistance+band*.25 and last['close']>resistance+band*.25:
+        return {'pattern':'BREAKOUT','side':'UP','support':support,'resistance':resistance}
+    if prev['close']<support-band*.25 and last['close']<support-band*.25:
+        return {'pattern':'BREAKDOWN','side':'DOWN','support':support,'resistance':resistance}
+    # Bounce/rejection: prior bar tests the boundary, latest bar confirms movement away.
+    if (prev['low']<=support+band and last['close']>prev['close']
+            and last['close']>last['open'] and support<last['close']<mid):
+        return {'pattern':'SUPPORT BOUNCE','side':'UP','support':support,'resistance':resistance}
+    if (prev['high']>=resistance-band and last['close']<prev['close']
+            and last['close']<last['open'] and mid<last['close']<resistance):
+        return {'pattern':'RESISTANCE REJECTION','side':'DOWN','support':support,'resistance':resistance}
+    return {'pattern':'CONSOLIDATING','side':'WAIT','support':support,'resistance':resistance}
+
+
+def range_update_exits(m,a,read):
+    """Close simulated positions using an observed sell bid; no settlement assumptions."""
+    with connect() as c:
+        rows=c.execute('SELECT * FROM keke_range_signals WHERE ticker=? AND entry_ask IS NOT NULL AND exit_at IS NULL',(m['ticker'],)).fetchall()
+        for r in rows:
+            bid=quote(m,r['side'],'bid')
+            if bid is None:continue
+            diff=bid-r['entry_ask']
+            reason=('take_profit' if diff>=TAKE_PROFIT_CENTS else
+                    'stop_watch' if diff<=-STOP_WARNING_CENTS else
+                    'opposite_momentum' if read.get('scalp') in ('UP','DOWN') and read['scalp']!=r['side'] else
+                    'time_exit' if a['seconds']<=90 else None)
+            if reason:
+                c.execute('UPDATE keke_range_signals SET exit_at=?,exit_bid=?,gross_per_contract=?,exit_reason=? WHERE id=?',
+                          (int(time.time()),bid,diff,reason,r['id']))
+
+
+def range_strategy(m,a,candles,read):
+    """Observe patterns; notify on qualified setups only; never place an order."""
+    pattern=range_pattern(candles)
+    if pattern is None:return
+    side=pattern['side'];kind=pattern['pattern'];ticker=a['ticker']
+    support=pattern['support'];resistance=pattern['resistance']
+    key=(ticker,kind,side)
+    # Only one notification of each distinct pattern per contract.
+    if key in range_alert_state['seen']:return
+    with connect() as c:
+        if c.execute('SELECT 1 FROM keke_range_signals WHERE ticker=? AND pattern=? AND side=?',(ticker,kind,side)).fetchone():
+            range_alert_state['seen'][key]=int(time.time())
+            return
+    # Consolidation is descriptive, not an entry; keep it in MARKET READ.
+    if side=='WAIT':
+        a['range_read']=pattern
+        return
+    a['range_read']=pattern
+    ask=a['asks'].get(side);bid=a['bids'].get(side)
+    spread=ask-bid if ask is not None and bid is not None else None
+    if not (RANGE_MIN_ENTRY_SECONDS<=a['seconds']<=810 and
+            ask is not None and .03<=ask<=RANGE_MAX_ASK and
+            spread is not None and 0<=spread<=RANGE_MAX_SPREAD):return
+    # Require enough remaining payout to exceed the observed spread and a fee buffer.
+    if 1-ask<=spread+.05:return
+    range_alert_state['seen'][key]=int(time.time())
+    with connect() as c:
+        c.execute("""INSERT OR IGNORE INTO keke_range_signals
+           (ticker,created_at,pattern,side,support,resistance,brti,entry_ask,entry_bid)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+           (ticker,int(time.time()),kind,side,support,resistance,a['btc'],ask,bid))
+    if state['enabled']:
+        send(f'⚡ {side} SCALP • {kind}\n'
+             f'BUY WATCH {ask_text(ask)} • {a["seconds"]//60}:{a["seconds"]%60:02d} left\n\n'
+             f'🟢 S ${support:,.0f} | 🔴 R ${resistance:,.0f}\n'
+             f'📍 BRTI ${a["btc"]:,.2f} • Spread {spread*100:.1f}¢\n'
+             'Confirm live ask, fees and liquidity. Manual entry only.')
+
 
 # V5.10: read-only trade-opportunity alerts; no order execution.
 ENTRY_MIN_SECONDS=150
@@ -1329,9 +1457,9 @@ def send_last():
 def main():
     init_db()
     initialize_telegram()
-    LOG.info('KeKe V5.13 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.14 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.13 BRTI-only entry/exit watch online. '
+    send('🧠 KeKe V5.14 BRTI-only entry/exit watch online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. No trades. /stats for BRTI-only, /legacy for history' )
     while True:
@@ -1387,6 +1515,8 @@ def main():
                 a['dual_read']=quick
                 portfolio_poll(market,a,quick)
                 paper_scalps_update(market,a,quick)
+                range_update_exits(market,a,quick)
+                range_strategy(market,a,candles,quick)
                 entry_opportunity(a,quick)
                 try:
                     record_shadow(a)

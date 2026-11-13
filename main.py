@@ -1,4 +1,4 @@
-"""KeKe V5.24 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.25 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -1762,9 +1762,9 @@ EXCHANGE_URLS={
     'Bitstamp':'https://www.bitstamp.net/api/v2/ticker/btcusd/',
     'Gemini':'https://api.gemini.com/v1/pubticker/btcusd',
     'Crypto.com':'https://api.crypto.com/exchange/v1/public/get-tickers?instrument_name=BTC_USD',
-    # LMAX Digital and Bullish require separately verified, authorized market-data endpoints.
-    # Set KEKE_LMAX_URL / KEKE_BULLISH_URL only for an endpoint returning JSON with a
-    # numeric last/price field for a genuine BTC/USD instrument.
+    'Bullish':'https://api.exchange.bullish.com/aggregator-api/v1/orderbook/BTC-USD',
+    # LMAX instrument is resolved from the official instrument directory.
+
 }
 
 def exchange_price(name, data):
@@ -1776,9 +1776,41 @@ def exchange_price(name, data):
         item=data['result']['data'][0]
         if item.get('i') not in ('BTC_USD','BTCUSD'):raise ValueError('Wrong instrument')
         return float(item['a'])  # last traded price, NOT best ask
-    if name in ('LMAX Digital','Bullish'):
-        return float(data.get('last',data.get('price')))
+    if name=='LMAX Digital':
+        if data.get('status') not in (None,'OPEN'): raise ValueError('LMAX market not open')
+        if data.get('instrument_id') != _lmax_instrument: raise ValueError('LMAX instrument mismatch')
+        # LMAX public ticker returns last trade, not necessarily current bid/ask.
+        return float(data['last_price'])
+    if name=='Bullish':
+        # Bullish aggregator orderbook returns [price,quantity] pairs; this is
+        # a midpoint snapshot, not a last trade. Keep this distinction visible.
+        bid=float(data['bids'][0][0]); ask=float(data['asks'][0][0])
+        if bid<=0 or ask<=0 or ask<bid: raise ValueError('Invalid Bullish book')
+        return (bid+ask)/2
     raise ValueError('Unknown exchange')
+
+_lmax_instrument=None
+_lmax_last_discovery=0
+
+def lmax_url(get):
+    global _lmax_instrument,_lmax_last_discovery
+    override=os.getenv('KEKE_LMAX_INSTRUMENT','').strip()
+    if override:
+        _lmax_instrument=override
+    if not _lmax_instrument:
+        now=time.time()
+        if now-_lmax_last_discovery<300: raise ValueError('LMAX BTC/USD instrument not discovered')
+        _lmax_last_discovery=now
+        r=get('https://public-data-api.london-digital.lmax.com/v1/instruments',timeout=3)
+        r.raise_for_status()
+        instruments=r.json()
+        if not isinstance(instruments,list): raise ValueError('Invalid LMAX instruments response')
+        matches=[x for x in instruments if isinstance(x,dict) and
+                 str(x.get('symbol','')).upper() in ('BTC/USD','XBT/USD') and
+                 x.get('ticker_enabled') is True]
+        if len(matches)!=1: raise ValueError('LMAX BTC/USD ticker unavailable or ambiguous')
+        _lmax_instrument=str(matches[0]['instrument_id'])
+    return 'https://public-data-api.london-digital.lmax.com/v1/ticker/'+_lmax_instrument
 
 def exchange_init():
     with connect() as c:
@@ -1798,7 +1830,7 @@ def exchange_sample(name, data, received_at_ms=None):
     received_at_ms=received_at_ms or int(time.time()*1000)
     with connect() as c:
         c.execute('INSERT OR IGNORE INTO keke_exchange_samples(exchange,received_at_ms,price) VALUES (?,?,?)',(name,received_at_ms,price))
-        c.execute('INSERT OR REPLACE INTO keke_exchange_health VALUES (?,?,?,?)',(name,received_at_ms,'OK','Public last-trade snapshot'))
+        c.execute('INSERT OR REPLACE INTO keke_exchange_health VALUES (?,?,?,?)',(name,received_at_ms,'OK','Orderbook midpoint' if name=='Bullish' else 'Public last-trade snapshot'))
     return price
 
 def exchange_cycle(get=None):
@@ -1806,18 +1838,18 @@ def exchange_cycle(get=None):
     get=get or requests.get
     for name in EXCHANGE_NAMES:
         url=EXCHANGE_URLS.get(name)
-        if name=='LMAX Digital':url=os.getenv('KEKE_LMAX_URL','').strip() or None
-        if name=='Bullish':url=os.getenv('KEKE_BULLISH_URL','').strip() or None
-        if not url:
+        if name=='Bullish':url=os.getenv('KEKE_BULLISH_URL','').strip() or url
+        if not url and name!='LMAX Digital':
             with connect() as c:c.execute('INSERT OR REPLACE INTO keke_exchange_health VALUES (?,?,?,?)',(name,int(time.time()*1000),'UNCONFIGURED','Verified BTC/USD data endpoint required'))
             continue
         try:
+            if name=='LMAX Digital':url=lmax_url(get)
             response=get(url,timeout=3)
             response.raise_for_status()
             received=int(time.time()*1000)
             exchange_sample(name,response.json(),received)
         except Exception as exc:
-            with connect() as c:c.execute('INSERT OR REPLACE INTO keke_exchange_health VALUES (?,?,?,?)',(name,int(time.time()*1000),'ERROR',type(exc).__name__))
+            with connect() as c:c.execute('INSERT OR REPLACE INTO keke_exchange_health VALUES (?,?,?,?)',(name,int(time.time()*1000),'ERROR',(type(exc).__name__+': '+str(exc)[:100])))
 
 def exchange_worker():
     while True:

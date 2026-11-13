@@ -1,4 +1,4 @@
-"""KeKe V5.9 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.13 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -110,6 +110,11 @@ def init_db():
             official_side TEXT, grade TEXT DEFAULT 'PENDING', graded_at INTEGER,
             PRIMARY KEY(ticker,checkpoint))''')
         c.execute('CREATE INDEX IF NOT EXISTS idx_shadow_grade ON keke_shadow_predictions(grade,ticker)')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_paper_scalps (
+            ticker TEXT NOT NULL, side TEXT NOT NULL, opened_at INTEGER NOT NULL,
+            entry_ask REAL NOT NULL, entry_bid REAL, closed_at INTEGER, exit_bid REAL,
+            gross_per_contract REAL, exit_reason TEXT,
+            PRIMARY KEY(ticker,side))''')
         c.execute('CREATE TABLE IF NOT EXISTS keke_brti_ticks (timestamp INTEGER PRIMARY KEY, price REAL NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS keke_model_epochs (version TEXT PRIMARY KEY, started_at INTEGER NOT NULL)')
         c.execute('INSERT OR IGNORE INTO keke_model_epochs(version,started_at) VALUES (?,?)',('5.9-BRTI-STATS',int(time.time())))
@@ -495,34 +500,32 @@ def stats_epoch():
 
 
 def brti_stats_summary():
+    """BRTI-only model epoch; historical stats remain available via /legacy."""
     cutoff=stats_epoch()
     with connect() as c:
         obs=c.execute('SELECT COUNT(*) n, COUNT(DISTINCT ticker) contracts FROM settlement_observations WHERE model_version=? AND captured_at>=?',('5.9-BRTI',cutoff)).fetchone()
-        forecasts=c.execute('SELECT ticker,event,side,grade,ask FROM keke_v56_forecasts WHERE captured_at>=? ORDER BY ticker,id',(cutoff,)).fetchall()
-        paper=c.execute('SELECT stage,grade,ask FROM v53_opportunities WHERE captured_at>=?',(cutoff,)).fetchall()
+        forecasts=c.execute('SELECT ticker,event,side,grade FROM keke_v56_forecasts WHERE captured_at>=? ORDER BY ticker,id',(cutoff,)).fetchall()
+        paper=c.execute('SELECT stage,grade FROM v53_opportunities WHERE captured_at>=?',(cutoff,)).fetchall()
     def summary(rows):
-        wins=sum(r['grade']=='WIN' for r in rows)
-        losses=sum(r['grade']=='LOSS' for r in rows)
+        w=sum(r['grade']=='WIN' for r in rows)
+        l=sum(r['grade']=='LOSS' for r in rows)
         pending=sum(r['grade']=='PENDING' for r in rows)
-        rate=f'{100*wins/(wins+losses):.1f}%' if wins+losses else 'n/a'
-        return f'{wins}W / {losses}L • {rate} • pending {pending}'
+        pct=f'{100*w/(w+l):.1f}%' if w+l else 'n/a'
+        return f'{w}W / {l}L ({pct}) • {pending} pending'
     initial=[r for r in forecasts if r['event']=='INITIAL']
     reversal=[r for r in forecasts if r['event']=='REVERSAL']
-    # Grade only the latest prediction per contract as the final directional call.
     latest={}
-    for r in forecasts:latest[r['ticker']]=r
-    final=list(latest.values())
+    for r in forecasts: latest[r['ticker']]=r
     paper_buy=[r for r in paper if r['stage']=='PAPER_BUY']
-    # These are model outcomes, not executed fills or realized trading returns.
-    return (f'📊 KEKE V5.9 • BRTI-ONLY\n'
-            f'Contracts observed: {obs["contracts"]} • Snapshots: {obs["n"]}\n'
-            f'🎯 Initial settlement: {summary(initial)}\n'
-            f'🔄 Reversals: {summary(reversal)}\n'
-            f'🏁 Last settlement pick: {summary(final)}\n'
-            f'🧪 Paper entries: {summary(paper_buy)}\n'
-            'Scalp realized P/L: not tracked yet\n'
-            'Previous model history preserved • /legacy for historical report\n'
-            'Win rates reflect official settled outcomes, not actual trade profits.')
+    return (f'📊 KEKE • BRTI-ONLY\n\n'
+            f'🎯 Initial: {summary(initial)}\n'
+            f'🏁 Final: {summary(list(latest.values()))}\n'
+            f'🔄 Reversals: {summary(reversal)}\n\n'
+            f'🧪 Paper outcomes: {summary(paper_buy)}\n'
+            '💰 Actual realized scalp P/L: requires verified fills\n\n'
+            f'📋 {obs["contracts"]} contracts • {obs["n"]} snapshots\n'
+            '📚 /legacy = previous model history\n\n'
+            '⚠️ Accuracy ≠ trading profit. Paper outcomes are NOT fill-based scalp results.')
 
 
 def grade_summary():
@@ -754,8 +757,78 @@ def export_research():
         LOG.exception('Research export failed')
         send('⚠️ Export failed. Your existing database was not changed.')
 
+def paper_scalps_summary():
+    with connect() as c:
+        rows=c.execute('SELECT * FROM keke_paper_scalps ORDER BY opened_at DESC').fetchall()
+    closed=[r for r in rows if r['closed_at'] is not None]
+    open_count=len(rows)-len(closed)
+    wins=sum(r['gross_per_contract']>0 for r in closed)
+    losses=sum(r['gross_per_contract']<0 for r in closed)
+    flat=len(closed)-wins-losses
+    gross=sum(r['gross_per_contract'] for r in closed)
+    return (f'⚡ PAPER SCALPS • 1 hypothetical contract each\n'
+            f'Closed: {len(closed)} ({wins}W / {losses}L / {flat} flat) • Open: {open_count}\n'
+            f'Gross total: ${gross:+.2f}\n'
+            'Uses observed ask on alert and later bid, not verified fills.\n'
+            'Fees, slippage and missed executions excluded.\n'
+            '💵 Actual realized P/L: unavailable until fills and fees are reconciled.')
+
+
+def paper_scalps_update(m, a, read):
+    """Research-only one-contract round trips. Does not place or infer actual orders."""
+    now=int(time.time())
+    ticker=m['ticker']
+    with connect() as c:
+        open_rows=c.execute('SELECT * FROM keke_paper_scalps WHERE closed_at IS NULL').fetchall()
+        for r in open_rows:
+            bid=quote(m,r['side'],'bid') if r['ticker']==ticker else None
+            if bid is None and r['ticker']==ticker:
+                continue  # never fabricate an exit price
+            if r['ticker']!=ticker:
+                # Old contract needs an actual observed closing quote; do not treat settlement as scalp exit.
+                continue
+            diff=bid-r['entry_ask']
+            opposite=read.get('scalp') in ('UP','DOWN') and read['scalp']!=r['side']
+            reason=('take_profit' if diff>=TAKE_PROFIT_CENTS else
+                    'stop_watch' if diff<=-STOP_WARNING_CENTS else
+                    'opposite_momentum' if opposite else
+                    'time_exit' if a['seconds']<=90 else None)
+            if reason:
+                c.execute('UPDATE keke_paper_scalps SET closed_at=?,exit_bid=?,gross_per_contract=?,exit_reason=? WHERE ticker=? AND side=? AND closed_at IS NULL',
+                          (now,bid,diff,reason,r['ticker'],r['side']))
+
+
+def record_paper_entry(a, side, ask, bid):
+    with connect() as c:
+        c.execute('INSERT OR IGNORE INTO keke_paper_scalps(ticker,side,opened_at,entry_ask,entry_bid) VALUES(?,?,?,?,?)',
+                  (a['ticker'],side,int(time.time()),ask,bid))
+
+
+def health_status():
+    """Operational status only. /market owns the analysis."""
+    lines=['👀 KEKE STATUS',f'🔔 Alerts: {"ON" if state["enabled"] else "PAUSED"}',
+           '🤖 Trading: manual only']
+    try:
+        m=get_market()
+        lines.append('📈 Kalshi market: '+('CONNECTED' if m else 'NO ACTIVE CONTRACT'))
+        if m:
+            lines.append('🎯 '+str(m['ticker']))
+            price,stamp=save_brti_ticks()
+            age=max(0,time.time()-stamp)
+            lines.append(f'📡 BRTI: {"FRESH" if age<=BRTI_MAX_AGE else "STALE"} ({age:.1f}s)')
+            lines.append(f'📚 BRTI candles: {len(brti_candles())} completed 1m')
+    except Exception as exc:
+        lines.append(f'⚠️ Market/BRTI check: {type(exc).__name__}')
+    try:
+        with connect() as c:c.execute('SELECT 1').fetchone()
+        lines.append('💾 Stats database: CONNECTED')
+    except Exception:lines.append('⚠️ Stats database: UNAVAILABLE')
+    lines.append('🧠 Trading analysis: /market')
+    return '\n'.join(lines)
+
+
 def send_stats():
-    send(brti_stats_summary())
+    send(brti_stats_summary()+'\n\n'+paper_scalps_summary())
 
 def fresh_status():
     """Fetch a new market and BRTI tick for STATUS; do not change prediction state."""
@@ -798,13 +871,15 @@ def telegram_commands():
             msg=upd.get('message') or {}
             if str((msg.get('chat') or {}).get('id'))!=str(CHAT):continue
             cmd=str(msg.get('text') or '').strip().lower()
-            cmd={'👀 status':'/status','🧠 market read':'/status','📊 stats':'/stats',
+            cmd={'👀 status':'/status','🧠 market read':'/market','📊 stats':'/stats',
                  '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop'}.get(cmd,cmd)
             if cmd.startswith('/stop'):
                 state['enabled']=False;send('🔴 Alerts paused. Data collection continues. /start resumes alerts.')
             elif cmd.startswith('/start'):
-                state['enabled']=True;send('🟢 Settlement alerts ON.')
+                state['enabled']=True;send('🟢 KeKe alerts ON.')
             elif cmd.startswith('/status'):
+                send(health_status())
+            elif cmd.startswith('/market'):
                 send(fresh_status())
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
@@ -821,12 +896,13 @@ def initialize_telegram():
         updates=obj.get('result',[])
         if updates:state['offset']=updates[-1]['update_id']+1
         tg('setMyCommands',commands=json.dumps([
-            {'command':'start','description':'Resume settlement alerts'},
+            {'command':'start','description':'Resume KeKe alerts'},
             {'command':'stop','description':'Pause alerts; keep recording'},
-            {'command':'status','description':'Fetch fresh settlement read'},
-            {'command':'stats','description':'V5.9 BRTI-only report card'},
+            {'command':'status','description':'Bot health, BRTI freshness and database'},
+            {'command':'market','description':'Fresh BRTI and scalp context'},
+            {'command':'stats','description':'BRTI-only prediction report card'},
             {'command':'legacy','description':'Historical and lifetime research stats'},
-            {'command':'last','description':'Last settlement ENTER'},
+            {'command':'last','description':'Last settlement pick'},
             {'command':'brti','description':'Test read-only Kalshi BRTI access'},
             {'command':'export','description':'Download research CSV archive'},
             {'command':'position','description':'Current Kalshi BTC position'}]))
@@ -1030,6 +1106,7 @@ def entry_opportunity(a,read):
     if key in trade_alert_state['last_entry']:
         return
     trade_alert_state['last_entry'][key]=now
+    record_paper_entry(a,side,ask,bid)
     mm,ss=divmod(seconds,60)
     f=read['frames']
     trend={'UP':'↑','DOWN':'↓','MIXED':'↔','COLLECTING':'⏳','N/A':'⏳'}
@@ -1200,39 +1277,47 @@ def process_v56(a,new_contract):
         record_v56(a,'REVERSAL',candidate,old,'Strong opposite settlement signal')
         if state['enabled']:send(format_read(a,f'🎯 SETTLEMENT {candidate} • REVERSED {old}'))
 
+def compact_update(a):
+    """First two lines fit Telegram notification previews; detail follows on opening."""
+    seconds=max(0,int(a['seconds']))
+    mm,ss=divmod(seconds,60)
+    side=a.get('v56_side') or 'ANALYZING'
+    distance=a.get('distance')
+    delta=f'${distance:+,.2f}' if distance is not None else 'n/a'
+    read=a.get('dual_read') or {}
+    frames=read.get('frames') or {}
+    arrows={'UP':'↑','DOWN':'↓','MIXED':'↔','FLAT':'→','COLLECTING':'⏳','N/A':'⏳'}
+    trend=' '.join(f'{m}m{arrows.get(frames.get(m),"⏳")}' for m in (1,3))
+    return (f'📡 {side} • {mm}:{ss:02d} LEFT\n'
+            f'BRTI {delta} vs target | {trend}\n\n'
+            f'🎯 Target {money_text(a.get("target"))}\n'
+            f'📍 BRTI {money_text(a.get("btc"))}\n'
+            f'⚡ Scalp watch: {read.get("scalp","WAIT")} (not an entry)\n'
+            f'{a.get("brti_levels", "S/R collecting")}')
+
 def proactive_updates(a, new_contract):
-    """Send a new-contract notice, at-most-once-per-minute heartbeat, and meaningful risk alert."""
-    if not state['enabled'] or a['source']!='BRTI':
-        return
-    ticker=a['ticker']; now=time.time()
+    if not state['enabled'] or a['source']!='BRTI':return
+    ticker=a['ticker'];now=time.time()
     if new_contract or state.get('heartbeat_ticker')!=ticker:
         state['heartbeat_ticker']=ticker
         state['heartbeat_at']=now
         state['threat_ticker']=ticker
         state['threat_side']=None
         state['threat_at']=0
-        send(banner_levels(a)+'\n'+format_read(a,'🆕 NEW CONTRACT • Monitoring')+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
+        send(banner_levels(a)+'\n'+format_read(a,'🆕 NEW CONTRACT')+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
         return
-    side=a.get('v56_side')
-    signal=a.get('v56_signal')
-    candidate=a.get('v56_candidate')
-    # Warn only when contrary evidence has meaningful strength; avoid repeating
-    # the same warning until evidence recovers or the thesis changes.
+    side=a.get('v56_side');signal=a.get('v56_signal');candidate=a.get('v56_candidate')
     threatened=(side in ('UP','DOWN') and candidate in ('UP','DOWN')
-                and candidate!=side and signal is not None
-                and abs(signal)>=THREAT_SIGNAL)
-    if not threatened:
-        state['threat_side']=None
-    elif (state.get('threat_side')!=side and
-          now-state.get('threat_at',0)>=THREAT_COOLDOWN):
-        state['threat_side']=side
-        state['threat_at']=now
-        state['heartbeat_at']=now
-        send(format_read(a,f'⚠️ SETTLEMENT {side} AT RISK'))
+                and candidate!=side and signal is not None and abs(signal)>=THREAT_SIGNAL)
+    if not threatened:state['threat_side']=None
+    elif state.get('threat_side')!=side and now-state.get('threat_at',0)>=THREAT_COOLDOWN:
+        state['threat_side']=side;state['threat_at']=now;state['heartbeat_at']=now
+        send(f'⚠️ {side} PICK AT RISK\nOpposite signal strengthening\n\n'+compact_update(a))
         return
     if now-state.get('heartbeat_at',0)>=HEARTBEAT_SECONDS:
         state['heartbeat_at']=now
-        send(format_read(a,'📡 UPDATE • '+(side or 'ANALYZING'))+dual_text(a.get('dual_read',{'scalp':'WAIT','frames':{1:'N/A',3:'N/A',15:'N/A'},'label':'NO DATA'})))
+        send(compact_update(a))
+
 
 def send_last():
     with connect() as c:
@@ -1244,11 +1329,11 @@ def send_last():
 def main():
     init_db()
     initialize_telegram()
-    LOG.info('KeKe V5.10 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe V5.13 BRTI-only read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    send('🧠 KeKe V5.10 BRTI-only entry/exit watch online. '
+    send('🧠 KeKe V5.13 BRTI-only entry/exit watch online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
-         'Automatic official-result grading active. No trades. /stats for V5.9, /legacy for history' )
+         'Official-result grading active. No trades. /stats for BRTI-only, /legacy for history' )
     while True:
         started=time.monotonic()
         try:
@@ -1283,8 +1368,9 @@ def main():
                         state['entry_side']=None
                         if state['enabled']:
                             level=brti_opening_levels(candles,brti)
-                            send(f'🆕 NEW CONTRACT • BRTI ${brti:,.2f} • Target {money_text(target_of(market))}\n'
-                                 +level+'\n📊 1m/3m/15m: collecting verified BRTI candles\n'
+                            send(banner_levels({'brti_levels':level})+'\n'
+                                 +f'🎯 Target {money_text(target_of(market))} • BRTI ${brti:,.2f}\n'
+                                 +'📊 1m/3m/15m: collecting verified BRTI candles\n'
                                  +'⚪ NO TRADE SIGNAL • Insufficient BRTI history')
                     state['last_read']=None
                     time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
@@ -1300,6 +1386,7 @@ def main():
                 quick=dual_read(a,candles)
                 a['dual_read']=quick
                 portfolio_poll(market,a,quick)
+                paper_scalps_update(market,a,quick)
                 entry_opportunity(a,quick)
                 try:
                     record_shadow(a)

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import requests
 import csv, io, zipfile
 import threading
+import keke_ai_lab as ai_lab
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 LOG = logging.getLogger('keke')
@@ -1068,9 +1069,19 @@ def telegram_commands():
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/exchange'):send(exchange_report())
             elif cmd.startswith('/lead'):send(exchange_research_report())
+            elif cmd in ('/aion','/aioff','/ai','/researchon','/researchoff','/auditai','/improvements','/compare'):
+                send(ai_lab.command(cmd))
             elif cmd.startswith('/audit'):send(audit_report())
             elif cmd.startswith('/research'):send(research_stats_report())
             elif cmd.startswith('/scorecard'):send(v527_scorecard())
+            elif cmd=='/shadowon':
+                shadow_view['enabled']=True
+                send('🧪 V5.28 shadow updates ON • once per minute. Official calls unchanged. /shadowoff stops updates.')
+                send(v528_shadow_message(shadow_view['last'],(state.get('last_read') or {}).get('v56_side')))
+            elif cmd=='/shadowoff':
+                shadow_view['enabled']=False
+                send('🧪 Shadow updates OFF. /shadow still gives the latest reading.')
+            elif cmd=='/shadow':send(v528_shadow_message(shadow_view['last'],(state.get('last_read') or {}).get('v56_side')))
             elif cmd.startswith('/preview'):send(preview_report())
             elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
             elif cmd.startswith('/position'):send(portfolio_status())
@@ -1099,6 +1110,9 @@ def initialize_telegram():
             {'command':'brti','description':'Test read-only Kalshi BRTI access'},
             {'command':'export','description':'Download research CSV archive'},
             {'command':'scorecard','description':'Rolling 24-hour early forecast scorecard'},
+            {'command':'shadow','description':'Current experimental V5.28 read'},
+            {'command':'shadowon','description':'Show V5.28 shadow every minute'},
+            {'command':'shadowoff','description':'Stop automatic shadow messages'},
             {'command':'position','description':'Current Kalshi BTC position'}]))
     except Exception:LOG.exception('Telegram setup error')
 
@@ -1189,6 +1203,86 @@ def record_shadow(a):
                 (a['ticker'],checkpoint,a['at'],a['seconds'],side,score,reason,
                  a['asks'].get(side),a['btc'],a['target']))
 
+
+# V5.28 visible shadow: independent experimental settlement research, never trades or changes V5.27 calls.
+# These are heuristic scores, NOT calibrated settlement probabilities.
+V528_SHADOW_INTERVAL=60
+shadow_view={'enabled':False,'ticker':None,'sent_at':0,'last':None}
+
+def v528_shadow_read(a,candles):
+    if not a or a.get('source')!='BRTI' or a.get('target') is None or len(candles)<16:
+        return None
+    rows=candles[-16:]
+    if any(int(rows[j+1]['time'])-int(rows[j]['time'])!=60 for j in range(len(rows)-1)):
+        return None
+    base=rows[:-2]  # freeze reference range before the two breakout-confirmation bars
+    support=min(x['low'] for x in base)
+    resistance=max(x['high'] for x in base)
+    width=resistance-support
+    if width<=0:return None
+    target=a['target']; price=a['btc']; seconds=max(1,a['seconds'])
+    position=(target-support)/width
+    # Independent body/wick measurements; avoid mistaking a long wick for a confirmed reversal.
+    last=rows[-1]
+    upper=max(0,last['high']-max(last['open'],last['close']))
+    lower=max(0,min(last['open'],last['close'])-last['low'])
+    span=max(.01,last['high']-last['low'])
+    upper_frac=upper/span;lower_frac=lower/span
+    upper_rejections=sum(1 for x in rows[-6:] if (x['high']-max(x['open'],x['close']))/max(.01,x['high']-x['low'])>=.45 and x['close']<x['high'])
+    lower_rejections=sum(1 for x in rows[-6:] if (min(x['open'],x['close'])-x['low'])/max(.01,x['high']-x['low'])>=.45 and x['close']>x['low'])
+    crossings=sum(1 for x in rows[-10:] if x['low']<=target<=x['high'])
+    closes_above=sum(1 for x in rows[-10:] if x['close']>target)
+    # Regime: range overlap and target-crossings; confirmed breaks require consecutive closes.
+    band=max(5.0,width*.05)
+    breakout_up=rows[-1]['close']>resistance+band and rows[-2]['close']>resistance+band
+    breakout_down=rows[-1]['close']<support-band and rows[-2]['close']<support-band
+    regime='BREAKOUT UP' if breakout_up else ('BREAKDOWN' if breakout_down else ('RANGING' if crossings>=3 else 'MIXED / TRENDING'))
+    # Target distance and time/volatility dominate; structure is a modest, capped modifier.
+    scale=max(18.0,max(12.0,float(a.get('volatility') or 0))*math.sqrt(max(30,seconds)/60))
+    base_score=(price-target)/scale
+    structure=0.0
+    if regime=='RANGING':
+        if position>=.70:structure-=.25
+        elif position<=.30:structure+=.25
+    if upper_rejections>=2:structure-=.15
+    if lower_rejections>=2:structure+=.15
+    if breakout_up:structure+=.40
+    if breakout_down:structure-=.40
+    structure=max(-.5,min(.5,structure))
+    score=base_score+structure
+    side='WAIT' if abs(score)<.45 else ('UP' if score>0 else 'DOWN')
+    return {'side':side,'score':score,'base':base_score,'structure':structure,'regime':regime,
+            'support':support,'resistance':resistance,'position':position,'crossings':crossings,
+            'above':closes_above,'upper':upper_frac,'lower':lower_frac,
+            'upper_count':upper_rejections,'lower_count':lower_rejections,'seconds':seconds,
+            'price':price,'target':target,'ticker':a['ticker']}
+
+def v528_shadow_message(read,official=None):
+    if not read:return '🧪 V5.28 SHADOW\nWaiting for 16 contiguous completed BRTI candles and a valid target.'
+    r=read
+    pos=f"{r['position']*100:.0f}%" if 0<=r['position']<=1 else 'OUTSIDE RANGE'
+    official=official or 'NO OFFICIAL PICK'
+    return (f"🧪 V5.28 LIVE SHADOW • EXPERIMENTAL\n"
+            f"Official KeKe: {official} | Shadow: {r['side']}\n"
+            f"BTC ${r['price']:,.2f} | Target ${r['target']:,.2f}\n"
+            f"Time left: {r['seconds']//60}:{r['seconds']%60:02d} | {r['regime']}\n"
+            f"Range ${r['support']:,.2f}–${r['resistance']:,.2f} | Target at {pos}\n"
+            f"Target touched in {r['crossings']}/10 candles | Closes above {r['above']}/10\n"
+            f"Last wick: upper {r['upper']:.0%}, lower {r['lower']:.0%} of candle\n"
+            f"6-bar rejection counts: upper {r['upper_count']}, lower {r['lower_count']}\n"
+            f"Research score {r['score']:+.2f} (distance/time {r['base']:+.2f}, structure {r['structure']:+.2f})\n"
+            f"⚠️ Uncalibrated research only. No live call, trade, or exit change.")
+
+def v528_shadow_tick(a,candles):
+    r=v528_shadow_read(a,candles)
+    shadow_view['last']=r
+    if not shadow_view['enabled'] or r is None:return
+    now=int(time.time())
+    if shadow_view['ticker']!=a['ticker']:
+        shadow_view['ticker']=a['ticker'];shadow_view['sent_at']=0
+    if now-shadow_view['sent_at']>=V528_SHADOW_INTERVAL:
+        shadow_view['sent_at']=now
+        send(v528_shadow_message(r,a.get('v56_side')))
 
 # V5.7 observational multi-timeframe and portfolio extension. GET requests only.
 PORTFOLIO_POLL_SECONDS=20
@@ -2219,6 +2313,7 @@ def main():
     exchange_init()
     research_init()
     v527_init()
+    ai_lab.start(DB_PATH,send)
     v527_daily_report()
     if os.getenv("KEKE_EXCHANGE_OBSERVER","1")=="1":
         threading.Thread(target=exchange_worker,daemon=True,name="exchange-observer").start()
@@ -2238,6 +2333,7 @@ def main():
                 state['last_grade']=time.monotonic()
                 grade_settlements()
                 v527_daily_report()
+            ai_lab.schedule_research()
             market=get_market()
             if market:
                 try:
@@ -2320,6 +2416,10 @@ def main():
                 if new:
                     proactive_updates(a,True)
                 process_v56(a,new)
+                try:
+                    v528_shadow_tick(a,candles)
+                    ai_lab.queue_live(a,shadow_view['last'])
+                except Exception:LOG.exception('V5.28 AI/shadow tick failed')
                 lock_forecast(a)
                 v527_checkpoint(a)
                 portfolio_poll(market,a,{'scalp':'WAIT'})

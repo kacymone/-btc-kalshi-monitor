@@ -1041,7 +1041,31 @@ def health_status():
 
 
 def send_stats():
-    send(prospective_early_summary()+'\n\n'+early_pick_stats_summary()+'\n\n'+brti_stats_summary()+'\n\n📦 Scalp tracking paused; historical records preserved.')
+    """Compact Telegram stats; retain detailed research in existing commands."""
+    try:
+        cutoff=stats_epoch()
+        with connect() as c:
+            rows=c.execute("SELECT ticker,event,grade FROM keke_v56_forecasts WHERE captured_at>=? ORDER BY ticker,id",(cutoff,)).fetchall()
+            contracts=c.execute("SELECT COUNT(DISTINCT ticker) n FROM settlement_observations WHERE model_version=? AND captured_at>=?",('5.9-BRTI',cutoff)).fetchone()['n']
+        def result(event):
+            group=[r for r in rows if r['event']==event]
+            w=sum(r['grade']=='WIN' for r in group)
+            l=sum(r['grade']=='LOSS' for r in group)
+            return f'{w}W/{l}L ({100*w/(w+l):.1f}%)' if w+l else 'Not graded yet'
+        early=prospective_early_summary()
+        import re
+        m=re.search(r'Coverage: ([\d.]+%)',early)
+        coverage=m.group(1) if m else 'n/a'
+        send('📊 KEKE | PERFORMANCE\n'
+             f'🎯 Early: {result("INITIAL")}\n'
+             f'📡 Late: {result("LATE")}\n'
+             f'🔄 Reversals: {result("REVERSAL")}\n'
+             f'📈 Early coverage: {coverage}\n'
+             f'📋 Contracts tracked: {contracts}\n'
+             '⚠️ Accuracy ≠ trading profit. /legacy for history.')
+    except Exception:
+        LOG.exception('Compact stats failed')
+        send('⚠️ Stats unavailable right now; try again shortly.')
 
 def fresh_status():
     """Fetch a new market and BRTI tick for STATUS; do not change prediction state."""

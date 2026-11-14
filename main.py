@@ -989,28 +989,23 @@ def kalshi_timestamp(value):
     return None
 
 def kalshi_live_point(payload):
-    """Conservatively identify explicitly timestamped BTC price points."""
-    found=[]
-    def visit(obj,path,depth=0):
-        if depth>9:return
-        if isinstance(obj,dict):
-            stamp=None
-            for k in ('timestamp','time','ts','timestamp_ms','time_ms','datetime'):
-                if k in obj:
-                    stamp=kalshi_timestamp(obj[k])
-                    if stamp:break
-            if stamp:
-                for k in ('value','price','btc_price','index_value'):
-                    v=number(obj.get(k))
-                    if v is not None and 10000<v<1000000:
-                        found.append((stamp,float(v),path+'.'+k))
-                        break
-            for k,v in obj.items():
-                if isinstance(v,(dict,list)):visit(v,path+'.'+str(k),depth+1)
-        elif isinstance(obj,list):
-            for i,item in enumerate(obj[-15:]):visit(item,path+'['+str(i)+']',depth+1)
-    visit(payload,'root')
-    return max(found,key=lambda x:x[0]) if found else (None,None,None)
+    """Read the documented BTC live-data `details.timeseries` t/v shape.
+
+    t is a Unix timestamp in milliseconds; v is a BTC chart price.
+    Never substitute candlestick open times for individual observations.
+    """
+    series = payload.get('timeseries') if isinstance(payload,dict) else None
+    if not isinstance(series,list):
+        return None,None,None
+    valid=[]
+    for point in series:
+        if not isinstance(point,dict):
+            continue
+        stamp=kalshi_timestamp(point.get('t'))
+        price=number(point.get('v'))
+        if stamp and price is not None and 10000<float(price)<1000000:
+            valid.append((stamp,float(price),'details.timeseries.t/v'))
+    return max(valid,key=lambda x:x[0]) if valid else (None,None,None)
 
 def kalshi_live_worker():
     """Collect chart API snapshots independently, including HTTP failures and raw sample."""
@@ -1101,11 +1096,34 @@ def export_kalshi_research():
                 if snapshot.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='keke_kalshi_live_raw_samples'").fetchone():
                     for event,blob in snapshot.execute('SELECT event_ticker,response_gzip FROM keke_kalshi_live_raw_samples'):
                         z.writestr('raw_event_samples/'+re.sub(r'[^A-Za-z0-9_-]','_',event)+'.json',gzip.decompress(blob))
+                # Extract chart t/v points into a dedicated CSV for direct UTC-second matching.
+                if snapshot.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='keke_kalshi_live_raw_samples'").fetchone():
+                    chart_csv=io.StringIO(newline='')
+                    chart_writer=csv.writer(chart_csv)
+                    chart_writer.writerow(('event_ticker','chart_source_utc','chart_timestamp_ms','chart_btc_price','sample_captured_utc'))
+                    chart_count=0
+                    for event,captured,blob in snapshot.execute('SELECT event_ticker,captured_utc,response_gzip FROM keke_kalshi_live_raw_samples'):
+                        try:
+                            payload=json.loads(gzip.decompress(blob))
+                            points=payload.get('live_data',{}).get('details',{}).get('timeseries',[])
+                            for point in points:
+                                if not isinstance(point,dict):continue
+                                ts=kalshi_timestamp(point.get('t'))
+                                val=number(point.get('v'))
+                                if ts and val is not None and 10000<float(val)<1000000:
+                                    chart_writer.writerow((event,ts,point['t'],val,captured))
+                                    chart_count+=1
+                        except (ValueError,TypeError,KeyError,UnicodeError,EOFError,OSError):
+                            LOG.warning('Skipping unreadable Kalshi raw sample for %s',event)
+                    z.writestr('kalshi_chart_timeseries.csv',chart_csv.getvalue())
+                    counts.append(f'kalshi_chart_timeseries: {chart_count} rows (one saved sample per event)')
                 z.writestr('README.txt',
-                    'KeKe Kalshi research export (read-only).\n'
+                    'KeKe Kalshi research export (read-only).\n' 
                     'This export includes Kalshi event live_data API observations where available.\n'
                     'The event live_data price is NOT verified as identical to the app BTC Now label.\n'
                     'Raw API JSON sample is saved once per event to inspect actual schema.\n'
+                    'kalshi_chart_timeseries.csv contains t/v price observations from those saved samples.\n'
+                    'Historical chart points are not proof of real-time availability at their source timestamp.\n'
                     'Observed timestamps reflect KeKe collection times unless explicitly named as source timestamps.\n'
                     'Market quote timestamps are not independently exchange-verified in this export.\n'
                     'Do not infer a price-feed lead or executable trading advantage from these files alone.\n\n'

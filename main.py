@@ -791,11 +791,57 @@ def menu_help():
             '⚙️ Settings: advanced research controls\n'
             'Confidence is an experimental evidence score, NOT a guaranteed outcome.')
 
+# Silent latency diagnostics. UTC clocks compare source age; monotonic clocks measure local durations.
+_LATENCY_CONTEXT = threading.local()
+
+def latency_init():
+    with connect() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS keke_speed_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, loop_started_utc TEXT,
+            brti_request_started_utc TEXT, brti_received_utc TEXT, brti_source_utc TEXT,
+            brti_age_ms REAL, brti_request_ms REAL, market_request_ms REAL,
+            processing_to_first_call_ms REAL, first_alert_send_ms REAL,
+            first_alert_api_ms REAL, loop_elapsed_ms REAL, alert_count INTEGER,
+            note TEXT)""")
+
+def latency_log(row):
+    try:
+        with connect() as c:
+            fields=list(row)
+            c.execute('INSERT INTO keke_speed_diagnostics ('+','.join(fields)+') VALUES ('+','.join('?' for _ in fields)+')',tuple(row.values()))
+    except Exception:
+        LOG.exception('Speed diagnostics write failed')
+
+def speed_report_csv(snapshot):
+    import statistics
+    if not snapshot.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='keke_speed_diagnostics'").fetchone():
+        return 'KeKe speed report\nNo diagnostic samples yet.\n'
+    rows=snapshot.execute('SELECT * FROM keke_speed_diagnostics').fetchall()
+    fields=[x[1] for x in snapshot.execute('PRAGMA table_info(keke_speed_diagnostics)')]
+    lines=['KeKe speed report','Samples: '+str(len(rows)),
+           'Source age is not network latency. Telegram API completion is not phone delivery.',
+           'A 5-second polling cycle can miss interim price changes.']
+    for field in ('brti_age_ms','brti_request_ms','market_request_ms','processing_to_first_call_ms','first_alert_api_ms','loop_elapsed_ms'):
+        i=fields.index(field)
+        vals=sorted(float(r[i]) for r in rows if r[i] is not None)
+        if vals:
+            p95=vals[min(len(vals)-1,int((len(vals)-1)*.95))]
+            lines.append(f'{field}: n={len(vals)}, median={statistics.median(vals):.1f} ms, p95={p95:.1f} ms, max={vals[-1]:.1f} ms')
+    return '\n'.join(lines)+'\n'
+
 def send(message):
     if not TOKEN or not CHAT:
         LOG.info('Telegram unavailable; %s',message)
         return
-    try: tg('sendMessage',chat_id=CHAT,text=message,reply_markup=json.dumps(KEYBOARD))
+    try:
+        t0=time.monotonic()
+        tg('sendMessage',chat_id=CHAT,text=message,reply_markup=json.dumps(KEYBOARD))
+        ctx=getattr(_LATENCY_CONTEXT,'current',None)
+        if ctx is not None:
+            ctx['alert_count']=ctx.get('alert_count',0)+1
+            ctx.setdefault('first_alert_api_ms',(time.monotonic()-t0)*1000)
+            ctx.setdefault('processing_to_first_call_ms',(t0-ctx['brti_received_mono'])*1000 if 'brti_received_mono' in ctx else None)
+            ctx.setdefault('first_alert_send_ms',(t0-ctx['brti_received_mono'])*1000 if 'brti_received_mono' in ctx else None)
     except Exception: LOG.exception('Telegram send failed')
 
 def money_text(x): return f'${x:,.2f}' if x is not None else 'UNKNOWN'
@@ -1071,7 +1117,7 @@ def export_kalshi_research():
         return
     tables=('keke_transition_snapshots','keke_contract_transitions',
             'settlement_observations','keke_brti_ticks',
-            'keke_kalshi_live_observations')
+            'keke_kalshi_live_observations','keke_speed_diagnostics')
     try:
         snapshot=sqlite3.connect(':memory:')
         try:
@@ -1117,6 +1163,7 @@ def export_kalshi_research():
                             LOG.warning('Skipping unreadable Kalshi raw sample for %s',event)
                     z.writestr('kalshi_chart_timeseries.csv',chart_csv.getvalue())
                     counts.append(f'kalshi_chart_timeseries: {chart_count} rows (one saved sample per event)')
+                z.writestr('keke_speed_summary.txt',speed_report_csv(snapshot))
                 z.writestr('README.txt',
                     'KeKe Kalshi research export (read-only).\n' 
                     'This export includes Kalshi event live_data API observations where available.\n'
@@ -1126,6 +1173,7 @@ def export_kalshi_research():
                     'Historical chart points are not proof of real-time availability at their source timestamp.\n'
                     'Observed timestamps reflect KeKe collection times unless explicitly named as source timestamps.\n'
                     'Market quote timestamps are not independently exchange-verified in this export.\n'
+                    'Speed diagnostics measure local durations and API completion, not Telegram phone delivery.\n'
                     'Do not infer a price-feed lead or executable trading advantage from these files alone.\n\n'
                     + '\n'.join(counts) + '\n')
             output.seek(0)
@@ -2561,6 +2609,7 @@ def preview_report():
 def main():
     init_db()
     kalshi_live_init()
+    latency_init()
     threading.Thread(target=kalshi_live_worker,daemon=True,name='kalshi-chart-observer').start()
     exchange_init()
     research_init()
@@ -2579,6 +2628,7 @@ def main():
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     while True:
         started=time.monotonic()
+        speed={'loop_started_utc':kalshi_utc(),'alert_count':0}
         try:
             telegram_commands()
             if time.monotonic()-state['last_grade']>=GRADE_EVERY:
@@ -2586,10 +2636,21 @@ def main():
                 grade_settlements()
                 v527_daily_report()
             ai_lab.schedule_research()
+            market_t0=time.monotonic()
             market=get_market()
+            speed['market_request_ms']=(time.monotonic()-market_t0)*1000
             if market:
+                speed['ticker']=market.get('ticker')
                 try:
+                    speed['brti_request_started_utc']=kalshi_utc()
+                    brti_t0=time.monotonic()
                     brti,brti_stamp=save_brti_ticks()
+                    speed['brti_request_ms']=(time.monotonic()-brti_t0)*1000
+                    speed['brti_received_utc']=kalshi_utc()
+                    speed['brti_source_utc']=kalshi_utc(brti_stamp)
+                    speed['brti_age_ms']=(time.time()-brti_stamp)*1000
+                    speed['brti_received_mono']=time.monotonic()
+                    _LATENCY_CONTEXT.current=speed
                     state['current_brti_stamp']=brti_stamp
                     state['brti_error_at']=0
                 except Exception as exc:
@@ -2693,6 +2754,12 @@ def main():
                              a['ticker'], a.get('v56_side'), brti, a['target'])
             else:LOG.info('No active BTC 15m contract')
         except Exception:LOG.exception('Monitor loop error; will retry')
+        finally:
+            speed['loop_elapsed_ms']=(time.monotonic()-started)*1000
+            speed.pop('brti_received_mono',None)
+            speed['note']='Observed polling iteration; no Telegram message means no alert latency sample'
+            latency_log(speed)
+            _LATENCY_CONTEXT.current=None
         time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
 
 if __name__=='__main__':main()

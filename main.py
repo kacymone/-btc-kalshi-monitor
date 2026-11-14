@@ -10,7 +10,12 @@ import csv, io, zipfile
 import threading
 import gzip
 import uuid
-import keke_ai_lab as ai_lab
+# AI Lab is optional and disabled by default to keep KeKe quiet.
+try:
+    import keke_ai_lab as ai_lab
+except ImportError:
+    ai_lab = None
+AI_LAB_ENABLED = os.getenv('KEKE_AI_LAB_ENABLED', '0') == '1' 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 LOG = logging.getLogger('keke')
@@ -1431,7 +1436,7 @@ def telegram_commands():
             elif cmd.startswith('/exchange'):send(exchange_report())
             elif cmd.startswith('/lead'):send(exchange_research_report())
             elif cmd in ('/aion','/aioff','/ai','/researchon','/researchoff','/auditai','/improvements','/compare'):
-                send(ai_lab.command(cmd))
+                send(ai_lab.command(cmd) if AI_LAB_ENABLED and ai_lab else "AI Lab is sleeping; KeKe settlement alerts remain active.")
             elif cmd.startswith('/audit'):send(audit_report())
             elif cmd.startswith('/research'):send(research_stats_report())
             elif cmd.startswith('/scorecard'):send(v527_scorecard())
@@ -1517,6 +1522,74 @@ def fast_opening_assessment(m, brti):
             'favored':'UP' if distance>0 else 'DOWN' if distance<0 else None}
 
 
+# Combined BRTI/Kalshi movement read: uses only historical, timestamped observations.
+# This is a small, conservative heuristic modifier, NOT a calibrated probability.
+KEKE_MOVEMENT_WEIGHT = max(0.0, min(0.20, float(os.getenv('KEKE_MOVEMENT_WEIGHT', '0.15'))))
+
+def movement_confirmation(a):
+    '''Return (adjustment, diagnostic) using the current contract's fresh live chart.
+
+    Rejects stale samples, cross-contract leakage, and mismatched chart timestamps.
+    The chart API is not assumed identical to the app's BTC Now display.
+    '''
+    neutral = (0.0, 'unconfirmed')
+    ticker = a.get('ticker')
+    if not ticker or a.get('distance') is None:
+        return neutral
+    now = time.time()
+    try:
+        with connect() as c:
+            chart = c.execute('''SELECT latest_point_price, latest_point_timestamp,
+                        received_utc FROM keke_kalshi_live_observations
+                        WHERE market_ticker=? AND latest_point_price IS NOT NULL
+                        ORDER BY id DESC LIMIT 24''', (ticker,)).fetchall()
+            ticks = c.execute('''SELECT timestamp,price FROM keke_brti_ticks
+                        WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp DESC LIMIT 45''',
+                        (int(now)-50, int(now))).fetchall()
+        def parse_utc(value):
+            return datetime.fromisoformat(str(value).replace('Z','+00:00')).timestamp()
+        usable=[]
+        for row in chart:
+            try:
+                observed=parse_utc(row['received_utc'])
+                point=parse_utc(row['latest_point_timestamp'])
+                if 0 <= now-observed <= 12 and 0 <= observed-point <= 12:
+                    usable.append((point, float(row['latest_point_price'])))
+                elif 0 <= now-observed <= 50 and 0 <= observed-point <= 12:
+                    usable.append((point, float(row['latest_point_price'])))
+            except (ValueError,TypeError,OverflowError):
+                continue
+        if len(usable)<2 or len(ticks)<2:
+            return neutral
+        usable.sort()
+        latest=usable[-1]
+        if now-latest[0]>12:
+            return neutral
+        prior=[r for r in usable[:-1] if 10 <= latest[0]-r[0] <= 35]
+        if not prior:
+            return neutral
+        prior=max(prior,key=lambda r:r[0])
+        # The BRTI 10-30s slope is computed from verified historical ticks.
+        ticks=[(float(r['timestamp']),float(r['price'])) for r in ticks]
+        current=max(ticks)
+        past=[r for r in ticks if 10 <= current[0]-r[0] <= 30]
+        if not past or now-current[0]>12:
+            return neutral
+        old=max(past)
+        brti_delta=current[1]-old[1]
+        chart_delta=latest[1]-prior[1]
+        # Require real movement in both sources; don't assume a static chart will catch up.
+        if abs(brti_delta)<5 or abs(chart_delta)<3:
+            return neutral
+        if brti_delta*chart_delta<=0:
+            return 0.0,'diverging'
+        # Distance remains dominant; this only slightly strengthens aligned momentum.
+        sign=1 if brti_delta>0 else -1
+        return sign*KEKE_MOVEMENT_WEIGHT,'aligned'
+    except (sqlite3.Error,ValueError,TypeError,KeyError,OverflowError) as exc:
+        LOG.debug('Movement confirmation unavailable: %s',type(exc).__name__)
+        return neutral
+
 def settlement_signal(a):
     if a['source']!='BRTI' or a['distance'] is None:
         return None
@@ -1528,7 +1601,10 @@ def settlement_signal(a):
     # A small, capped directional drift component; target distance dominates.
     momentum=a.get('delta3') or 0
     drift=max(-0.35,min(0.35,0.18*momentum/scale))
-    return a['distance']/scale + drift
+    adjustment,condition=movement_confirmation(a)
+    a['movement_condition']=condition
+    a['movement_adjustment']=adjustment
+    return a['distance']/scale + drift + adjustment
 
 # Silent experimental model: NEVER changes the live V5.6 predictions or alerts.
 SHADOW_CHECKPOINTS=(720,540,360)  # 12, 9, and 6 minutes left
@@ -2682,7 +2758,8 @@ def main():
     exchange_init()
     research_init()
     v527_init()
-    ai_lab.start(DB_PATH,send)
+    if AI_LAB_ENABLED and ai_lab:
+        ai_lab.start(DB_PATH,send)
     v527_daily_report()
     if os.getenv("KEKE_EXCHANGE_OBSERVER","1")=="1":
         threading.Thread(target=exchange_worker,daemon=True,name="exchange-observer").start()
@@ -2713,7 +2790,8 @@ def main():
                 v527_daily_report()
                 speed['grading_ms']=(time.monotonic()-grade_t0)*1000
             ai_t0=time.monotonic()
-            ai_lab.schedule_research()
+            if AI_LAB_ENABLED and ai_lab:
+                ai_lab.schedule_research()
             speed['ai_schedule_ms']=(time.monotonic()-ai_t0)*1000
             market_t0=time.monotonic()
             market=get_market()
@@ -2810,7 +2888,8 @@ def main():
                 process_v56(a,new)
                 try:
                     v528_shadow_tick(a,candles)
-                    ai_lab.queue_live(a,shadow_view['last'])
+                    if AI_LAB_ENABLED and ai_lab:
+                        ai_lab.queue_live(a,shadow_view['last'])
                 except Exception:LOG.exception('V5.28 AI/shadow tick failed')
                 lock_forecast(a)
                 v527_checkpoint(a)

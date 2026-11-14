@@ -5,7 +5,7 @@ import os, json, time, sqlite3, threading, queue, logging, math
 import requests
 
 LOG=logging.getLogger('keke.ai')
-API='https://api.openai.com/v1/chat/completions'
+API='https://api.openai.com/v1/responses'
 MODEL=os.getenv('KEKE_AI_MODEL','gpt-4.1-mini')
 INTERVAL=max(30,int(os.getenv('KEKE_AI_INTERVAL','60')))
 RESEARCH_INTERVAL=max(3600,int(os.getenv('KEKE_AI_RESEARCH_INTERVAL','3600')))
@@ -44,29 +44,53 @@ def _set(key,value):
 
 def _call(system,data,max_tokens=380):
     key=os.getenv('OPENAI_API_KEY','').strip()
-    if not key:raise RuntimeError('OPENAI_API_KEY is not configured')
-    response=requests.post(API,headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},json={
-        'model':MODEL,'temperature':0,'response_format':{'type':'json_object'},'max_tokens':max_tokens,
-        'messages':[{'role':'system','content':system},{'role':'user','content':json.dumps(data,separators=(',',':'))}]
-    },timeout=22)
+    if not key:
+        raise RuntimeError('OPENAI_API_KEY is not configured')
+    # Responses API uses input + text.format, not Chat Completions messages/response_format.
+    # Do not pass temperature: not all Responses models accept it.
+    payload={
+        'model':MODEL,
+        'instructions':system + ' Respond with a single valid JSON object only.',
+        'input':[{'role':'user','content':[{'type':'input_text',
+                  'text':json.dumps(data,separators=(',',':'),allow_nan=False)}]}],
+        'text':{'format':{'type':'json_object'}},
+        'max_output_tokens':max(600,max_tokens),
+        'store':False
+    }
+    response=requests.post(API,headers={
+        'Authorization':'Bearer '+key,
+        'Content-Type':'application/json'
+    },json=payload,timeout=35)
     if response.status_code >= 400:
-        # Log only structured error metadata; never print credentials or headers.
+        # Do not log raw API messages, request bodies, or credentials.
         try:
-            err = response.json().get('error', {})
-            error_type = str(err.get('type', 'unknown'))[:80]
-            error_code = str(err.get('code', 'unknown'))[:80]
-            safe_message = str(err.get('message', ''))
-            # Authentication errors can quote key prefixes; omit message for 401.
-            if response.status_code == 401:
-                safe_message = '(authentication rejected; message withheld to protect key)'
-            else:
-                safe_message = safe_message[:300]
-            LOG.error('OpenAI API HTTP %s type=%s code=%s detail=%s',
-                      response.status_code, error_type, error_code, safe_message)
-        except (ValueError, AttributeError, TypeError):
-            LOG.error('OpenAI API HTTP %s (non-JSON error response)', response.status_code)
+            err=response.json().get('error') or {}
+            LOG.error('OpenAI Responses HTTP %s type=%s code=%s param=%s',
+                response.status_code,
+                str(err.get('type','unknown'))[:80],
+                str(err.get('code','unknown'))[:80],
+                str(err.get('param','none'))[:80])
+        except (ValueError,AttributeError,TypeError):
+            LOG.error('OpenAI Responses HTTP %s (non-JSON response)',response.status_code)
     response.raise_for_status()
-    return json.loads(response.json()['choices'][0]['message']['content'])
+    body=response.json()
+    if body.get('status') not in (None,'completed'):
+        raise RuntimeError('OpenAI response incomplete: '+str(body.get('status'))[:60])
+    # In the raw Responses REST API, output is a list of message/reasoning items.
+    # Reasoning items are not text. Only parse output_text parts from assistant messages.
+    parts=[]
+    for item in body.get('output',[]):
+        if item.get('type')!='message' or item.get('role')!='assistant':
+            continue
+        for content in item.get('content',[]):
+            if content.get('type')=='output_text' and isinstance(content.get('text'),str):
+                parts.append(content['text'])
+    if not parts:
+        raise RuntimeError('OpenAI response had no assistant output_text')
+    result=json.loads(''.join(parts))
+    if not isinstance(result,dict):
+        raise ValueError('OpenAI returned JSON that is not an object')
+    return result
 
 def _analyst(snapshot):
     prompt=('You are an independent research analyst for a BTC 15-minute settlement forecast. '

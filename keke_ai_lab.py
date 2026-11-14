@@ -51,8 +51,7 @@ def _call(system,data,max_tokens=380):
     payload={
         'model':MODEL,
         'instructions':system + ' Respond with a single valid JSON object only.',
-        'input':[{'role':'user','content':[{'type':'input_text',
-                  'text':json.dumps(data,separators=(',',':'),allow_nan=False)}]}],
+        'input':json.dumps(data,separators=(',',':'),allow_nan=False),
         'text':{'format':{'type':'json_object'}},
         'max_output_tokens':max(600,max_tokens),
         'store':False

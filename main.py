@@ -2484,7 +2484,19 @@ def main():
                 if not new:
                     proactive_updates(a,False)
                 state['last_read']=a
-                LOG.info('%s settlement %s BRTI %s target %s',a['ticker'],a.get('v56_side'),brti,a['target'])
+                # Diagnostic only: source observation time versus local receive/log time.
+                # Does not alter settlement predictions, prices, or Telegram output.
+                source_ts = state.get('current_brti_stamp')
+                received_ts = time.time()
+                if source_ts is not None:
+                    LOG.info('%s settlement %s BRTI %s target %s | brti_source_utc=%s received_utc=%s feed_age_s=%.2f',
+                             a['ticker'], a.get('v56_side'), brti, a['target'],
+                             datetime.fromtimestamp(float(source_ts), timezone.utc).isoformat(timespec='milliseconds'),
+                             datetime.fromtimestamp(received_ts, timezone.utc).isoformat(timespec='milliseconds'),
+                             received_ts-float(source_ts))
+                else:
+                    LOG.info('%s settlement %s BRTI %s target %s | brti_source_utc=UNKNOWN',
+                             a['ticker'], a.get('v56_side'), brti, a['target'])
             else:LOG.info('No active BTC 15m contract')
         except Exception:LOG.exception('Monitor loop error; will retry')
         time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))

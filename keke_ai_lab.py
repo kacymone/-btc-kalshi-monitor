@@ -50,11 +50,21 @@ def _call(system,data,max_tokens=380):
         'messages':[{'role':'system','content':system},{'role':'user','content':json.dumps(data,separators=(',',':'))}]
     },timeout=22)
     if response.status_code >= 400:
-    logging.error(
-        "OpenAI API error %s: %s",
-        response.status_code,
-        response.text[:1000]
-    )
+        # Log only structured error metadata; never print credentials or headers.
+        try:
+            err = response.json().get('error', {})
+            error_type = str(err.get('type', 'unknown'))[:80]
+            error_code = str(err.get('code', 'unknown'))[:80]
+            safe_message = str(err.get('message', ''))
+            # Authentication errors can quote key prefixes; omit message for 401.
+            if response.status_code == 401:
+                safe_message = '(authentication rejected; message withheld to protect key)'
+            else:
+                safe_message = safe_message[:300]
+            LOG.error('OpenAI API HTTP %s type=%s code=%s detail=%s',
+                      response.status_code, error_type, error_code, safe_message)
+        except (ValueError, AttributeError, TypeError):
+            LOG.error('OpenAI API HTTP %s (non-JSON error response)', response.status_code)
     response.raise_for_status()
     return json.loads(response.json()['choices'][0]['message']['content'])
 

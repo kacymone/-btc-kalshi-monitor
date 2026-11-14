@@ -20,7 +20,7 @@ TOKEN=os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT=os.getenv('TELEGRAM_CHAT_ID')
 DATA_DIR=os.getenv('DATA_DIR','/data')
 DB_NAME='kate_btc_watcher.db'
-CHECK_EVERY=5
+CHECK_EVERY=max(1.0,float(os.getenv("KEKE_MAIN_POLL_SECONDS","1")))
 HEARTBEAT_SECONDS=60
 THREAT_SIGNAL=0.20
 THREAT_COOLDOWN=90
@@ -36,6 +36,27 @@ BRTI_PATH='/trade-api/v2/cfbenchmarks/values'
 BRTI_MAX_AGE=30
 
 session=requests.Session()
+# Shared cooldown across the main observer and background chart collector.
+_RATE_LOCK=threading.Lock()
+_RATE_UNTIL=0.0
+_RATE_STRIKES=0
+
+def keke_rate_wait():
+    with _RATE_LOCK:
+        remaining=max(0.0,_RATE_UNTIL-time.monotonic())
+    if remaining:
+        time.sleep(remaining)
+
+def keke_rate_result(status):
+    global _RATE_UNTIL,_RATE_STRIKES
+    with _RATE_LOCK:
+        if status==429:
+            _RATE_STRIKES=min(_RATE_STRIKES+1,5)
+            delay=min(60,5*(2**(_RATE_STRIKES-1)))
+            _RATE_UNTIL=max(_RATE_UNTIL,time.monotonic()+delay)
+            LOG.warning('Kalshi HTTP 429: pausing read requests for %ss',delay)
+        elif status==200 and _RATE_STRIKES:
+            _RATE_STRIKES=0
 state={'ticker':None,'last_alert':None,'last_sent':0,'last_side':None,'last_read':None,
        'enabled':True,'offset':None,'entry_side':None,'entry_at':None,'last_btc':None,
        'last_btc_at':None,'last_poll':0,'last_grade':0,
@@ -172,7 +193,9 @@ def record_event(ticker,event,detail=''):
 
 
 def http_json(url,params=None,timeout=6):
+    keke_rate_wait()
     r=session.get(url,params=params,timeout=timeout)
+    keke_rate_result(r.status_code)
     r.raise_for_status()
     obj=r.json()
     if isinstance(obj,dict) and obj.get('error'):
@@ -1064,7 +1087,9 @@ def kalshi_live_worker():
             if market:
                 event=market.get('event_ticker') or market.get('ticker')
                 started_utc=kalshi_utc()
+                keke_rate_wait()
                 response=session.get(BASE+'/live_data/events/'+str(event),params={'range':'15min'},timeout=10)
+                keke_rate_result(response.status_code)
                 finished_utc=kalshi_utc()
                 obj=response.json() if response.ok else {}
                 data=obj.get('live_data',obj) if isinstance(obj,dict) else {}
@@ -2628,7 +2653,7 @@ def main():
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     while True:
         started=time.monotonic()
-        speed={'loop_started_utc':kalshi_utc(),'alert_count':0}
+        speed={'loop_started_utc':kalshi_utc(),'alert_count':0,'configured_poll_seconds':CHECK_EVERY}
         try:
             telegram_commands()
             if time.monotonic()-state['last_grade']>=GRADE_EVERY:
@@ -2679,7 +2704,7 @@ def main():
                         v527_checkpoint(a)
                         portfolio_poll(market,a,{'scalp':'WAIT'})
                         state['last_read']=a
-                        time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
+                        time.sleep(max(0.05,CHECK_EVERY-(time.monotonic()-started)))
                         continue
                 if not candles:
                     # Portfolio reads must keep working while BRTI history warms up.
@@ -2697,7 +2722,7 @@ def main():
                                  +'📊 Verified BRTI history warming up\n'
                                  +'⚪ NO TRADE SIGNAL • Insufficient BRTI history')
                     state['last_read']=None
-                    time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
+                    time.sleep(max(0.05,CHECK_EVERY-(time.monotonic()-started)))
                     continue
                 if time.time()-(candles[-1]['time']+60)>MAX_DATA_AGE:
                     raise ValueError('BRTI candles stale; no directional read')
@@ -2760,6 +2785,6 @@ def main():
             speed['note']='Observed polling iteration; no Telegram message means no alert latency sample'
             latency_log(speed)
             _LATENCY_CONTEXT.current=None
-        time.sleep(max(1,CHECK_EVERY-(time.monotonic()-started)))
+        time.sleep(max(0.05,CHECK_EVERY-(time.monotonic()-started)))
 
 if __name__=='__main__':main()

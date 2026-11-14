@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import requests
 import csv, io, zipfile
 import threading
+import gzip
 import keke_ai_lab as ai_lab
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -953,6 +954,178 @@ def export_research():
         LOG.exception('Research export failed')
         send('⚠️ Export failed. Your existing database was not changed.')
 
+# Independent read-only Kalshi app/chart data observer. Never participates in predictions.
+KALSHI_LIVE_POLL_SECONDS = max(5, int(os.getenv('KEKE_KALSHI_LIVE_POLL_SECONDS','5')))
+
+def kalshi_live_init():
+    with connect() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_kalshi_live_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, received_utc TEXT NOT NULL,
+            request_started_utc TEXT NOT NULL, request_finished_utc TEXT NOT NULL,
+            event_ticker TEXT NOT NULL, market_ticker TEXT,
+            http_status INTEGER, data_type TEXT, latest_value REAL,
+            latest_point_price REAL, latest_point_timestamp TEXT,
+            chart_point_path TEXT, response_keys TEXT, details_keys TEXT,
+            brti_price REAL, brti_source_utc TEXT,
+            yes_bid TEXT, yes_ask TEXT, no_bid TEXT, no_ask TEXT,
+            error TEXT)''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_kalshi_live_time ON keke_kalshi_live_observations(received_utc)')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_kalshi_live_raw_samples (
+            event_ticker TEXT PRIMARY KEY, captured_utc TEXT NOT NULL,
+            response_gzip BLOB NOT NULL)''')
+
+def kalshi_utc(ts=None):
+    return datetime.fromtimestamp(time.time() if ts is None else ts,timezone.utc).isoformat(timespec='milliseconds')
+
+def kalshi_timestamp(value):
+    if isinstance(value,(int,float)):
+        if value>1e12: value=value/1000
+        if 1e9<value<3e9:return kalshi_utc(value)
+    if isinstance(value,str):
+        try:
+            dt=datetime.fromisoformat(value.replace('Z','+00:00'))
+            if dt.tzinfo:return dt.astimezone(timezone.utc).isoformat(timespec='milliseconds')
+        except ValueError:pass
+    return None
+
+def kalshi_live_point(payload):
+    """Conservatively identify explicitly timestamped BTC price points."""
+    found=[]
+    def visit(obj,path,depth=0):
+        if depth>9:return
+        if isinstance(obj,dict):
+            stamp=None
+            for k in ('timestamp','time','ts','timestamp_ms','time_ms','datetime'):
+                if k in obj:
+                    stamp=kalshi_timestamp(obj[k])
+                    if stamp:break
+            if stamp:
+                for k in ('value','price','btc_price','index_value'):
+                    v=number(obj.get(k))
+                    if v is not None and 10000<v<1000000:
+                        found.append((stamp,float(v),path+'.'+k))
+                        break
+            for k,v in obj.items():
+                if isinstance(v,(dict,list)):visit(v,path+'.'+str(k),depth+1)
+        elif isinstance(obj,list):
+            for i,item in enumerate(obj[-15:]):visit(item,path+'['+str(i)+']',depth+1)
+    visit(payload,'root')
+    return max(found,key=lambda x:x[0]) if found else (None,None,None)
+
+def kalshi_live_worker():
+    """Collect chart API snapshots independently, including HTTP failures and raw sample."""
+    last_error=0
+    while True:
+        started=time.monotonic()
+        market=None
+        try:
+            market=get_market()
+            if market:
+                event=market.get('event_ticker') or market.get('ticker')
+                started_utc=kalshi_utc()
+                response=session.get(BASE+'/live_data/events/'+str(event),params={'range':'15min'},timeout=10)
+                finished_utc=kalshi_utc()
+                obj=response.json() if response.ok else {}
+                data=obj.get('live_data',obj) if isinstance(obj,dict) else {}
+                details=data.get('details',{}) if isinstance(data,dict) else {}
+                if not isinstance(details,dict):details={}
+                point_ts,point_price,point_path=kalshi_live_point(details)
+                latest=number(details.get('latest_value'))
+                if latest is None:latest=number(data.get('latest_value')) if isinstance(data,dict) else None
+                if latest is not None and not 10000<latest<1000000:latest=None
+                brti_stamp=state.get('current_brti_stamp')
+                brti_price=(state.get('last_read') or {}).get('btc')
+                with connect() as c:
+                    c.execute('''INSERT INTO keke_kalshi_live_observations (
+                        received_utc,request_started_utc,request_finished_utc,event_ticker,market_ticker,
+                        http_status,data_type,latest_value,latest_point_price,latest_point_timestamp,
+                        chart_point_path,response_keys,details_keys,brti_price,brti_source_utc,
+                        yes_bid,yes_ask,no_bid,no_ask,error)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        (kalshi_utc(),started_utc,finished_utc,event,market.get('ticker'),
+                         response.status_code,data.get('type') if isinstance(data,dict) else None,
+                         latest,point_price,point_ts,point_path,
+                         json.dumps(list(data.keys()) if isinstance(data,dict) else []),
+                         json.dumps(list(details.keys())),brti_price,
+                         kalshi_utc(brti_stamp) if isinstance(brti_stamp,(int,float)) else None,
+                         str(market.get('yes_bid_dollars') or market.get('yes_bid') or ''),
+                         str(market.get('yes_ask_dollars') or market.get('yes_ask') or ''),
+                         str(market.get('no_bid_dollars') or market.get('no_bid') or ''),
+                         str(market.get('no_ask_dollars') or market.get('no_ask') or ''),
+                         None if response.ok else ('HTTP '+str(response.status_code))))
+                    if response.ok and isinstance(obj,dict):
+                        c.execute('INSERT OR IGNORE INTO keke_kalshi_live_raw_samples VALUES (?,?,?)',
+                                  (event,finished_utc,gzip.compress(json.dumps(obj,separators=(',',':')).encode())))
+        except Exception as exc:
+            if time.time()-last_error>300:
+                LOG.warning('Kalshi chart observer: %s',str(exc)[:180]);last_error=time.time()
+            try:
+                with connect() as c:
+                    c.execute('''INSERT INTO keke_kalshi_live_observations
+                      (received_utc,request_started_utc,request_finished_utc,event_ticker,market_ticker,error)
+                      VALUES (?,?,?,?,?,?)''',
+                      (kalshi_utc(),kalshi_utc(),kalshi_utc(),
+                       (market or {}).get('event_ticker','UNKNOWN'),
+                       (market or {}).get('ticker'),str(exc)[:300]))
+            except Exception:LOG.exception('Kalshi observer error logging failed')
+        time.sleep(max(1,KALSHI_LIVE_POLL_SECONDS-(time.monotonic()-started)))
+
+def export_kalshi_research():
+    """Separate read-only timestamp research export; no trading or signal changes."""
+    if not TOKEN or not CHAT:
+        return
+    tables=('keke_transition_snapshots','keke_contract_transitions',
+            'settlement_observations','keke_brti_ticks',
+            'keke_kalshi_live_observations')
+    try:
+        snapshot=sqlite3.connect(':memory:')
+        try:
+            with connect() as live:
+                live.backup(snapshot, pages=100, sleep=0.05)
+            output=io.BytesIO()
+            counts=[]
+            with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_DEFLATED) as z:
+                for table in tables:
+                    if not snapshot.execute('SELECT 1 FROM sqlite_master WHERE type=? AND name=?',('table',table)).fetchone():
+                        continue
+                    cur=snapshot.execute('SELECT * FROM "'+table+'"')
+                    buf=io.StringIO(newline='')
+                    writer=csv.writer(buf)
+                    writer.writerow([d[0] for d in cur.description])
+                    count=0
+                    for record in cur:
+                        writer.writerow(record)
+                        count+=1
+                    z.writestr(table+'.csv',buf.getvalue())
+                    counts.append(f'{table}: {count} rows')
+                if snapshot.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='keke_kalshi_live_raw_samples'").fetchone():
+                    for event,blob in snapshot.execute('SELECT event_ticker,response_gzip FROM keke_kalshi_live_raw_samples'):
+                        z.writestr('raw_event_samples/'+re.sub(r'[^A-Za-z0-9_-]','_',event)+'.json',gzip.decompress(blob))
+                z.writestr('README.txt',
+                    'KeKe Kalshi research export (read-only).\n'
+                    'This export includes Kalshi event live_data API observations where available.\n'
+                    'The event live_data price is NOT verified as identical to the app BTC Now label.\n'
+                    'Raw API JSON sample is saved once per event to inspect actual schema.\n'
+                    'Observed timestamps reflect KeKe collection times unless explicitly named as source timestamps.\n'
+                    'Market quote timestamps are not independently exchange-verified in this export.\n'
+                    'Do not infer a price-feed lead or executable trading advantage from these files alone.\n\n'
+                    + '\n'.join(counts) + '\n')
+            output.seek(0)
+            if output.getbuffer().nbytes>45*1024*1024:
+                send('⚠️ Kalshi export exceeds 45 MB; existing data was not changed.')
+                return
+            response=session.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',
+                data={'chat_id':CHAT,'caption':'🔬 KeKe Kalshi research • existing timestamped observations • ZIP of CSV files'},
+                files={'document':('keke_kalshi_research.zip',output,'application/zip')},timeout=90)
+            response.raise_for_status()
+            if not response.json().get('ok'):
+                raise ValueError('Telegram rejected Kalshi export')
+        finally:
+            snapshot.close()
+    except Exception:
+        LOG.exception('Kalshi research export failed')
+        send('⚠️ Kalshi research export failed. Existing data was not changed.')
+
 def range_stats_summary():
     with connect() as c:
         rows=c.execute("SELECT pattern,entry_ask,exit_bid,gross_per_contract,exit_at FROM keke_range_signals").fetchall()
@@ -1152,6 +1325,7 @@ def telegram_commands():
             elif cmd.startswith('/last'):send_last()
             elif cmd.startswith('/brti'):run_brti_test()
             elif cmd == '/export':export_research()
+            elif cmd == '/kalshiexport':export_kalshi_research()
     except Exception:LOG.exception('Telegram command polling error')
 
 def initialize_telegram():
@@ -2368,6 +2542,8 @@ def preview_report():
 
 def main():
     init_db()
+    kalshi_live_init()
+    threading.Thread(target=kalshi_live_worker,daemon=True,name='kalshi-chart-observer').start()
     exchange_init()
     research_init()
     v527_init()

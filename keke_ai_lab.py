@@ -126,14 +126,13 @@ def _store_analyst(snapshot,result):
         json.dumps(snapshot),json.dumps(result)))
 
 def _message(snapshot,result):
-    return (f"🧠 KEKE AI • INDEPENDENT RESEARCH\n"
-      f"Contract: {snapshot['ticker']}\n"
-      f"Official: {snapshot.get('official') or 'WAIT'} | Shadow: {snapshot.get('shadow') or 'WAIT'} | AI: {result['side']}\n"
-      f"Time left: {snapshot['seconds_left']//60}:{snapshot['seconds_left']%60:02d} | Risk: {result['risk']}\n"
-      f"Why: {result['reason']}\n"
-      f"Disagreement: {result['disagreement']}\n"
-      f"Watch for: {result['invalidation']}\n"
-      '🧪 Research only • no trade or official forecast change')
+    """Compact Telegram research note; full assessment remains stored in SQLite."""
+    return (f"🧠 AI {result['side']} | Risk: {result['risk']} | "
+            f"{snapshot['seconds_left']//60}:{snapshot['seconds_left']%60:02d} left\n"
+            f"Official: {snapshot.get('official') or 'WAIT'} | "
+            f"Shadow: {snapshot.get('shadow') or 'WAIT'}\n"
+            f"Why: {result['reason'][:160]}\n"
+            "Research only • official signal unchanged")
 
 def _research():
     # Use exactly one representative AI snapshot per ticker to avoid pseudo-replication.

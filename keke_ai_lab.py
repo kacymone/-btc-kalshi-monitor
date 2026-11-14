@@ -49,6 +49,12 @@ def _call(system,data,max_tokens=380):
         'model':MODEL,'temperature':0,'response_format':{'type':'json_object'},'max_tokens':max_tokens,
         'messages':[{'role':'system','content':system},{'role':'user','content':json.dumps(data,separators=(',',':'))}]
     },timeout=22)
+    if response.status_code >= 400:
+    logging.error(
+        "OpenAI API error %s: %s",
+        response.status_code,
+        response.text[:1000]
+    )
     response.raise_for_status()
     return json.loads(response.json()['choices'][0]['message']['content'])
 

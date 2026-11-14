@@ -12,6 +12,7 @@ RESEARCH_INTERVAL=max(3600,int(os.getenv('KEKE_AI_RESEARCH_INTERVAL','3600')))
 _tasks=queue.Queue(maxsize=2)
 _started=False
 _last_enqueued={}
+_last_notified={}  # per-contract alert deduplication; research snapshots remain unchanged
 _db=None
 _send=None
 
@@ -126,13 +127,42 @@ def _store_analyst(snapshot,result):
         json.dumps(snapshot),json.dumps(result)))
 
 def _message(snapshot,result):
-    """Compact Telegram research note; full assessment remains stored in SQLite."""
-    return (f"🧠 AI {result['side']} | Risk: {result['risk']} | "
-            f"{snapshot['seconds_left']//60}:{snapshot['seconds_left']%60:02d} left\n"
-            f"Official: {snapshot.get('official') or 'WAIT'} | "
-            f"Shadow: {snapshot.get('shadow') or 'WAIT'}\n"
-            f"Why: {result['reason'][:160]}\n"
-            "Research only • official signal unchanged")
+    return (f"🧠 KEKE AI • INDEPENDENT RESEARCH\n"
+      f"Contract: {snapshot['ticker']}\n"
+      f"Official: {snapshot.get('official') or 'WAIT'} | Shadow: {snapshot.get('shadow') or 'WAIT'} | AI: {result['side']}\n"
+      f"Time left: {snapshot['seconds_left']//60}:{snapshot['seconds_left']%60:02d} | Risk: {result['risk']}\n"
+      f"Why: {result['reason']}\n"
+      f"Disagreement: {result['disagreement']}\n"
+      f"Watch for: {result['invalidation']}\n"
+      '🧪 Research only • no trade or official forecast change')
+
+def _quiet_alert(snapshot, result):
+    """Notify only for a material, actionable change; keep every AI assessment stored."""
+    ticker=snapshot['ticker']
+    side=result['side']
+    lean=str(snapshot.get('official') or '').upper()
+    risk=result['risk']
+    # A raw model lean is not necessarily a published official pick.
+    # Avoid presenting it as an official call.
+    if side not in ('UP', 'DOWN'):
+        return None
+    # A contradictory AI settlement opinion merits one alert, but not each minute.
+    if lean not in ('UP', 'DOWN') or side == lean:
+        return None
+    now=int(snapshot['observed_at'])
+    previous=_last_notified.get(ticker)
+    # One disagreement alert per contract and direction, unless a new side emerges.
+    if previous and previous[0] == side:
+        return None
+    _last_notified[ticker]=(side,now)
+    # Bound memory in a long-running worker.
+    if len(_last_notified)>150:
+        for old in list(_last_notified)[:50]:
+            _last_notified.pop(old,None)
+    why=str(result.get('reason') or '').replace('\n',' ').strip()[:135]
+    return (f"🧠 AI settlement watch: {side} | Risk: {risk}\n"
+            f"Model lean: {lean} (not a confirmed published call)\n"
+            f"{why}\nResearch only • official signal unchanged")
 
 def _research():
     # Use exactly one representative AI snapshot per ticker to avoid pseudo-replication.
@@ -201,7 +231,9 @@ def _worker():
             if job=='analyst':
                 result=_analyst(payload)
                 _store_analyst(payload,result)
-                if _get('live_enabled')=='1':_send(_message(payload,result))
+                if _get('live_enabled')=='1':
+                    alert=_quiet_alert(payload,result)
+                    if alert:_send(alert)
             elif job=='research':
                 result=_research()
                 if result.get('status')=='TESTED_NOT_APPROVED' and _get('research_notifications')=='1':
@@ -209,7 +241,7 @@ def _worker():
         except Exception as e:
             LOG.exception('AI %s failed: %s',job,type(e).__name__)
             if job=='analyst' and _get('live_enabled')=='1':
-                _send('⚠️ AI analyst unavailable; KeKe official predictions remain unchanged. Check Railway logs/API key.')
+                LOG.warning('AI analyst unavailable; official KeKe predictions unaffected')
         finally:_tasks.task_done()
 
 def start(db_path,send_fn):
@@ -248,7 +280,7 @@ def command(cmd):
     if cmd=='/aion':
         if not os.getenv('OPENAI_API_KEY'):
             return '⚠️ Add OPENAI_API_KEY in Railway first. AI is off; official KeKe unaffected.'
-        _set('live_enabled','1');return '🧠 AI live analyst ON • independent assessments about every 60 seconds when BRTI candles are available. Official calls unchanged.'
+        _set('live_enabled','1');return '🧠 AI quiet mode ON • analysis saved; Telegram only for material disagreement. Official calls unchanged.'
     if cmd=='/aioff':_set('live_enabled','0');return '🧠 AI live analyst OFF. Official KeKe unchanged.'
     if cmd=='/researchon':
         if not os.getenv('OPENAI_API_KEY'):return '⚠️ Add OPENAI_API_KEY in Railway first.'

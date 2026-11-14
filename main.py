@@ -750,11 +750,45 @@ def tg(method,**data):
     r.raise_for_status()
     return r.json()
 
-KEYBOARD={'keyboard':[[{'text':'👀 STATUS'},{'text':'📊 STATS'}],
-                      [{'text':'🕒 LAST'},{'text':'🧠 MARKET READ'}],
-                      [{'text':'💰 POSITION'}],
-                      [{'text':'🟢 START'},{'text':'🔴 STOP'}]],
+# V5.30: compact user-facing keyboard; legacy slash commands remain available.
+KEYBOARD={'keyboard':[[{'text':'📡 LIVE'},{'text':'📊 STATS'}],
+                      [{'text':'📍 POSITION'},{'text':'📜 HISTORY'}],
+                      [{'text':'😴 SLEEP'},{'text':'☀️ WAKE'}],
+                      [{'text':'⚙️ SETTINGS'},{'text':'❓ HELP'}]],
           'resize_keyboard':True,'is_persistent':True}
+
+def confidence_report():
+    """Explain experimental directional strength without claiming win probability."""
+    read=shadow_view.get('last')
+    if not read:
+        return ('🎯 KEKE CONFIDENCE • RESEARCH ONLY\n'
+                'Waiting for fresh, contiguous BRTI candles and a verified target.\n'
+                'No calibrated win probability available.')
+    score=abs(float(read['score']))
+    strength=('STRONG' if score>=1.25 else 'FAVORABLE' if score>=.75
+              else 'TENTATIVE' if score>=.45 else 'WAIT')
+    side=read['side']
+    return (f'🎯 KEKE CONFIDENCE • EXPERIMENTAL\n'
+            f'Settlement lean: {side} | Evidence: {strength}\n'
+            f'Regime: {read["regime"]} | Time left: {read["seconds"]//60}m {read["seconds"]%60:02d}s\n'
+            f'Distance/time component: {read["base"]:+.2f}\n'
+            f'Structure adjustment: {read["structure"]:+.2f}\n'
+            'This is NOT a win probability or a trade recommendation. '
+            'Official predictions remain unchanged; compare with verified settlements.')
+
+def menu_settings():
+    return ('⚙️ KEKE SETTINGS\n'
+            '😴 Sleep pauses Telegram alerts; ☀️ Wake resumes them. Research continues.\n'
+            'Advanced research: /shadow, /shadowon, /shadowoff, /audit, /research, /export\n'
+            'Check experimental confidence: /confidence')
+
+def menu_help():
+    return ('❓ KEKE HELP\n'
+            '📡 Live: fresh market read | 📊 Stats: verified results\n'
+            '📍 Position: current position | 📜 History: latest settlement pick\n'
+            '😴 Sleep / ☀️ Wake: pause or resume alerts\n'
+            '⚙️ Settings: advanced research controls\n'
+            'Confidence is an experimental evidence score, NOT a guaranteed outcome.')
 
 def send(message):
     if not TOKEN or not CHAT:
@@ -1057,13 +1091,19 @@ def telegram_commands():
             if str((msg.get('chat') or {}).get('id'))!=str(CHAT):continue
             cmd=str(msg.get('text') or '').strip().lower()
             cmd={'👀 status':'/status','🧠 market read':'/market','📊 stats':'/stats',
-                 '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop'}.get(cmd,cmd)
+                 '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop',
+                 '📡 live':'/market','📍 position':'/position','📜 history':'/last',
+                 '😴 sleep':'/stop','☀️ wake':'/start','⚙️ settings':'/settings',
+                 '❓ help':'/help'}.get(cmd,cmd)
             if cmd.startswith('/stop'):
                 state['enabled']=False;runtime_set('alerts_enabled',False);send('🔴 Alerts paused. Data collection continues. /start resumes alerts.')
             elif cmd.startswith('/start'):
                 state['enabled']=True;runtime_set('alerts_enabled',True);send('🟢 KeKe alerts ON.')
             elif cmd.startswith('/status'):
                 send(health_status())
+            elif cmd=='/confidence':send(confidence_report())
+            elif cmd=='/settings':send(menu_settings())
+            elif cmd=='/help':send(menu_help())
             elif cmd.startswith('/market'):
                 send(fresh_status())
             elif cmd.startswith('/stats'):send_stats()
@@ -1099,21 +1139,15 @@ def initialize_telegram():
             state['offset']=updates[-1]['update_id']+1
             runtime_set('telegram_offset',state['offset'])
         tg('setMyCommands',commands=json.dumps([
-            {'command':'start','description':'Resume KeKe alerts'},
-            {'command':'stop','description':'Pause alerts; keep recording'},
-            {'command':'status','description':'Bot health, BRTI freshness and database'},
-            {'command':'market','description':'Fresh BRTI settlement context'},
-            {'command':'stats','description':'BRTI-only prediction report card'},
-            {'command':'legacy','description':'Historical and lifetime research stats'},
-            {'command':'exchange','description':'Seven-exchange research feed health'},
-            {'command':'last','description':'Last settlement pick'},
-            {'command':'brti','description':'Test read-only Kalshi BRTI access'},
-            {'command':'export','description':'Download research CSV archive'},
-            {'command':'scorecard','description':'Rolling 24-hour early forecast scorecard'},
-            {'command':'shadow','description':'Current experimental V5.28 read'},
-            {'command':'shadowon','description':'Show V5.28 shadow every minute'},
-            {'command':'shadowoff','description':'Stop automatic shadow messages'},
-            {'command':'position','description':'Current Kalshi BTC position'}]))
+            {'command':'market','description':'Live BTC settlement read'},
+            {'command':'stats','description':'Verified prediction statistics'},
+            {'command':'position','description':'Current Kalshi position'},
+            {'command':'last','description':'Latest settlement pick'},
+            {'command':'stop','description':'Sleep: pause alerts'},
+            {'command':'start','description':'Wake: resume alerts'},
+            {'command':'settings','description':'Advanced research controls'},
+            {'command':'help','description':'KeKe menu help'},
+            {'command':'confidence','description':'Experimental confidence explanation'}]))
     except Exception:LOG.exception('Telegram setup error')
 
 # V5.6 uses BRTI distance relative to volatility and time to settlement.

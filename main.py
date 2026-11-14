@@ -36,7 +36,14 @@ ALERT_COOLDOWN=90
 BRTI_PATH='/trade-api/v2/cfbenchmarks/values'
 BRTI_MAX_AGE=30
 
-session=requests.Session()
+# One HTTP session per worker thread: requests.Session is not designed for shared mutation.
+_HTTP_LOCAL=threading.local()
+def get_session():
+    sess=getattr(_HTTP_LOCAL,'session',None)
+    if sess is None:
+        sess=requests.Session()
+        _HTTP_LOCAL.session=sess
+    return sess
 # Shared cooldown across the main observer and background chart collector.
 _RATE_LOCK=threading.Lock()
 _RATE_UNTIL=0.0
@@ -194,9 +201,12 @@ def record_event(ticker,event,detail=''):
 
 
 def http_json(url,params=None,timeout=6):
-    keke_rate_wait()
-    r=session.get(url,params=params,timeout=timeout)
-    keke_rate_result(r.status_code)
+    if url.startswith('https://api.telegram.org/'):
+        r=requests.get(url,params=params,timeout=timeout)
+    else:
+        keke_rate_wait()
+        r=get_session().get(url,params=params,timeout=timeout)
+        keke_rate_result(r.status_code)
     r.raise_for_status()
     obj=r.json()
     if isinstance(obj,dict) and obj.get('error'):
@@ -308,7 +318,7 @@ def brti_raw():
         signature=key.sign(signed,padding.PSS(mgf=padding.MGF1(hashes.SHA256()),salt_length=padding.PSS.DIGEST_LENGTH),hashes.SHA256())
     headers={'KALSHI-ACCESS-KEY':key_id,'KALSHI-ACCESS-TIMESTAMP':ts,
              'KALSHI-ACCESS-SIGNATURE':base64.b64encode(signature).decode()}
-    response=session.get('https://external-api.kalshi.com'+BRTI_PATH,params={'id':'BRTI'},headers=headers,timeout=8)
+    response=get_session().get('https://external-api.kalshi.com'+BRTI_PATH,params={'id':'BRTI'},headers=headers,timeout=8)
     response.raise_for_status()
     obj=response.json()
     if not isinstance(obj,dict) or obj.get('error'):
@@ -771,7 +781,7 @@ def grade_summary():
 
 def tg(method,**data):
     if not TOKEN: return None
-    r=session.post(f'https://api.telegram.org/bot{TOKEN}/{method}',data=data,timeout=7)
+    r=get_session().post(f'https://api.telegram.org/bot{TOKEN}/{method}',data=data,timeout=7)
     r.raise_for_status()
     return r.json()
 
@@ -834,7 +844,9 @@ def latency_init():
         for column,kind in (
             ('run_id','TEXT'),('run_started_utc','TEXT'),
             ('configured_poll_seconds','REAL'),('actual_start_interval_ms','REAL'),
-            ('sleep_requested_ms','REAL'),('loop_finished_utc','TEXT')):
+            ('sleep_requested_ms','REAL'),('loop_finished_utc','TEXT'),
+            ('grading_ms','REAL'),('ai_schedule_ms','REAL'),
+            ('other_loop_work_ms','REAL'),('telegram_poll_mode','TEXT')):
             if column not in existing:
                 c.execute(f'ALTER TABLE keke_speed_diagnostics ADD COLUMN {column} {kind}')
 
@@ -863,7 +875,8 @@ def speed_report_csv(snapshot):
            'Actual start interval measures the time between successive main-loop starts, including work and sleep.',
            'Older rows without a run ID are deliberately excluded from this summary.']
     for field in ('actual_start_interval_ms','sleep_requested_ms','brti_age_ms','brti_request_ms',
-                  'market_request_ms','processing_to_first_call_ms','first_alert_api_ms','loop_elapsed_ms'):
+                  'market_request_ms','grading_ms','ai_schedule_ms','other_loop_work_ms',
+                  'processing_to_first_call_ms','first_alert_api_ms','loop_elapsed_ms'):
         if field not in fields:continue
         i=fields.index(field)
         vals=sorted(float(r[i]) for r in rows if r[i] is not None)
@@ -1031,7 +1044,7 @@ def export_research():
             if output.getbuffer().nbytes>45*1024*1024:
                 send('⚠️ Export is over 45 MB. No data was changed; ask for a smaller export.')
                 return
-            response=session.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',
+            response=get_session().post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',
                 data={'chat_id':CHAT,'caption':'📦 KeKe research export • CSV files • read-only'},
                 files={'document':('keke_research_export.zip',output,'application/zip')},timeout=90)
             response.raise_for_status()
@@ -1108,7 +1121,7 @@ def kalshi_live_worker():
                 event=market.get('event_ticker') or market.get('ticker')
                 started_utc=kalshi_utc()
                 keke_rate_wait()
-                response=session.get(BASE+'/live_data/events/'+str(event),params={'range':'15min'},timeout=10)
+                response=get_session().get(BASE+'/live_data/events/'+str(event),params={'range':'15min'},timeout=10)
                 keke_rate_result(response.status_code)
                 finished_utc=kalshi_utc()
                 obj=response.json() if response.ok else {}
@@ -1225,7 +1238,7 @@ def export_kalshi_research():
             if output.getbuffer().nbytes>45*1024*1024:
                 send('⚠️ Kalshi export exceeds 45 MB; existing data was not changed.')
                 return
-            response=session.post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',
+            response=get_session().post(f'https://api.telegram.org/bot{TOKEN}/sendDocument',
                 data={'chat_id':CHAT,'caption':'🔬 KeKe Kalshi research • existing timestamped observations • ZIP of CSV files'},
                 files={'document':('keke_kalshi_research.zip',output,'application/zip')},timeout=90)
             response.raise_for_status()
@@ -1439,6 +1452,16 @@ def telegram_commands():
             elif cmd == '/kalshiexport':export_kalshi_research()
     except Exception:LOG.exception('Telegram command polling error')
 
+def telegram_command_worker():
+    """Handle slow Telegram requests independently of the time-sensitive price loop."""
+    while True:
+        try:
+            telegram_commands()
+        except Exception:
+            LOG.exception('Telegram background worker error')
+        time.sleep(2.0)
+
+
 def initialize_telegram():
     if not TOKEN:return
     try:
@@ -1648,7 +1671,7 @@ def authenticated_get(path,params=None):
         sig=key.sign(signed,padding.PSS(mgf=padding.MGF1(hashes.SHA256()),salt_length=padding.PSS.DIGEST_LENGTH),hashes.SHA256())
     headers={'KALSHI-ACCESS-KEY':key_id,'KALSHI-ACCESS-TIMESTAMP':timestamp,
              'KALSHI-ACCESS-SIGNATURE':base64.b64encode(sig).decode()}
-    r=session.get(BASE+path,params=params,headers=headers,timeout=10)
+    r=get_session().get(BASE+path,params=params,headers=headers,timeout=10)
     # Diagnostic includes only HTTP status and safe response structure, never secrets.
     if r.status_code >= 400:
         raise RuntimeError(f'Kalshi portfolio HTTP {r.status_code} on {path}')
@@ -2666,6 +2689,7 @@ def main():
     state['enabled']=runtime_get('alerts_enabled',True)
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
+    threading.Thread(target=telegram_command_worker,daemon=True,name='telegram-command-worker').start()
     LOG.info('KeKe V5.27 settlement-only BRTI read-only monitor starting; Stats database: %s',DB_PATH)
     run_brti_test()
     if state['enabled']:send('🎯 KeKe V5.27 BRTI settlement predictions online. '
@@ -2679,14 +2703,18 @@ def main():
         speed={'loop_started_utc':kalshi_utc(), 'run_id':_SPEED_RUN_ID,
                'run_started_utc':_SPEED_RUN_STARTED_UTC,
                'actual_start_interval_ms':actual_interval_ms,
-               'alert_count':0,'configured_poll_seconds':CHECK_EVERY}
+               'alert_count':0,'configured_poll_seconds':CHECK_EVERY,
+               'telegram_poll_mode':'background-thread'}
         try:
-            telegram_commands()
             if time.monotonic()-state['last_grade']>=GRADE_EVERY:
-                state['last_grade']=time.monotonic()
+                grade_t0=time.monotonic()
+                state['last_grade']=grade_t0
                 grade_settlements()
                 v527_daily_report()
+                speed['grading_ms']=(time.monotonic()-grade_t0)*1000
+            ai_t0=time.monotonic()
             ai_lab.schedule_research()
+            speed['ai_schedule_ms']=(time.monotonic()-ai_t0)*1000
             market_t0=time.monotonic()
             market=get_market()
             speed['market_request_ms']=(time.monotonic()-market_t0)*1000
@@ -2807,6 +2835,7 @@ def main():
         except Exception:LOG.exception('Monitor loop error; will retry')
         finally:
             speed['loop_elapsed_ms']=(time.monotonic()-started)*1000
+            speed['other_loop_work_ms']=max(0.0,speed['loop_elapsed_ms']-speed.get('market_request_ms',0)-speed.get('brti_request_ms',0)-speed.get('grading_ms',0)-speed.get('ai_schedule_ms',0))
             speed['sleep_requested_ms']=max(50.0,CHECK_EVERY*1000-speed['loop_elapsed_ms'])
             speed['loop_finished_utc']=kalshi_utc()
             speed.pop('brti_received_mono',None)

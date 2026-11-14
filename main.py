@@ -9,6 +9,7 @@ import requests
 import csv, io, zipfile
 import threading
 import gzip
+import uuid
 import keke_ai_lab as ai_lab
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -816,8 +817,11 @@ def menu_help():
 
 # Silent latency diagnostics. UTC clocks compare source age; monotonic clocks measure local durations.
 _LATENCY_CONTEXT = threading.local()
+_SPEED_RUN_ID = uuid.uuid4().hex[:12]
+_SPEED_RUN_STARTED_UTC = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
 
 def latency_init():
+    # Additive migration: keep historical measurements and preserve existing DB.
     with connect() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS keke_speed_diagnostics (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, loop_started_utc TEXT,
@@ -826,6 +830,13 @@ def latency_init():
             processing_to_first_call_ms REAL, first_alert_send_ms REAL,
             first_alert_api_ms REAL, loop_elapsed_ms REAL, alert_count INTEGER,
             note TEXT)""")
+        existing={r[1] for r in c.execute('PRAGMA table_info(keke_speed_diagnostics)')}
+        for column,kind in (
+            ('run_id','TEXT'),('run_started_utc','TEXT'),
+            ('configured_poll_seconds','REAL'),('actual_start_interval_ms','REAL'),
+            ('sleep_requested_ms','REAL'),('loop_finished_utc','TEXT')):
+            if column not in existing:
+                c.execute(f'ALTER TABLE keke_speed_diagnostics ADD COLUMN {column} {kind}')
 
 def latency_log(row):
     try:
@@ -839,12 +850,21 @@ def speed_report_csv(snapshot):
     import statistics
     if not snapshot.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='keke_speed_diagnostics'").fetchone():
         return 'KeKe speed report\nNo diagnostic samples yet.\n'
-    rows=snapshot.execute('SELECT * FROM keke_speed_diagnostics').fetchall()
     fields=[x[1] for x in snapshot.execute('PRAGMA table_info(keke_speed_diagnostics)')]
-    lines=['KeKe speed report','Samples: '+str(len(rows)),
+    total=snapshot.execute('SELECT COUNT(*) FROM keke_speed_diagnostics').fetchone()[0]
+    if 'run_id' not in fields:
+        return f'KeKe speed report\nHistorical samples: {total}\nNo run-tagged diagnostics yet.\n'
+    rows=snapshot.execute('SELECT * FROM keke_speed_diagnostics WHERE run_id=? ORDER BY id',(_SPEED_RUN_ID,)).fetchall()
+    lines=['KeKe speed report (current process only)',
+           'Run ID: '+_SPEED_RUN_ID, 'Run started UTC: '+_SPEED_RUN_STARTED_UTC,
+           f'Configured main poll target: {CHECK_EVERY:g} seconds',
+           f'Current-run samples: {len(rows)}; all historical samples: {total}',
            'Source age is not network latency. Telegram API completion is not phone delivery.',
-           'A 5-second polling cycle can miss interim price changes.']
-    for field in ('brti_age_ms','brti_request_ms','market_request_ms','processing_to_first_call_ms','first_alert_api_ms','loop_elapsed_ms'):
+           'Actual start interval measures the time between successive main-loop starts, including work and sleep.',
+           'Older rows without a run ID are deliberately excluded from this summary.']
+    for field in ('actual_start_interval_ms','sleep_requested_ms','brti_age_ms','brti_request_ms',
+                  'market_request_ms','processing_to_first_call_ms','first_alert_api_ms','loop_elapsed_ms'):
+        if field not in fields:continue
         i=fields.index(field)
         vals=sorted(float(r[i]) for r in rows if r[i] is not None)
         if vals:
@@ -2651,9 +2671,15 @@ def main():
     if state['enabled']:send('🎯 KeKe V5.27 BRTI settlement predictions online. '
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
+    previous_loop_started=None
     while True:
         started=time.monotonic()
-        speed={'loop_started_utc':kalshi_utc(),'alert_count':0,'configured_poll_seconds':CHECK_EVERY}
+        actual_interval_ms=(started-previous_loop_started)*1000 if previous_loop_started is not None else None
+        previous_loop_started=started
+        speed={'loop_started_utc':kalshi_utc(), 'run_id':_SPEED_RUN_ID,
+               'run_started_utc':_SPEED_RUN_STARTED_UTC,
+               'actual_start_interval_ms':actual_interval_ms,
+               'alert_count':0,'configured_poll_seconds':CHECK_EVERY}
         try:
             telegram_commands()
             if time.monotonic()-state['last_grade']>=GRADE_EVERY:
@@ -2781,6 +2807,8 @@ def main():
         except Exception:LOG.exception('Monitor loop error; will retry')
         finally:
             speed['loop_elapsed_ms']=(time.monotonic()-started)*1000
+            speed['sleep_requested_ms']=max(50.0,CHECK_EVERY*1000-speed['loop_elapsed_ms'])
+            speed['loop_finished_utc']=kalshi_utc()
             speed.pop('brti_received_mono',None)
             speed['note']='Observed polling iteration; no Telegram message means no alert latency sample'
             latency_log(speed)

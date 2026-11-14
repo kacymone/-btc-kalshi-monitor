@@ -51,7 +51,7 @@ def _call(system,data,max_tokens=380):
     payload={
         'model':MODEL,
         'instructions':system + ' Respond with a single valid JSON object only.',
-        'input':json.dumps(data,separators=(',',':'),allow_nan=False),
+        'input':[{'role':'user','content':[{'type':'input_text','text':json.dumps(data,separators=(',',':'),allow_nan=False)}]}],
         'text':{'format':{'type':'json_object'}},
         'max_output_tokens':max(600,max_tokens),
         'store':False
@@ -69,6 +69,13 @@ def _call(system,data,max_tokens=380):
                 str(err.get('type','unknown'))[:80],
                 str(err.get('code','unknown'))[:80],
                 str(err.get('param','none'))[:80])
+            message=str(err.get('message',''))
+            # Error text is needed to identify input validation failures.
+            # Redact the exact key and recognizable API-key tokens before logging.
+            import re
+            message=message.replace(key,'[REDACTED]')
+            message=re.sub(r'sk-[A-Za-z0-9_-]{8,}', '[REDACTED]', message)
+            LOG.error('OpenAI validation detail: %s',message[:500])
         except (ValueError,AttributeError,TypeError):
             LOG.error('OpenAI Responses HTTP %s (non-JSON response)',response.status_code)
     response.raise_for_status()

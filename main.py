@@ -3503,4 +3503,19 @@ def main():
                              datetime.fromtimestamp(received_ts, timezone.utc).isoformat(timespec='milliseconds'),
                              received_ts-float(source_ts))
                 else:
-                    LOG.info('%s settlement %s BRTI %s target %s 
+                    LOG.info('%s settlement %s BRTI %s target %s | brti_source_utc=UNKNOWN',
+                             a['ticker'], a.get('v56_side'), brti, a['target'])
+            else:LOG.info('No active BTC 15m contract')
+        except Exception:LOG.exception('Monitor loop error; will retry')
+        finally:
+            speed['loop_elapsed_ms']=(time.monotonic()-started)*1000
+            speed['other_loop_work_ms']=max(0.0,speed['loop_elapsed_ms']-speed.get('market_request_ms',0)-speed.get('brti_request_ms',0)-speed.get('grading_ms',0)-speed.get('ai_schedule_ms',0))
+            speed['sleep_requested_ms']=max(50.0,CHECK_EVERY*1000-speed['loop_elapsed_ms'])
+            speed['loop_finished_utc']=kalshi_utc()
+            speed.pop('brti_received_mono',None)
+            speed['note']='Observed polling iteration; no Telegram message means no alert latency sample'
+            latency_log(speed)
+            _LATENCY_CONTEXT.current=None
+        time.sleep(max(0.05,CHECK_EVERY-(time.monotonic()-started)))
+
+if __name__=='__main__':main()

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import requests
 import csv, io, zipfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import uuid
 AI_LAB_ENABLED = False
@@ -1519,47 +1520,39 @@ def quick_live_text(a):
     header=('🟢 UP' if side=='UP' else '🔴 DOWN' if side=='DOWN' else '👀 WAIT')
     opposing=(side=='UP' and pressure=='🔴 DOWN PRESSURE') or (side=='DOWN' and pressure=='🟢 UP PRESSURE')
     watch=bool(a.get('reversal_watch') or opposing)
-    status=('⚠️ AT RISK • opposing momentum' if opposing else
-            '⚠️ REVERSAL WATCH' if watch else 'No opposing pressure detected')
+    status=('⚠️ '+side+' WEAKENING' if opposing else
+            '⚠️ REVERSAL WATCH' if watch else '✅ HOLDING STRONG' if side in ('UP','DOWN') else '⏳ WAIT')
     target=a.get('target')
     fmt=lambda n: '${:+,.2f}'.format(n) if n is not None else '—'
-    lines=['🎯 SETTLEMENT PICK • '+f'{sec//60}:{sec%60:02d} left',
-           header+(' • UNDER REVIEW' if watch else ' • CURRENT FORECAST'),
-           'Status: '+status,
+    def relative(n):
+        if n is None or target is None:return '—'
+        try:return fmt(n-float(target))
+        except (TypeError,ValueError):return '—'
+    lines=[header+' • '+f'{sec//60}:{sec%60:02d}',
+           status,
            '',
-           '📈 LIVE MOMENTUM: '+pressure,
-           '⚠️ Prediction status: '+(side+' weakening' if opposing else 'Reversal under review' if watch else 'No opposing pressure detected'),
-           '',
-           '🎯 Target: '+money_text(target),
-           '📍 BRTI: '+(money_text(aligned_b) if aligned_b is not None else 'unavailable')+' ('+(fmt(aligned_b-float(target)) if aligned_b is not None and target is not None else '—')+')',
-           '📊 Kalshi: '+(money_text(kalshi) if kalshi is not None else 'unavailable')+' ('+(fmt(kalshi-float(target)) if kalshi is not None and target is not None else '—')+')',
-           '',
-           '↔️ GAP: '+(fmt(gap) if gap is not None else 'unavailable'),
-           '']
-    # Preserve the already-computed completed-candle support/resistance.
+           '🎯 '+money_text(target),
+           '📍 BRTI '+(money_text(aligned_b) if aligned_b is not None else '—')+' ('+relative(aligned_b)+')',
+           '📊 Kalshi '+(money_text(kalshi) if kalshi is not None else '—')+' ('+relative(kalshi)+')',
+           '↔️ Gap '+(fmt(gap) if gap is not None else '—')]
     import re as _levels_re
     raw_levels=a.get('brti_levels') or ''
     sr=dict((name.lower(), price) for name,price in _levels_re.findall(
         r'(?:BRTI )?(support|resistance)(?: \([^)]*\))?: \(?(\$[\d,]+(?:\.\d+)?)', raw_levels, _levels_re.I))
-    if sr.get('support'): lines.append('🟢 Support: '+sr['support'])
-    if sr.get('resistance'): lines.append('🔴 Resistance: '+sr['resistance'])
-    if not sr: lines.append('🟡 S/R collecting')
-    lines.append('')
+    if sr.get('support'):lines.append('🟢 Support '+sr['support'])
+    if sr.get('resistance'):lines.append('🔴 Resistance '+sr['resistance'])
+    momentum=('UP' if pressure=='🟢 UP PRESSURE' else
+              'DOWN' if pressure=='🔴 DOWN PRESSURE' else
+              'KALSHI CATCHING UP' if pressure=='↔️ KALSHI CATCHING UP' else
+              'MIXED' if pressure=='🟡 MIXED MOMENTUM' else 'UNKNOWN')
+    lines.append('📈 Momentum: '+momentum)
     if gap is not None and 'stale' not in dashboard.lower():
         for period in ('5s','15s','30s'):
             b=change(period,'BRTI');k=change(period,'Kalshi')
             if b is not None and k is not None:
-                lines.append(f'{period} B {b:+.2f} | K {k:+.2f}')
-        lines.append('')
-        lev=a.get('live_level_evidence') or {}
-        if lev.get('direction'):
-            lines.append(('🟢 ' if lev['direction']=='UP' else '🔴 ')+lev['label'])
-        if opposing:
-            lines.append('⚠️ REVERSAL WATCH • settlement pick not yet changed')
+                lines.append(f'{period}: B {b:+.2f} | K {k:+.2f}')
     else:
-        lines.append('⚠️ KALSHI DATA UNAVAILABLE')
-    if a.get('reversal_watch') and not opposing:
-        lines.append('⚠️ REVERSAL WATCH • settlement pick not yet changed')
+        lines.append('⚠️ Kalshi data unavailable')
     return '\n'.join(lines)
 
 def fresh_status():
@@ -1598,65 +1591,91 @@ def fresh_status():
         LOG.warning('Fresh STATUS failed: %s',type(exc).__name__)
         return '⚠️ Could not retrieve a fresh market reading. Please retry; no stale price is being presented as live.'
 
-def telegram_commands():
-    if not TOKEN or not CHAT:return
+def handle_telegram_command(cmd):
     try:
-        params={'timeout':0,'limit':30}
-        if state['offset'] is not None:params['offset']=state['offset']
-        obj=http_json(f'https://api.telegram.org/bot{TOKEN}/getUpdates',params)
-        for upd in obj.get('result',[]):
-            state['offset']=upd['update_id']+1
-            runtime_set('telegram_offset',state['offset'])
-            msg=upd.get('message') or {}
-            if str((msg.get('chat') or {}).get('id'))!=str(CHAT):continue
-            cmd=str(msg.get('text') or '').strip().lower()
-            cmd={'👀 status':'/status','🧠 market read':'/market','📊 stats':'/stats',
-                 '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop',
-                 '📡 live':'/market','📍 position':'/position','📜 history':'/last',
-                 '😴 sleep':'/stop','☀️ wake':'/start','⚙️ settings':'/settings',
-                 '❓ help':'/help'}.get(cmd,cmd)
-            if cmd.startswith('/stop'):
-                state['enabled']=False;runtime_set('alerts_enabled',False);send('🔴 Alerts paused. Data collection continues. /start resumes alerts.')
-            elif cmd.startswith('/start'):
-                state['enabled']=True;runtime_set('alerts_enabled',True);send('🟢 KeKe alerts ON.')
-            elif cmd.startswith('/status'):
-                send(health_status())
-            elif cmd=='/confidence':send(confidence_report())
-            elif cmd=='/settings':send(menu_settings())
-            elif cmd=='/help':send(menu_help())
-            elif cmd.startswith('/market') or cmd.startswith('/live'):
-                send(fresh_status())
-            elif cmd.startswith('/stats'):send_stats()
-            elif cmd.startswith('/exchange'):send(exchange_report())
-            elif cmd.startswith('/lead'):send(exchange_research_report())
-            elif cmd.startswith('/audit'):send(audit_report())
-            elif cmd.startswith('/research'):send(research_stats_report())
-            elif cmd.startswith('/scorecard'):send(v527_scorecard())
-            elif cmd=='/shadowon':
-                shadow_view['enabled']=True
-                send('🧪 V5.28 shadow updates ON • once per minute. Official calls unchanged. /shadowoff stops updates.')
-                send(v528_shadow_message(shadow_view['last'],(state.get('last_read') or {}).get('v56_side')))
-            elif cmd=='/shadowoff':
-                shadow_view['enabled']=False
-                send('🧪 Shadow updates OFF. /shadow still gives the latest reading.')
-            elif cmd=='/shadow':send(v528_shadow_message(shadow_view['last'],(state.get('last_read') or {}).get('v56_side')))
-            elif cmd.startswith('/preview'):send(preview_report())
-            elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
-            elif cmd.startswith('/position'):send(portfolio_status())
-            elif cmd.startswith('/last'):send_last()
-            elif cmd.startswith('/brti'):run_brti_test()
-            elif cmd == '/export':export_research()
-            elif cmd == '/kalshiexport':export_kalshi_research()
-    except Exception:LOG.exception('Telegram command polling error')
+        cmd={'👀 status':'/status','🧠 market read':'/market','📊 stats':'/stats',
+             '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop',
+             '📡 live':'/market','📍 position':'/position','📜 history':'/last',
+             '😴 sleep':'/stop','☀️ wake':'/start','⚙️ settings':'/settings',
+             '❓ help':'/help'}.get(cmd,cmd)
+        if cmd.startswith('/stop'):
+            state['enabled']=False;runtime_set('alerts_enabled',False);send('🔴 Alerts paused. Data collection continues. /start resumes alerts.')
+        elif cmd.startswith('/start'):
+            state['enabled']=True;runtime_set('alerts_enabled',True);send('🟢 KeKe alerts ON.')
+        elif cmd.startswith('/status'):
+            send(health_status())
+        elif cmd=='/confidence':send(confidence_report())
+        elif cmd=='/settings':send(menu_settings())
+        elif cmd=='/help':send(menu_help())
+        elif cmd.startswith('/market') or cmd.startswith('/live'):
+            send(responsive_live_status())
+        elif cmd.startswith('/stats'):send_stats()
+        elif cmd.startswith('/exchange'):send(exchange_report())
+        elif cmd.startswith('/lead'):send(exchange_research_report())
+        elif cmd.startswith('/audit'):send(audit_report())
+        elif cmd.startswith('/research'):send(research_stats_report())
+        elif cmd.startswith('/scorecard'):send(v527_scorecard())
+        elif cmd=='/shadowon':
+            shadow_view['enabled']=True
+            send('🧪 V5.28 shadow updates ON • once per minute. Official calls unchanged. /shadowoff stops updates.')
+            send(v528_shadow_message(shadow_view['last'],(state.get('last_read') or {}).get('v56_side')))
+        elif cmd=='/shadowoff':
+            shadow_view['enabled']=False
+            send('🧪 Shadow updates OFF. /shadow still gives the latest reading.')
+        elif cmd=='/shadow':send(v528_shadow_message(shadow_view['last'],(state.get('last_read') or {}).get('v56_side')))
+        elif cmd.startswith('/preview'):send(preview_report())
+        elif cmd.startswith('/legacy'):send('📚 HISTORICAL + LIFETIME REPORT\n'+grade_summary())
+        elif cmd.startswith('/position'):send(portfolio_status())
+        elif cmd.startswith('/last'):send_last()
+        elif cmd.startswith('/brti'):run_brti_test()
+        elif cmd == '/export':export_research()
+        elif cmd == '/kalshiexport':export_kalshi_research()
+    except Exception:
+        LOG.exception('Telegram command handler error for %s',cmd)
+        send('⚠️ Command failed. Try again; monitoring continues.')
+
+_LIVE_REQUEST_LOCK=threading.Lock()
+_LIVE_REQUEST_AT=0.0
+_COMMAND_POOL=ThreadPoolExecutor(max_workers=4,thread_name_prefix='keke-telegram-command')
+
+def responsive_live_status():
+    """Immediate cached answer: never wait for multiple external data calls on a manual LIVE tap."""
+    a=state.get('last_read')
+    if not a:
+        return '📡 LIVE • Market reading warming up. No verified recent assessment yet.'
+    stamp=state.get('current_brti_stamp')
+    age=time.time()-float(stamp) if stamp else None
+    freshness=('BRTI source age: %.1fs'%age) if age is not None else 'BRTI source age: unknown'
+    if age is None or age>8:
+        return '⚠️ LIVE DATA STALE • '+freshness+'\nLast forecast is NOT a fresh trading signal.\n'+quick_live_text(a)
+    return '📡 LIVE • '+freshness+'\n'+quick_live_text(a)
+
+def telegram_commands():
+    global _LIVE_REQUEST_AT
+    if not TOKEN or not CHAT:return
+    params={'timeout':0,'limit':100}
+    if state['offset'] is not None:params['offset']=state['offset']
+    obj=http_json(f'https://api.telegram.org/bot{TOKEN}/getUpdates',params,timeout=4)
+    for upd in obj.get('result',[]):
+        state['offset']=upd['update_id']+1
+        runtime_set('telegram_offset',state['offset'])
+        msg=upd.get('message') or {}
+        if str((msg.get('chat') or {}).get('id'))!=str(CHAT):continue
+        cmd=str(msg.get('text') or '').strip().lower()
+        if cmd in ('📡 live','/live','/market'):
+            # A burst of button taps should get one timely answer, not queue old responses.
+            with _LIVE_REQUEST_LOCK:
+                now=time.monotonic()
+                if now-_LIVE_REQUEST_AT<1.5:continue
+                _LIVE_REQUEST_AT=now
+        _COMMAND_POOL.submit(handle_telegram_command,cmd)
 
 def telegram_command_worker():
-    """Handle slow Telegram requests independently of the time-sensitive price loop."""
+    """Telegram intake stays responsive while individual commands do network/database work."""
     while True:
-        try:
-            telegram_commands()
-        except Exception:
-            LOG.exception('Telegram background worker error')
-        time.sleep(2.0)
+        try:telegram_commands()
+        except Exception:LOG.exception('Telegram intake failed; retrying')
+        time.sleep(0.5)
 
 
 def initialize_telegram():
@@ -2059,7 +2078,7 @@ def v528_shadow_tick(a,candles):
 
 # V5.7 observational multi-timeframe and portfolio extension. GET requests only.
 PORTFOLIO_POLL_SECONDS=2
-POSITION_GAP_UPDATE_SECONDS=2
+POSITION_GAP_UPDATE_SECONDS=3
 POSITION_ALERT_COOLDOWN=45
 # V5.47: observational risk controls; never place orders.
 RISK_WARN_LOSS_PCT=0.12

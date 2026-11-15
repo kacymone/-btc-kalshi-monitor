@@ -1517,9 +1517,18 @@ def quick_live_text(a):
     sec=max(0,int(a.get('seconds') or 0))
     side=a.get('v56_side') or 'WAIT'
     header=('🟢 UP' if side=='UP' else '🔴 DOWN' if side=='DOWN' else '👀 WAIT')
+    opposing=(side=='UP' and pressure=='🔴 DOWN PRESSURE') or (side=='DOWN' and pressure=='🟢 UP PRESSURE')
+    watch=bool(a.get('reversal_watch') or opposing)
+    status=('⚠️ AT RISK • opposing momentum' if opposing else
+            '⚠️ REVERSAL WATCH' if watch else 'No opposing pressure detected')
     target=a.get('target')
     fmt=lambda n: '${:+,.2f}'.format(n) if n is not None else '—'
-    lines=[f'{header} • {sec//60}:{sec%60:02d}',
+    lines=['🎯 SETTLEMENT PICK • '+f'{sec//60}:{sec%60:02d} left',
+           header+(' • UNDER REVIEW' if watch else ' • CURRENT FORECAST'),
+           'Status: '+status,
+           '',
+           '📈 LIVE MOMENTUM: '+pressure,
+           '⚠️ Prediction status: '+(side+' weakening' if opposing else 'Reversal under review' if watch else 'No opposing pressure detected'),
            '',
            '🎯 Target: '+money_text(target),
            '📍 BRTI: '+(money_text(aligned_b) if aligned_b is not None else 'unavailable')+' ('+(fmt(aligned_b-float(target)) if aligned_b is not None and target is not None else '—')+')',
@@ -1542,16 +1551,15 @@ def quick_live_text(a):
             if b is not None and k is not None:
                 lines.append(f'{period} B {b:+.2f} | K {k:+.2f}')
         lines.append('')
-        lines.append(pressure)
         lev=a.get('live_level_evidence') or {}
         if lev.get('direction'):
             lines.append(('🟢 ' if lev['direction']=='UP' else '🔴 ')+lev['label'])
-        if (side=='UP' and pressure=='🔴 DOWN PRESSURE') or (side=='DOWN' and pressure=='🟢 UP PRESSURE'):
-            lines.append('⚠️ REVERSAL WATCH')
+        if opposing:
+            lines.append('⚠️ REVERSAL WATCH • settlement pick not yet changed')
     else:
         lines.append('⚠️ KALSHI DATA UNAVAILABLE')
-    if a.get('reversal_watch') and '⚠️ REVERSAL WATCH' not in lines:
-        lines.append('⚠️ REVERSAL WATCH')
+    if a.get('reversal_watch') and not opposing:
+        lines.append('⚠️ REVERSAL WATCH • settlement pick not yet changed')
     return '\n'.join(lines)
 
 def fresh_status():
@@ -3495,19 +3503,4 @@ def main():
                              datetime.fromtimestamp(received_ts, timezone.utc).isoformat(timespec='milliseconds'),
                              received_ts-float(source_ts))
                 else:
-                    LOG.info('%s settlement %s BRTI %s target %s | brti_source_utc=UNKNOWN',
-                             a['ticker'], a.get('v56_side'), brti, a['target'])
-            else:LOG.info('No active BTC 15m contract')
-        except Exception:LOG.exception('Monitor loop error; will retry')
-        finally:
-            speed['loop_elapsed_ms']=(time.monotonic()-started)*1000
-            speed['other_loop_work_ms']=max(0.0,speed['loop_elapsed_ms']-speed.get('market_request_ms',0)-speed.get('brti_request_ms',0)-speed.get('grading_ms',0)-speed.get('ai_schedule_ms',0))
-            speed['sleep_requested_ms']=max(50.0,CHECK_EVERY*1000-speed['loop_elapsed_ms'])
-            speed['loop_finished_utc']=kalshi_utc()
-            speed.pop('brti_received_mono',None)
-            speed['note']='Observed polling iteration; no Telegram message means no alert latency sample'
-            latency_log(speed)
-            _LATENCY_CONTEXT.current=None
-        time.sleep(max(0.05,CHECK_EVERY-(time.monotonic()-started)))
-
-if __name__=='__main__':main()
+                    LOG.info('%s settlement %s BRTI %s target %s 

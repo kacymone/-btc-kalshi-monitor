@@ -979,14 +979,105 @@ def settlement_live_text(a):
         return '🧮 Settlement math: '+str(avg.get('reason','collecting readings'))
     rolling=avg.get('rolling')
     lines=['🧮 LIVE SETTLEMENT MATH',
-           '60s BRTI rolling mean: '+(money_text(rolling) if rolling is not None else 'collecting'),
-           'Projected final average: '+money_text(avg['projected']),
-           'Projected vs target: ${:+,.2f}'.format(avg['distance']),
-           'Observed final-minute readings: {}/60'.format(avg['fixed_count'])]
-    if avg['final_minute'] and avg['remaining']>0:
-        lines.append('Remaining {}s must average {} for UP'.format(avg['remaining'],money_text(avg['required_remaining_mean'])))
-    lines.append('Forecast uses live 15s/30s trend for unknown readings; not a guaranteed outcome')
+           '60s BRTI rolling mean: '+(money_text(rolling) if rolling is not None else 'collecting')]
+    if not avg['final_minute']:
+        lines.append('Final-minute readings: 0/60')
+        lines.append('Final settlement average: not yet predictable from locked readings')
+        lines.append('Current BRTI vs target: ${:+,.2f}'.format(float(a['distance'])))
+        lines.append('No long-range price extrapolation')
+    else:
+        lines.append('Observed final-minute readings: {}/60'.format(avg['fixed_count']))
+        lines.append('If remaining BRTI holds: '+money_text(avg['projected']))
+        lines.append('Scenario vs target: ${:+,.2f}'.format(avg['distance']))
+        if avg['remaining']>0:
+            lines.append('Remaining {}s must average {} for UP'.format(avg['remaining'],money_text(avg['required_remaining_mean'])))
+        lines.append('Scenario only; future seconds update live')
     return '\n'.join(lines)
+
+def live_gap_dashboard(a):
+    """Read-only, timestamp-aligned BRTI versus Kalshi chart comparison for /live.
+
+    The Kalshi API chart is a chart series, not an executable contract quote.
+    Missing or stale chart data is explicitly marked unavailable.
+    """
+    ticker=a.get('ticker')
+    if not ticker:
+        return '📊 LIVE GAP TRACKER\n⚪ Market unavailable'
+    now=time.time()
+    try:
+        with connect() as c:
+            charts=c.execute("""SELECT latest_point_price,latest_point_timestamp,received_utc
+                FROM keke_kalshi_live_observations
+                WHERE market_ticker=? AND latest_point_price IS NOT NULL
+                ORDER BY id DESC LIMIT 160""",(ticker,)).fetchall()
+            ticks=c.execute("""SELECT timestamp,price FROM keke_brti_ticks
+                WHERE timestamp>=? ORDER BY timestamp""",(int(now)-150,)).fetchall()
+        def ts(value):
+            return datetime.fromisoformat(str(value).replace('Z','+00:00')).timestamp()
+        raw=[]
+        for r in charts:
+            try:
+                t=ts(r['latest_point_timestamp']);received=ts(r['received_utc'])
+                if t<=received<=t+15 and t<=now+2 and now-received<=135:
+                    raw.append((t,float(r['latest_point_price'])))
+            except (TypeError,ValueError,OverflowError):
+                continue
+        chart_by_time={round(t,2):(t,v) for t,v in raw}
+        chart=sorted(chart_by_time.values())
+        brti=sorted((float(r['timestamp']),float(r['price'])) for r in ticks)
+        if not chart or not brti:
+            return '📊 LIVE GAP TRACKER\n⚪ Collecting timestamped BRTI/Kalshi readings'
+        # Chart observations are sampled every ~5s. Pair to BRTI at the
+        # chart timestamp, not the time the API response happened to arrive.
+        def closest(t):
+            candidates=[(abs(bt-t),bp) for bt,bp in brti if abs(bt-t)<=3]
+            return min(candidates)[1] if candidates else None
+        paired=[]
+        for t,k in chart:
+            b=closest(t)
+            if b is not None:paired.append((t,b,k,b-k))
+        if not paired:
+            return '📊 LIVE GAP TRACKER\n⚪ Waiting for timestamp-aligned chart/BRTI data'
+        latest=paired[-1]
+        age=now-latest[0]
+        if age>15:
+            return '📊 LIVE GAP TRACKER\n⚠️ Kalshi chart stale ({:.0f}s old); gap not shown as live'.format(age)
+        target=a.get('target')
+        def signed(v):return '${:+,.2f}'.format(v)
+        def past(seconds):
+            desired=latest[0]-seconds
+            options=[x for x in paired[:-1] if abs(x[0]-desired)<=5]
+            return min(options,key=lambda x:abs(x[0]-desired)) if options else None
+        lines=['📊 LIVE BRTI / KALSHI GAP',
+               'BRTI (aligned): '+money_text(latest[1]),
+               'Kalshi chart: '+money_text(latest[2]),
+               'BRTI − Kalshi: '+signed(latest[3])]
+        if target is not None:
+            lines.append('BRTI vs target: '+signed(latest[1]-float(target)))
+            lines.append('Kalshi vs target: '+signed(latest[2]-float(target)))
+        lines.append('📈 CHANGES (now vs earlier)')
+        for seconds in (5,15,30,60):
+            old=past(seconds)
+            if old is None:
+                lines.append('{}s: collecting'.format(seconds))
+                continue
+            bd=latest[1]-old[1];kd=latest[2]-old[2];gd=latest[3]-old[3]
+            lines.append('{}s: BRTI {} | Kalshi {} | gap {}'.format(seconds,signed(bd),signed(kd),signed(gd)))
+        old=past(15) or past(30)
+        if old:
+            gd=latest[3]-old[3]
+            if abs(latest[3])<abs(old[3])-1:
+                cause='BRTI pulling back' if (latest[1]-old[1])*old[3]<0 else 'average catching up / mixed movement'
+                lines.append('↘ Gap narrowing • '+cause)
+            elif abs(latest[3])>abs(old[3])+1:
+                lines.append('↗ Gap widening')
+            else:
+                lines.append('↔ Gap relatively steady')
+        lines.append('Chart age: {:.0f}s • chart price is not contract P/L'.format(max(0,age)))
+        return '\n'.join(lines)
+    except (sqlite3.Error,ValueError,TypeError,OverflowError) as exc:
+        LOG.debug('Gap dashboard unavailable: %s',type(exc).__name__)
+        return '📊 LIVE GAP TRACKER\n⚪ Data temporarily unavailable'
 
 def safe_shape(value, depth=0):
     """Show only JSON key names and types; never values or array contents."""
@@ -1401,7 +1492,7 @@ def fresh_status():
                 a['brti_levels']=levels
                 a['v56_side']=load_v56(a['ticker'])['side']
                 settlement_signal(a)
-                return format_read(a)+'\n\n'+settlement_live_text(a)+'\n\n📊 Opening BRTI read; longer candles collecting'
+                return format_read(a)+'\n\n'+live_gap_dashboard(a)+'\n\n'+settlement_live_text(a)+'\n\n📊 Opening BRTI read; longer candles collecting'
             return (f'📡 BRTI ${brti:,.2f} • Target {money_text(target_of(market))}\n'
                     +levels+'\n⚪ Collecting verified BRTI candles; no trade signal')
         a=assessment(market,brti,candles,brti)
@@ -1416,7 +1507,7 @@ def fresh_status():
         a['v56_signal']=sig
         a['v56_candidate']='UP' if sig is not None and sig>0 else ('DOWN' if sig is not None and sig<0 else None)
         state['last_read']=a
-        return format_read(a)+'\n\n'+settlement_live_text(a)+'\n\n🎯 Settlement-only monitoring • scalp signals paused'
+        return format_read(a)+'\n\n'+live_gap_dashboard(a)+'\n\n'+settlement_live_text(a)+'\n\n🎯 Settlement-only monitoring • scalp signals paused'
     except Exception as exc:
         LOG.warning('Fresh STATUS failed: %s',type(exc).__name__)
         return '⚠️ Could not retrieve a fresh market reading. Please retry; no stale price is being presented as live.'
@@ -1600,7 +1691,7 @@ def movement_confirmation(a):
         return neutral
 
 def settlement_average_evidence(a):
-    """Use observed BRTI seconds and a live, bounded trend forecast for unknown seconds.
+    """Use actual BRTI seconds; avoid extrapolating short-term trends to settlement.
 
     Never interpolate missing observed seconds or claim future observations are known.
     The market close timestamp anchors the final 60-second window.
@@ -1633,36 +1724,26 @@ def settlement_average_evidence(a):
         fixed_count=len(fixed)
         remaining=60-fixed_count
         current=by_second[last]
-        # Derive a per-second drift from observed 15s/30s movement, with a
-        # volatility-based cap. This is a forecast, not a future observation.
-        slopes=[]
-        for span in (15,30):
-            earlier=by_second.get(last-span)
-            if earlier is not None:slopes.append((current-earlier)/span)
-        slope=(0.65*slopes[0]+0.35*slopes[1]) if len(slopes)==2 else (slopes[0] if slopes else 0.0)
-        recent=[by_second[t] for t in range(max(last-59,min(by_second)),last+1) if t in by_second]
-        variation=(max(recent)-min(recent)) if len(recent)>=2 else 12.0
-        slope_cap=max(0.15,min(5.0,variation/30.0))
-        slope=max(-slope_cap,min(slope_cap,slope))
-        # Predict only future samples within the final-minute settlement window.
-        # Prior to that window, the projection remains a scenario, not a lock.
-        future=[]
-        for t in range(max(last+1,final_start),close):
-            future.append(current+slope*(t-last))
-        # Before the settlement minute starts, there are no fixed observations.
-        # Estimate its 60 future values at their actual future timestamps.
-        if last<final_start:
-            future=[current+slope*(t-last) for t in range(final_start,close)]
-        projected=(fixed_sum+sum(future))/60.0 if len(future)+fixed_count==60 else None
-        if projected is None:return {'ready':False,'reason':'settlement window incomplete','rolling':rolling}
+        # Do not extrapolate a short-lived 15s/30s slope across the entire
+        # contract. Before the final minute there are ZERO locked settlement
+        # observations, so an exact future settlement price is unknowable.
+        if last < final_start:
+            return {'ready':True,'rolling':rolling,'projected':None,
+                    'distance':None,'fixed_count':0,'remaining':60,
+                    'required_remaining_mean':None,'scenario':'not forecast before final minute',
+                    'last':current,'final_minute':False}
+        # Within the final minute, use actual observed settlement seconds.
+        # A flat remaining-price *scenario* is shown for transparency only;
+        # it is not an asserted forecast of future readings.
+        projected=(fixed_sum+remaining*current)/60.0
         required=(60*float(a['target'])-fixed_sum)/remaining if remaining else None
         return {'ready':True,'rolling':rolling,'projected':projected,
                 'distance':projected-float(a['target']),
                 'fixed_count':fixed_count,'remaining':remaining,
                 'required_remaining_mean':required,
-                'scenario':'observed BRTI + bounded live 15s/30s trend',
-                'slope_per_second':slope,'last':current,
-                'final_minute':last>=final_start}
+                'scenario':'remaining readings at current BRTI (scenario only)',
+                'last':current,'final_minute':True}
+
     except (sqlite3.Error,ValueError,TypeError,OverflowError,KeyError) as exc:
         LOG.debug('Settlement average unavailable: %s',type(exc).__name__)
         return neutral
@@ -1687,18 +1768,16 @@ def settlement_signal(a):
     avg=settlement_average_evidence(a)
     a['settlement_average']=avg
     if avg.get('ready') and a['seconds']<=60:
-        # Use projected final 60s mean, not raw spot, for the directional score.
+        # Final-minute observed sum plus current-price scenario for unknown seconds.
         # Remaining seconds are a flat-price scenario; never claim certainty.
         projected_distance=avg['distance']
         remaining=max(1,avg['remaining'])
         uncertainty=max(6.0,range1*math.sqrt(remaining/60))
         return projected_distance/uncertainty + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
-    # Before the final minute, use live trend-projected settlement distance as
-    # additional evidence, bounded so distant extrapolations cannot dominate.
-    projected_component=0.0
-    if avg.get('ready') and avg.get('final_minute') is False:
-        projected_component=max(-0.30,min(0.30,(avg['distance']-a['distance'])/max(40.0,scale*3)))
-    return a['distance']/scale + drift + projected_component + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
+    # Before the final minute, preserve the original target-distance,
+    # momentum and movement engine; do not let speculative price
+    # extrapolation influence UP/DOWN calls.
+    return a['distance']/scale + drift + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
 
 # Silent experimental model: NEVER changes the live V5.6 predictions or alerts.
 SHADOW_CHECKPOINTS=(720,540,360)  # 12, 9, and 6 minutes left
@@ -1821,9 +1900,10 @@ def v528_shadow_tick(a,candles):
         send(v528_shadow_message(r,a.get('v56_side')))
 
 # V5.7 observational multi-timeframe and portfolio extension. GET requests only.
-PORTFOLIO_POLL_SECONDS=20
+PORTFOLIO_POLL_SECONDS=8
+POSITION_GAP_UPDATE_SECONDS=25
 POSITION_ALERT_COOLDOWN=180
-portfolio_state={'last_poll':0,'positions':{},'alert_at':{},'error_at':0}
+portfolio_state={'last_poll':0,'positions':{},'alert_at':{},'error_at':0,'gap_sent_at':{}}
 
 def authenticated_get(path,params=None):
     key_id=os.getenv('KALSHI_API_KEY_ID','').strip()
@@ -2273,11 +2353,20 @@ def portfolio_poll(m,a,read):
         else:
             send(f'💰 {event} • {ticker}\n{position["qty"]:g} {position["side"]} '
                  f'• bid {ask_text(position["bid"])}\nGross P/L {tiny_money(position["gross"])} '
-                 '(estimated; fees/fills unverified).')
+                 '(estimated; fees/fills unverified).\n\n'+live_gap_dashboard(a))
+            portfolio_state['gap_sent_at'][ticker]=now
     if not position:
         portfolio_state['positions'].pop(ticker,None)
+        portfolio_state['gap_sent_at'].pop(ticker,None)
         return
     portfolio_state['positions'][ticker]=position
+    # Keep the trader informed without requiring repeated /live taps.
+    # Numbers are observations, not automatic sell/hold instructions.
+    if state['enabled'] and now-portfolio_state['gap_sent_at'].get(ticker,0)>=POSITION_GAP_UPDATE_SECONDS:
+        send('📍 POSITION LIVE • {} {}\nSell bid {} • Est. gross P/L {}\n\n{}'.format(
+            position['qty'],position['side'],ask_text(position['bid']),
+            tiny_money(position['gross']),live_gap_dashboard(a)))
+        portfolio_state['gap_sent_at'][ticker]=now
     # Compare the position to the SETTLEMENT prediction, not the disabled scalp model.
     prediction=state.get('v56') or {}
     predicted=prediction.get('side') if state.get('v56_ticker')==ticker else None

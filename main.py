@@ -1,4 +1,4 @@
-"""KeKe V5.27 BRTI-only settlement forecast alerts — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.29 dual-feed shadow settlement evidence — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -1522,72 +1522,63 @@ def fast_opening_assessment(m, brti):
             'favored':'UP' if distance>0 else 'DOWN' if distance<0 else None}
 
 
-# Combined BRTI/Kalshi movement read: uses only historical, timestamped observations.
-# This is a small, conservative heuristic modifier, NOT a calibrated probability.
+# V5.29 dual-feed settlement evidence. This is a bounded heuristic, not a proven edge.
+# Only timestamped, past observations from the current market are eligible.
 KEKE_MOVEMENT_WEIGHT = max(0.0, min(0.20, float(os.getenv('KEKE_MOVEMENT_WEIGHT', '0.15'))))
+KEKE_MOVEMENT_LIVE = os.getenv('KEKE_MOVEMENT_LIVE', '0') == '1'
 
 def movement_confirmation(a):
-    '''Return (adjustment, diagnostic) using the current contract's fresh live chart.
+    """(signed score adjustment, status) for a *settlement* call, not chart chasing.
 
-    Rejects stale samples, cross-contract leakage, and mismatched chart timestamps.
-    The chart API is not assumed identical to the app's BTC Now display.
-    '''
-    neutral = (0.0, 'unconfirmed')
-    ticker = a.get('ticker')
-    if not ticker or a.get('distance') is None:
-        return neutral
-    now = time.time()
+    Historical Kalshi API chart points are NOT asserted identical to the app BTC Now.
+    BRTI and chart slopes must be observed over comparable past 15-40s windows.
+    Return neutral if freshness, timing or coverage cannot be established.
+    """
+    neutral=(0.0,'insufficient paired data')
+    ticker=a.get('ticker')
+    if not ticker or a.get('distance') is None:return neutral
+    now=time.time()
     try:
         with connect() as c:
-            chart = c.execute('''SELECT latest_point_price, latest_point_timestamp,
-                        received_utc FROM keke_kalshi_live_observations
-                        WHERE market_ticker=? AND latest_point_price IS NOT NULL
-                        ORDER BY id DESC LIMIT 24''', (ticker,)).fetchall()
-            ticks = c.execute('''SELECT timestamp,price FROM keke_brti_ticks
-                        WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp DESC LIMIT 45''',
-                        (int(now)-50, int(now))).fetchall()
-        def parse_utc(value):
-            return datetime.fromisoformat(str(value).replace('Z','+00:00')).timestamp()
-        usable=[]
-        for row in chart:
+            chart=c.execute("""SELECT latest_point_price,latest_point_timestamp,received_utc
+                FROM keke_kalshi_live_observations
+                WHERE market_ticker=? AND latest_point_price IS NOT NULL
+                ORDER BY id DESC LIMIT 80""",(ticker,)).fetchall()
+            ticks=c.execute("""SELECT timestamp,price FROM keke_brti_ticks
+                WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp DESC LIMIT 90""",
+                (int(now)-95,int(now))).fetchall()
+        def ts(v):return datetime.fromisoformat(str(v).replace('Z','+00:00')).timestamp()
+        points={}
+        for r in chart:
             try:
-                observed=parse_utc(row['received_utc'])
-                point=parse_utc(row['latest_point_timestamp'])
-                if 0 <= now-observed <= 12 and 0 <= observed-point <= 12:
-                    usable.append((point, float(row['latest_point_price'])))
-                elif 0 <= now-observed <= 50 and 0 <= observed-point <= 12:
-                    usable.append((point, float(row['latest_point_price'])))
-            except (ValueError,TypeError,OverflowError):
-                continue
-        if len(usable)<2 or len(ticks)<2:
-            return neutral
-        usable.sort()
-        latest=usable[-1]
-        if now-latest[0]>12:
-            return neutral
-        prior=[r for r in usable[:-1] if 10 <= latest[0]-r[0] <= 35]
-        if not prior:
-            return neutral
-        prior=max(prior,key=lambda r:r[0])
-        # The BRTI 10-30s slope is computed from verified historical ticks.
-        ticks=[(float(r['timestamp']),float(r['price'])) for r in ticks]
-        current=max(ticks)
-        past=[r for r in ticks if 10 <= current[0]-r[0] <= 30]
-        if not past or now-current[0]>12:
-            return neutral
-        old=max(past)
-        brti_delta=current[1]-old[1]
-        chart_delta=latest[1]-prior[1]
-        # Require real movement in both sources; don't assume a static chart will catch up.
-        if abs(brti_delta)<5 or abs(chart_delta)<3:
-            return neutral
-        if brti_delta*chart_delta<=0:
-            return 0.0,'diverging'
-        # Distance remains dominant; this only slightly strengthens aligned momentum.
-        sign=1 if brti_delta>0 else -1
-        return sign*KEKE_MOVEMENT_WEIGHT,'aligned'
+                received=ts(r['received_utc']);stamp=ts(r['latest_point_timestamp'])
+                if stamp<=received<=stamp+12 and received<=now+2 and now-received<=65:
+                    points[stamp]=float(r['latest_point_price'])
+            except (ValueError,TypeError,OverflowError):pass
+        points=sorted(points.items())
+        ticks=sorted((float(r['timestamp']),float(r['price'])) for r in ticks)
+        if len(points)<2 or len(ticks)<2:return neutral
+        chart_now=points[-1];brti_now=ticks[-1]
+        if now-chart_now[0]>12 or now-brti_now[0]>12:return neutral
+        if abs(chart_now[0]-brti_now[0])>12:return neutral
+        def slope(series,latest):
+            candidates=[x for x in series[:-1] if 15<=latest[0]-x[0]<=40]
+            return latest[1]-max(candidates,key=lambda x:x[0])[1] if candidates else None
+        cdelta=slope(points,chart_now);bdelta=slope(ticks,brti_now)
+        if cdelta is None or bdelta is None:return neutral
+        # Do not mistake a spike or unconfirmed divergence for Kalshi catch-up.
+        if abs(bdelta)<5 and abs(cdelta)<3:return (0.0,'sideways')
+        if abs(bdelta)<5 or abs(cdelta)<3:return (0.0,'unconfirmed movement')
+        if bdelta*cdelta<0:return (0.0,'diverging; no automatic catch-up')
+        direction=1 if bdelta>0 else -1
+        # Only modestly support movement *away from* the settlement target;
+        # aligned movement toward target is a warning, not bullish confirmation.
+        if direction*a['distance']>0:
+            return (direction*KEKE_MOVEMENT_WEIGHT,'aligned away from target')
+        return (- (1 if a['distance']>0 else -1)*KEKE_MOVEMENT_WEIGHT,
+                'aligned toward target; fragile lead')
     except (sqlite3.Error,ValueError,TypeError,KeyError,OverflowError) as exc:
-        LOG.debug('Movement confirmation unavailable: %s',type(exc).__name__)
+        LOG.debug('Movement evidence unavailable: %s',type(exc).__name__)
         return neutral
 
 def settlement_signal(a):
@@ -1604,7 +1595,9 @@ def settlement_signal(a):
     adjustment,condition=movement_confirmation(a)
     a['movement_condition']=condition
     a['movement_adjustment']=adjustment
-    return a['distance']/scale + drift + adjustment
+    a['movement_live']=KEKE_MOVEMENT_LIVE
+    # Always collect the diagnostic; activate the modifier only after replay approval.
+    return a['distance']/scale + drift + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
 
 # Silent experimental model: NEVER changes the live V5.6 predictions or alerts.
 SHADOW_CHECKPOINTS=(720,540,360)  # 12, 9, and 6 minutes left

@@ -1,4 +1,4 @@
-"""KeKe V5.32 multi-timeframe settlement evidence — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.33 settlement-average multi-timeframe settlement evidence — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -972,6 +972,22 @@ def format_read(a, headline=None):
             f'🎯 Target: {money_text(a.get("target"))}\n'
             f'{price_line}\n📏 ${relation}')
 
+def settlement_live_text(a):
+    """Show the live target comparison and settlement arithmetic on /live."""
+    avg=a.get('settlement_average') or settlement_average_evidence(a)
+    if not avg.get('ready'):
+        return '🧮 Settlement math: '+str(avg.get('reason','collecting readings'))
+    rolling=avg.get('rolling')
+    lines=['🧮 LIVE SETTLEMENT MATH',
+           '60s BRTI rolling mean: '+(money_text(rolling) if rolling is not None else 'collecting'),
+           'Projected final average: '+money_text(avg['projected']),
+           'Projected vs target: ${:+,.2f}'.format(avg['distance']),
+           'Observed final-minute readings: {}/60'.format(avg['fixed_count'])]
+    if avg['final_minute'] and avg['remaining']>0:
+        lines.append('Remaining {}s must average {} for UP'.format(avg['remaining'],money_text(avg['required_remaining_mean'])))
+    lines.append('Forecast uses live 15s/30s trend for unknown readings; not a guaranteed outcome')
+    return '\n'.join(lines)
+
 def safe_shape(value, depth=0):
     """Show only JSON key names and types; never values or array contents."""
     if isinstance(value, dict):
@@ -1384,7 +1400,8 @@ def fresh_status():
             if a is not None:
                 a['brti_levels']=levels
                 a['v56_side']=load_v56(a['ticker'])['side']
-                return format_read(a)+'\n\n📊 Opening BRTI read; longer candles collecting'
+                settlement_signal(a)
+                return format_read(a)+'\n\n'+settlement_live_text(a)+'\n\n📊 Opening BRTI read; longer candles collecting'
             return (f'📡 BRTI ${brti:,.2f} • Target {money_text(target_of(market))}\n'
                     +levels+'\n⚪ Collecting verified BRTI candles; no trade signal')
         a=assessment(market,brti,candles,brti)
@@ -1399,7 +1416,7 @@ def fresh_status():
         a['v56_signal']=sig
         a['v56_candidate']='UP' if sig is not None and sig>0 else ('DOWN' if sig is not None and sig<0 else None)
         state['last_read']=a
-        return format_read(a)+'\n\n🎯 Settlement-only monitoring • scalp signals paused'
+        return format_read(a)+'\n\n'+settlement_live_text(a)+'\n\n🎯 Settlement-only monitoring • scalp signals paused'
     except Exception as exc:
         LOG.warning('Fresh STATUS failed: %s',type(exc).__name__)
         return '⚠️ Could not retrieve a fresh market reading. Please retry; no stale price is being presented as live.'
@@ -1430,7 +1447,7 @@ def telegram_commands():
             elif cmd=='/confidence':send(confidence_report())
             elif cmd=='/settings':send(menu_settings())
             elif cmd=='/help':send(menu_help())
-            elif cmd.startswith('/market'):
+            elif cmd.startswith('/market') or cmd.startswith('/live'):
                 send(fresh_status())
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/exchange'):send(exchange_report())
@@ -1519,7 +1536,8 @@ def fast_opening_assessment(m, brti):
             'volatility':volatility,'delta3':prices[-1]-prices[0],
             'asks':{side:quote(m,side,'ask') for side in ('UP','DOWN')},
             'brti_levels':'📊 Completed candles collecting',
-            'favored':'UP' if distance>0 else 'DOWN' if distance<0 else None}
+            'favored':'UP' if distance>0 else 'DOWN' if distance<0 else None,
+            'market_close':m.get('close_time')}
 
 
 # V5.29 dual-feed settlement evidence. This is a bounded heuristic, not a proven edge.
@@ -1581,6 +1599,74 @@ def movement_confirmation(a):
         LOG.debug('Movement evidence unavailable: %s',type(exc).__name__)
         return neutral
 
+def settlement_average_evidence(a):
+    """Use observed BRTI seconds and a live, bounded trend forecast for unknown seconds.
+
+    Never interpolate missing observed seconds or claim future observations are known.
+    The market close timestamp anchors the final 60-second window.
+    """
+    neutral={'ready':False,'reason':'insufficient BRTI seconds'}
+    if a.get('target') is None or a.get('seconds') is None:return neutral
+    now=int(time.time())
+    try:
+        with connect() as c:
+            rows=c.execute('SELECT timestamp,price FROM keke_brti_ticks WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp',
+                           (now-180,now)).fetchall()
+        by_second={int(r['timestamp']):float(r['price']) for r in rows}
+        if not by_second:return neutral
+        last=max(by_second)
+        if now-last>5:return {'ready':False,'reason':'stale BRTI'}
+        window=[by_second.get(t) for t in range(last-59,last+1)]
+        rolling=sum(window)/60.0 if all(v is not None for v in window) else None
+        seconds=max(0,int(a['seconds']))
+        close_raw=a.get('market_close')
+        if close_raw:
+            close=int(datetime.fromisoformat(close_raw.replace('Z','+00:00')).timestamp())
+        else:
+            close=now+seconds
+        final_start=close-60
+        fixed_times=range(final_start,min(last,close-1)+1) if last>=final_start else range(0)
+        fixed=[by_second.get(t) for t in fixed_times]
+        if any(v is None for v in fixed):
+            return {'ready':False,'reason':'missing observed settlement seconds','rolling':rolling}
+        fixed_sum=sum(fixed)
+        fixed_count=len(fixed)
+        remaining=60-fixed_count
+        current=by_second[last]
+        # Derive a per-second drift from observed 15s/30s movement, with a
+        # volatility-based cap. This is a forecast, not a future observation.
+        slopes=[]
+        for span in (15,30):
+            earlier=by_second.get(last-span)
+            if earlier is not None:slopes.append((current-earlier)/span)
+        slope=(0.65*slopes[0]+0.35*slopes[1]) if len(slopes)==2 else (slopes[0] if slopes else 0.0)
+        recent=[by_second[t] for t in range(max(last-59,min(by_second)),last+1) if t in by_second]
+        variation=(max(recent)-min(recent)) if len(recent)>=2 else 12.0
+        slope_cap=max(0.15,min(5.0,variation/30.0))
+        slope=max(-slope_cap,min(slope_cap,slope))
+        # Predict only future samples within the final-minute settlement window.
+        # Prior to that window, the projection remains a scenario, not a lock.
+        future=[]
+        for t in range(max(last+1,final_start),close):
+            future.append(current+slope*(t-last))
+        # Before the settlement minute starts, there are no fixed observations.
+        # Estimate its 60 future values at their actual future timestamps.
+        if last<final_start:
+            future=[current+slope*(t-last) for t in range(final_start,close)]
+        projected=(fixed_sum+sum(future))/60.0 if len(future)+fixed_count==60 else None
+        if projected is None:return {'ready':False,'reason':'settlement window incomplete','rolling':rolling}
+        required=(60*float(a['target'])-fixed_sum)/remaining if remaining else None
+        return {'ready':True,'rolling':rolling,'projected':projected,
+                'distance':projected-float(a['target']),
+                'fixed_count':fixed_count,'remaining':remaining,
+                'required_remaining_mean':required,
+                'scenario':'observed BRTI + bounded live 15s/30s trend',
+                'slope_per_second':slope,'last':current,
+                'final_minute':last>=final_start}
+    except (sqlite3.Error,ValueError,TypeError,OverflowError,KeyError) as exc:
+        LOG.debug('Settlement average unavailable: %s',type(exc).__name__)
+        return neutral
+
 def settlement_signal(a):
     if a['source']!='BRTI' or a['distance'] is None:
         return None
@@ -1596,8 +1682,23 @@ def settlement_signal(a):
     a['movement_condition']=condition
     a['movement_adjustment']=adjustment
     a['movement_live']=KEKE_MOVEMENT_LIVE
-    # Always collect the diagnostic; activate the modifier only after replay approval.
-    return a['distance']/scale + drift + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
+    # Settlement-average math is LIVE, not shadow. In the final minute the
+    # already-observed seconds are locked into the eventual arithmetic mean.
+    avg=settlement_average_evidence(a)
+    a['settlement_average']=avg
+    if avg.get('ready') and a['seconds']<=60:
+        # Use projected final 60s mean, not raw spot, for the directional score.
+        # Remaining seconds are a flat-price scenario; never claim certainty.
+        projected_distance=avg['distance']
+        remaining=max(1,avg['remaining'])
+        uncertainty=max(6.0,range1*math.sqrt(remaining/60))
+        return projected_distance/uncertainty + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
+    # Before the final minute, use live trend-projected settlement distance as
+    # additional evidence, bounded so distant extrapolations cannot dominate.
+    projected_component=0.0
+    if avg.get('ready') and avg.get('final_minute') is False:
+        projected_component=max(-0.30,min(0.30,(avg['distance']-a['distance'])/max(40.0,scale*3)))
+    return a['distance']/scale + drift + projected_component + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
 
 # Silent experimental model: NEVER changes the live V5.6 predictions or alerts.
 SHADOW_CHECKPOINTS=(720,540,360)  # 12, 9, and 6 minutes left

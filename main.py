@@ -472,19 +472,20 @@ def record(a):
                a['target'],a['confidence'],a['reason']))
 
 def record_early_prediction(a):
-    # One independent early directional baseline per contract
-    if a['source']!='BRTI' or a['favored'] not in ('UP','DOWN'):
+    """Record only the opening-window live settlement pick; never a later or competing heuristic."""
+    if a.get('source') != 'BRTI' or not INITIAL_PICK_MIN_SECONDS <= a.get('seconds', 0) <= 900:
         return
-    if a['seconds'] < 600 or a['seconds'] > 900:
+    side = a.get('v56_side')
+    if side not in ('UP', 'DOWN'):
         return
-    if a['distance'] is None or abs(a['distance']) < MIN_CUSHION:
+    if a.get('distance') is None:
         return
     with connect() as c:
         c.execute('''INSERT OR IGNORE INTO settlement_predictions
             (ticker,captured_at,seconds_left,side,source,distance,ask)
             VALUES (?,?,?,?,?,?,?)''',
-            (a['ticker'],a['at'],a['seconds'],a['favored'],a['source'],
-             a['distance'],a['asks'].get(a['favored'])))
+            (a['ticker'],a['at'],a['seconds'],side,a['source'],
+             a['distance'],a['asks'].get(side)))
 
 
 def official_result(ticker):
@@ -642,12 +643,12 @@ def early_pick_stats_summary(now=None):
         monitored = c.execute("""
             SELECT ticker, MAX(captured_at + seconds_left) AS contract_end
             FROM settlement_observations
-            WHERE captured_at >= ? AND seconds_left BETWEEN 780 AND 900
+            WHERE captured_at >= ? AND seconds_left BETWEEN 720 AND 900
               AND model_version = '5.9-BRTI'
             GROUP BY ticker
         """, (start,)).fetchall()
         eligible = sorted(r['ticker'] for r in monitored if now >= int(r['contract_end']))
-        missed = c.execute('SELECT COUNT(*) AS n FROM keke_opening_health WHERE first_seen>=? AND first_seconds<780', (start,)).fetchone()['n']
+        missed = c.execute('SELECT COUNT(*) AS n FROM keke_opening_health WHERE first_seen>=? AND first_seconds<720', (start,)).fetchone()['n']
         if not eligible:
             return ('🎯 EARLY-PICK TEST • V5.16 onward\n'
                     'No completed opening-window contracts yet. Historical picks excluded.')
@@ -665,7 +666,7 @@ def early_pick_stats_summary(now=None):
     for ticker, events in by_ticker.items():
         qualifying = [r for r in events if r['event'] == 'INITIAL'
                       and r['seconds_left'] is not None
-                      and 780 <= r['seconds_left'] <= 900]
+                      and 720 <= r['seconds_left'] <= 900]
         if qualifying:
             early[ticker] = qualifying[0]
     wins = sum(r['grade'] == 'WIN' for r in early.values())
@@ -700,13 +701,13 @@ def prospective_early_summary(now=None):
                           MAX(had_history) had_history FROM keke_opening_health
                           WHERE first_seen>=? GROUP BY ticker''',(start,)).fetchall()
         completed=[r for r in rows if r['first_seconds'] is not None and now>=r['first_seen']+r['first_seconds']]
-        eligible=[r for r in completed if r['first_seconds']>=780]
-        missed=[r for r in completed if r['first_seconds']<780]
+        eligible=[r for r in completed if r['first_seconds']>=720]
+        missed=[r for r in completed if r['first_seconds']<720]
         lacking=sum(not r['had_history'] for r in eligible)
         picks=[]
         for r in eligible:
             pick=c.execute('''SELECT * FROM keke_v56_forecasts WHERE ticker=? AND event='INITIAL'
-                              AND seconds_left BETWEEN 780 AND 900 AND captured_at>=?
+                              AND seconds_left BETWEEN 720 AND 900 AND captured_at>=?
                               ORDER BY id LIMIT 1''',(r['ticker'],start)).fetchone()
             if pick:picks.append(pick)
     wins=sum(p['grade']=='WIN' for p in picks)
@@ -1465,7 +1466,7 @@ def send_stats():
             l=sum(r['grade']=='LOSS' for r in items)
             return f'{w}W/{l}L ({100*w/(w+l):.1f}%)' if w+l else 'Not graded yet'
         # Earliest qualifying opening call only; never count a late initial as early.
-        early=[next((r for r in events if r['event']=='INITIAL' and 780<=r['seconds_left']<=900),None) for events in by_ticker.values()]
+        early=[next((r for r in events if r['event']=='INITIAL' and 720<=r['seconds_left']<=900),None) for events in by_ticker.values()]
         early=[r for r in early if r is not None]
         # Latest recorded prediction for each contract (including a reversal).
         final=[events[-1] for events in by_ticker.values() if events]
@@ -1702,7 +1703,7 @@ def initialize_telegram():
 # This is a directional research signal, NOT a calibrated win probability.
 V56_FIRST_MIN_SECONDS=600
 V56_INITIAL_SIGNAL=0.45
-INITIAL_PICK_MIN_SECONDS=780  # opening two minutes of each 900-second contract
+INITIAL_PICK_MIN_SECONDS=720  # opening three minutes of each 900-second contract
 V527_EARLY_COVERAGE_GOAL=.60
 V527_EARLY_ACCURACY_GOAL=.75
 V527_REPORT_WINDOW=86400
@@ -3156,16 +3157,16 @@ def v527_scorecard(now=None):
     start=now-V527_REPORT_WINDOW
     with connect() as c:
         # First-seen openings are the coverage denominator. Exclude openings first
-        # observed after the 120-second window and unfinished/unverified markets.
+        # observed after the 180-second window and unfinished/unverified markets.
         rows=c.execute('''SELECT h.ticker,h.first_seconds,r.settled_side,
           (SELECT f.side FROM keke_v56_forecasts f WHERE f.ticker=h.ticker
-           AND f.event='INITIAL' AND f.seconds_left BETWEEN 780 AND 900
+           AND f.event='INITIAL' AND f.seconds_left BETWEEN 720 AND 900
            ORDER BY f.captured_at,f.id LIMIT 1) early_side,
           (SELECT MIN(f.seconds_left) FROM keke_v56_forecasts f WHERE f.ticker=h.ticker
-           AND f.event='INITIAL' AND f.seconds_left BETWEEN 780 AND 900) early_seconds
+           AND f.event='INITIAL' AND f.seconds_left BETWEEN 720 AND 900) early_seconds
           FROM keke_opening_health h JOIN settlement_results r ON r.ticker=h.ticker
           WHERE h.first_seen>=? AND h.first_seen<=? AND r.verified=1
-            AND h.first_seconds BETWEEN 780 AND 900''',(start,now)).fetchall()
+            AND h.first_seconds BETWEEN 720 AND 900''',(start,now)).fetchall()
         checkpoints=c.execute("""SELECT grade,seconds_left FROM keke_v527_checkpoints
             WHERE captured_at BETWEEN ? AND ? AND grade!='PENDING'""" ,(start,now)).fetchall()
         warnings=c.execute('''SELECT COUNT(*) n FROM keke_v527_warnings
@@ -3481,7 +3482,6 @@ def main():
                 opening_seen(a['ticker'],a['seconds'],True)
                 if len(candles)>=15:
                     record(a)
-                    record_early_prediction(a)
                     record_v53(a)
                 quick=dual_read(a,candles) if len(candles)>=15 else {'scalp':'WAIT','frames':{1:'COLLECTING',3:'COLLECTING',15:'COLLECTING'}}
                 a['dual_read']=quick
@@ -3502,6 +3502,8 @@ def main():
                 if new:
                     proactive_updates(a,True)
                 process_v56(a,new)
+                if len(candles)>=15:
+                    record_early_prediction(a)
                 try:
                     v528_shadow_tick(a,candles)
                 except Exception:LOG.exception('V5.28 AI/shadow tick failed')

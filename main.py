@@ -1,4 +1,4 @@
-"""KeKe V5.29 dual-feed shadow settlement evidence — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.32 multi-timeframe settlement evidence — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -2212,10 +2212,26 @@ def record_v56(a,event,side,previous=None,reason=''):
             (a['ticker'],a['at'],a['seconds'],event,side,previous,
              a['v56_signal'],a['asks'].get(side),a['target'],a['btc'],reason))
 
+def settlement_candle_evidence(a, candidate):
+    """Completed 1m/3m/15m BRTI structure; no future candles or invented volume.
+
+    15m is context only: requiring four completed 15m bars would be inappropriate
+    for a 15-minute settlement horizon. This is evidence, not a guaranteed edge.
+    """
+    frames=(a.get('dual_read') or {}).get('frames') or {}
+    one=frames.get(1, 'COLLECTING')
+    three=frames.get(3, 'COLLECTING')
+    fifteen=frames.get(15, 'COLLECTING')
+    aligned=(one==candidate and three==candidate)
+    opposed=(one in ('UP','DOWN') and three==one and one!=candidate)
+    return {'aligned':aligned,'opposed':opposed,
+            'context':f'1m={one};3m={three};15m={fifteen}'}
+
 def process_v56(a,new_contract):
     if new_contract or state.get('v56_ticker')!=a['ticker']:
         state['v56_ticker']=a['ticker']
         state['v56']=load_v56(a['ticker'])
+        runtime_set('v56_opposite_since_'+a['ticker'],0)
     t=state['v56']
     signal=settlement_signal(a)
     a['v56_signal']=signal
@@ -2232,28 +2248,49 @@ def process_v56(a,new_contract):
             record_v56(a,event,candidate,reason='First qualifying settlement signal')
             if state['enabled']:send(format_read(a,f'🎯 SETTLEMENT {candidate} • {event} PICK'))
         return
-    if candidate==t['side'] or abs(signal)<V56_REVERSAL_SIGNAL:
+    # V5.31: Reversal evidence must persist in *time*, not merely two fast polls.
+    # A contradictory dual-feed movement blocks an accelerated reversal; a missing
+    # Kalshi reading is neutral, never fabricated confirmation.
+    evidence=a.get('movement_condition','insufficient paired data')
+    movement=a.get('movement_adjustment',0.0)
+    cand_sign=1 if candidate=='UP' else -1
+    opposing_chart=(evidence=='aligned away from target' and movement*cand_sign<0)
+    candle_evidence=settlement_candle_evidence(a,candidate)
+    a['settlement_candle_context']=candle_evidence['context']
+    if candidate==t['side'] or abs(signal)<V56_REVERSAL_SIGNAL or opposing_chart:
         t['opposite']=0
         runtime_set('v56_opposite_'+a['ticker'],0)
+        runtime_set('v56_opposite_since_'+a['ticker'],0)
         return
+    first_seen=runtime_get('v56_opposite_since_'+a['ticker'],0)
+    now_epoch=int(time.time())
+    if not first_seen or first_seen>now_epoch:
+        first_seen=now_epoch
+        runtime_set('v56_opposite_since_'+a['ticker'],first_seen)
     t['opposite']+=1
     runtime_set('v56_opposite_'+a['ticker'],t['opposite'])
-    # V5.30: require independently corroborated movement before accelerating a reversal.
-    # A BRTI/Kalshi gap alone never triggers a flip. Existing reversal rules remain
-    # unchanged unless the explicitly enabled movement mode has fresh paired evidence.
-    corroborated = (
+    corroborated=(
         KEKE_MOVEMENT_LIVE
-        and a.get('movement_condition') == 'aligned away from target'
-        and a.get('movement_adjustment', 0.0) * (1 if candidate == 'UP' else -1) > 0
+        and candle_evidence['aligned']
+        and evidence=='aligned away from target'
+        and movement*cand_sign>0
         and a.get('distance') is not None
-        and abs(a['distance']) >= max(25.0, float(a.get('volatility') or 0))
+        and a['distance']*cand_sign>0
+        and abs(a['distance'])>=max(25.0,float(a.get('volatility') or 0))
     )
-    required_confirmations = 1 if corroborated and abs(signal) >= V56_REVERSAL_SIGNAL else V56_REVERSAL_CONFIRM
-    if abs(signal)>=V56_FAST_REVERSAL_SIGNAL or t['opposite']>=required_confirmations:
+    # Strong aligned movement can accelerate a flip, but still requires several
+    # seconds of stability. Other reversals must persist for at least 20 seconds.
+    # When both completed short timeframes oppose a proposed reversal, don't
+    # accelerate it. Require additional persistence instead; a strong target
+    # signal can still reverse rather than being permanently vetoed.
+    min_elapsed=6 if corroborated and abs(signal)>=V56_FAST_REVERSAL_SIGNAL else (30 if candle_evidence['opposed'] else 20)
+    if now_epoch-first_seen>=min_elapsed and t['opposite']>=V56_REVERSAL_CONFIRM:
         old=t['side'];t['side']=candidate;t['opposite']=0
         runtime_set('v56_opposite_'+a['ticker'],0)
+        runtime_set('v56_opposite_since_'+a['ticker'],0)
         a['v56_side']=candidate
-        record_v56(a,'REVERSAL',candidate,old,'Strong opposite settlement signal')
+        record_v56(a,'REVERSAL',candidate,old,
+                   'Sustained opposite signal; dual-feed '+str(evidence)+'; candles '+candle_evidence['context'])
         if state['enabled']:send(format_read(a,f'🎯 SETTLEMENT {candidate} • REVERSED {old}'))
 
 def compact_update(a):

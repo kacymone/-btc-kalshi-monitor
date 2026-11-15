@@ -1451,28 +1451,34 @@ def health_status():
 
 
 def send_stats():
-    """Compact Telegram stats; retain detailed research in existing commands."""
+    """One result per contract for early and final calls; reversal events separate."""
     try:
         cutoff=stats_epoch()
         with connect() as c:
-            rows=c.execute("SELECT ticker,event,grade FROM keke_v56_forecasts WHERE captured_at>=? ORDER BY ticker,id",(cutoff,)).fetchall()
+            rows=c.execute("SELECT ticker,event,side,grade,seconds_left,captured_at,id FROM keke_v56_forecasts WHERE captured_at>=? ORDER BY ticker,captured_at,id",(cutoff,)).fetchall()
             contracts=c.execute("SELECT COUNT(DISTINCT ticker) n FROM settlement_observations WHERE model_version=? AND captured_at>=?",('5.9-BRTI',cutoff)).fetchone()['n']
-        def result(event):
-            group=[r for r in rows if r['event']==event]
-            w=sum(r['grade']=='WIN' for r in group)
-            l=sum(r['grade']=='LOSS' for r in group)
+        by_ticker={}
+        for r in rows:by_ticker.setdefault(r['ticker'],[]).append(r)
+        def score(items):
+            w=sum(r['grade']=='WIN' for r in items)
+            l=sum(r['grade']=='LOSS' for r in items)
             return f'{w}W/{l}L ({100*w/(w+l):.1f}%)' if w+l else 'Not graded yet'
-        early=prospective_early_summary()
-        import re
-        m=re.search(r'Coverage: ([\d.]+%)',early)
-        coverage=m.group(1) if m else 'n/a'
-        send('📊 KEKE | PERFORMANCE\n'
-             f'🎯 Early: {result("INITIAL")}\n'
-             f'📡 Late: {result("LATE")}\n'
-             f'🔄 Reversals: {result("REVERSAL")}\n'
-             f'📈 Early coverage: {coverage}\n'
-             f'📋 Contracts tracked: {contracts}\n'
-             '⚠️ Accuracy ≠ trading profit. /legacy for history.')
+        # Earliest qualifying opening call only; never count a late initial as early.
+        early=[next((r for r in events if r['event']=='INITIAL' and 780<=r['seconds_left']<=900),None) for events in by_ticker.values()]
+        early=[r for r in early if r is not None]
+        # Latest recorded prediction for each contract (including a reversal).
+        final=[events[-1] for events in by_ticker.values() if events]
+        reversals=[r for events in by_ticker.values() for r in events if r['event']=='REVERSAL']
+        # Denominator is contracts observed in this epoch; distinguish ungraded.
+        coverage=f'{100*len(early)/contracts:.1f}%' if contracts else 'n/a'
+        send('📊 KEKE | PERFORMANCE\n\n'
+             f'🎯 Early (one/contract): {score(early)}\n'
+             f'🏁 Last call (one/contract): {score(final)}\n'
+             f'🔄 Reversal EVENTS: {score(reversals)}\n'
+             f'📈 Opening coverage: {coverage} ({len(early)}/{contracts})\n'
+             f'📋 Contracts tracked: {contracts}\n\n'
+             'Last call = last recorded prediction, not necessarily at expiry.\n'
+             'Accuracy ≠ trading profit. /legacy for history.')
     except Exception:
         LOG.exception('Compact stats failed')
         send('⚠️ Stats unavailable right now; try again shortly.')
@@ -2721,11 +2727,19 @@ def process_v56(a,new_contract):
     candle_evidence=settlement_candle_evidence(a,candidate)
     a['settlement_candle_context']=candle_evidence['context']
     late_confirmed=bool(late_cross and late_cross['side']==candidate and candidate!=t['side'])
+    # A late cross alone is not a settlement lock: require short candle confirmation
+    # OR corroborated same-direction Kalshi movement before shortening the timer.
+    if late_confirmed:
+        paired=a.get('movement_condition')=='aligned away from target' and (a.get('movement_adjustment') or 0)*(1 if candidate=='UP' else -1)>0
+        if not (candle_evidence['aligned'] or paired):
+            a['reversal_watch']=True
+            late_confirmed=False
+
     level_ev=a.get('live_level_evidence') or {}
     level_confirmed=bool(level_ev.get('confirmed') and level_ev.get('direction')==candidate)
     if candidate!=t['side'] and level_ev.get('direction')==candidate:
         a['reversal_watch']=True
-    if candidate==t['side'] or (abs(signal)<V56_REVERSAL_SIGNAL and not late_confirmed) or (opposing_chart and not late_confirmed):
+    if candidate==t['side'] or (abs(signal)<V56_REVERSAL_SIGNAL and not late_confirmed and not (late_cross and late_cross['side']==candidate)) or (opposing_chart and not late_confirmed and not (late_cross and late_cross['side']==candidate)):
         t['opposite']=0
         runtime_set('v56_opposite_'+a['ticker'],0)
         runtime_set('v56_opposite_since_'+a['ticker'],0)

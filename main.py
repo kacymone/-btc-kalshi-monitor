@@ -2050,8 +2050,8 @@ def v528_shadow_tick(a,candles):
         send(v528_shadow_message(r,a.get('v56_side')))
 
 # V5.7 observational multi-timeframe and portfolio extension. GET requests only.
-PORTFOLIO_POLL_SECONDS=5
-POSITION_GAP_UPDATE_SECONDS=5
+PORTFOLIO_POLL_SECONDS=2
+POSITION_GAP_UPDATE_SECONDS=2
 POSITION_ALERT_COOLDOWN=180
 portfolio_state={'last_poll':0,'positions':{},'alert_at':{},'error_at':0,'gap_sent_at':{},'live_message_ids':{}}
 
@@ -2459,6 +2459,33 @@ def get_open_position(m):
     return {'ticker':ticker,'side':side,'qty':qty,'basis':basis,'avg':avg,
             'bid':bid,'ask':ask,'gross':gross}
 
+def settlement_hold_values(position):
+    """Gross $1/contract settlement payout if the held side wins; no fees assumed."""
+    qty=position.get('qty')
+    basis=position.get('basis')
+    if qty is None or qty <= 0:
+        return None, None, None
+    payout=float(qty)  # Kalshi binary contracts pay $1 per winning contract.
+    if basis is None:
+        return payout, None, None
+    return payout, payout-float(basis), -float(basis)
+
+
+def settlement_hold_lines(position):
+    payout, win_profit, loss_profit = settlement_hold_values(position)
+    if payout is None:
+        return ['🏁 Hold to settlement: unavailable']
+    lines=[f'🏁 If {position["side"]} wins at settlement:',
+           f'   Total payout: {total_money(payout)}']
+    if win_profit is None:
+        lines.append('   Net profit: unavailable (cost basis missing)')
+    else:
+        lines.append(f'   Gross profit: {total_money(win_profit)}')
+        lines.append(f'If {position["side"]} loses: {total_money(loss_profit)}')
+    lines.append('Before settlement fees, if any; assumes full position held.')
+    return lines
+
+
 def compact_position_gap(a,position):
     """Fast, number-first position view; no speculative profit or trade advice."""
     dashboard=live_gap_dashboard(a)
@@ -2519,6 +2546,7 @@ def compact_position_gap(a,position):
             compact_change('5s'),compact_change('15s'),compact_change('30s'),
             '',label,'',
             f'Bid {ask_text(position["bid"])} | Est. gross {tiny_money(position["gross"])}',
+            '',*settlement_hold_lines(position),
             fields.get('Chart age','')]
     if 'stale' in dashboard.lower() or 'unavailable' in dashboard.lower() or 'collecting timestamped' in dashboard.lower():
         result[6]='⚠️ Chart data unavailable'
@@ -2614,9 +2642,14 @@ def portfolio_status():
         p=get_open_position(m)
         if not p:return '💰 No active position in the current BTC15m contract.'
         pnl=tiny_money(p['gross'])
-        return (f"💰 {p['qty']} {p['side']} • Cost basis/contract {ask_text(p['avg'])}"
-                f"\nTotal cost {total_money(p['basis'])} • Sell bid {ask_text(p['bid'])} • Gross P/L {pnl}"
-                "\nExcludes fees and slippage; current contract only.")
+        lines=[f"📍 {p['qty']:g} {p['side']} contracts",
+               f"Cost per contract: {ask_text(p['avg'])}",
+               f"Total cost: {total_money(p['basis'])}",
+               f"Current sell bid: {ask_text(p['bid'])}",
+               f"Est. gross sell P/L: {pnl}",
+               '',*settlement_hold_lines(p),
+               'Sell P/L excludes fees and slippage; current contract only.']
+        return '\n'.join(lines)
     except Exception as exc:
         LOG.warning('Position command failed: %s: %s',type(exc).__name__,str(exc)[:150])
         detail=str(exc)[:100] if isinstance(exc,(RuntimeError,ValueError)) else type(exc).__name__

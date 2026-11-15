@@ -2238,7 +2238,18 @@ def process_v56(a,new_contract):
         return
     t['opposite']+=1
     runtime_set('v56_opposite_'+a['ticker'],t['opposite'])
-    if abs(signal)>=V56_FAST_REVERSAL_SIGNAL or t['opposite']>=V56_REVERSAL_CONFIRM:
+    # V5.30: require independently corroborated movement before accelerating a reversal.
+    # A BRTI/Kalshi gap alone never triggers a flip. Existing reversal rules remain
+    # unchanged unless the explicitly enabled movement mode has fresh paired evidence.
+    corroborated = (
+        KEKE_MOVEMENT_LIVE
+        and a.get('movement_condition') == 'aligned away from target'
+        and a.get('movement_adjustment', 0.0) * (1 if candidate == 'UP' else -1) > 0
+        and a.get('distance') is not None
+        and abs(a['distance']) >= max(25.0, float(a.get('volatility') or 0))
+    )
+    required_confirmations = 1 if corroborated and abs(signal) >= V56_REVERSAL_SIGNAL else V56_REVERSAL_CONFIRM
+    if abs(signal)>=V56_FAST_REVERSAL_SIGNAL or t['opposite']>=required_confirmations:
         old=t['side'];t['side']=candidate;t['opposite']=0
         runtime_set('v56_opposite_'+a['ticker'],0)
         a['v56_side']=candidate

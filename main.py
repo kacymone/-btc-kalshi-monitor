@@ -10,12 +10,8 @@ import csv, io, zipfile
 import threading
 import gzip
 import uuid
-# AI Lab is optional and disabled by default to keep KeKe quiet.
-try:
-    import keke_ai_lab as ai_lab
-except ImportError:
-    ai_lab = None
-AI_LAB_ENABLED = os.getenv('KEKE_AI_LAB_ENABLED', '0') == '1' 
+AI_LAB_ENABLED = False
+ai_lab = None 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 LOG = logging.getLogger('keke')
@@ -948,6 +944,7 @@ def format_read(a, headline=None):
     mm,ss=divmod(max(0,int(a['seconds'])),60)
     side=a.get('v56_side')
     label=headline or ('🟢 SETTLEMENT: UP' if side=='UP' else '🔴 SETTLEMENT: DOWN' if side=='DOWN' else '👀 ANALYZING')
+    if a.get('reversal_watch'):label+=' ⚠️ REVERSAL WATCH'
     if a.get('source')!='BRTI' or a.get('target') is None:
         return f'{label}\n\n🎯 Target: {money_text(a.get("target"))}\n⏱ {mm}:{ss:02d} left\n⚠️ BRTI unavailable'
     price=a.get('btc')
@@ -1476,6 +1473,30 @@ def send_stats():
         LOG.exception('Compact stats failed')
         send('⚠️ Stats unavailable right now; try again shortly.')
 
+def quick_live_text(a):
+    """One-glance Live: observed prices and gap, not a price forecast."""
+    gap=live_gap_dashboard(a)
+    fields={}
+    for line in gap.splitlines():
+        if ': ' in line:
+            key,val=line.split(': ',1)
+            fields[key]=val
+    sec=max(0,int(a.get('seconds') or 0))
+    side=a.get('v56_side') or 'WAIT'
+    header=('🟢 UP' if side=='UP' else '🔴 DOWN' if side=='DOWN' else '👀 WAIT')
+    target=a.get('target')
+    lines=[f'{header} • {sec//60}:{sec%60:02d}',
+           '🎯 '+money_text(target),
+           'BRTI '+money_text(a.get('btc'))+' ('+('${:+,.2f}'.format(a['distance']) if a.get('distance') is not None else '—')+')',
+           'Kalshi '+fields.get('Kalshi chart','unavailable'),
+           'Gap '+fields.get('BRTI − Kalshi','unavailable')]
+    for p in ('5s','15s','30s','60s'):
+        line=next((x for x in gap.splitlines() if x.startswith(p+': ')),None)
+        if line:lines.append(line)
+    if a.get('reversal_watch'):lines.append('⚠️ REVERSAL WATCH')
+    if 'stale' in gap.lower() or 'unavailable' in gap.lower():lines.append('⚠️ Kalshi data stale/unavailable')
+    return '\n'.join(lines)
+
 def fresh_status():
     """Fetch a new market and BRTI tick for STATUS; do not change prediction state."""
     try:
@@ -1492,7 +1513,7 @@ def fresh_status():
                 a['brti_levels']=levels
                 a['v56_side']=load_v56(a['ticker'])['side']
                 settlement_signal(a)
-                return format_read(a)+'\n\n'+live_gap_dashboard(a)+'\n\n'+settlement_live_text(a)+'\n\n📊 Opening BRTI read; longer candles collecting'
+                return quick_live_text(a)
             return (f'📡 BRTI ${brti:,.2f} • Target {money_text(target_of(market))}\n'
                     +levels+'\n⚪ Collecting verified BRTI candles; no trade signal')
         a=assessment(market,brti,candles,brti)
@@ -1507,7 +1528,7 @@ def fresh_status():
         a['v56_signal']=sig
         a['v56_candidate']='UP' if sig is not None and sig>0 else ('DOWN' if sig is not None and sig<0 else None)
         state['last_read']=a
-        return format_read(a)+'\n\n'+live_gap_dashboard(a)+'\n\n'+settlement_live_text(a)+'\n\n🎯 Settlement-only monitoring • scalp signals paused'
+        return quick_live_text(a)
     except Exception as exc:
         LOG.warning('Fresh STATUS failed: %s',type(exc).__name__)
         return '⚠️ Could not retrieve a fresh market reading. Please retry; no stale price is being presented as live.'
@@ -1543,8 +1564,6 @@ def telegram_commands():
             elif cmd.startswith('/stats'):send_stats()
             elif cmd.startswith('/exchange'):send(exchange_report())
             elif cmd.startswith('/lead'):send(exchange_research_report())
-            elif cmd in ('/aion','/aioff','/ai','/researchon','/researchoff','/auditai','/improvements','/compare'):
-                send(ai_lab.command(cmd) if AI_LAB_ENABLED and ai_lab else "AI Lab is sleeping; KeKe settlement alerts remain active.")
             elif cmd.startswith('/audit'):send(audit_report())
             elif cmd.startswith('/research'):send(research_stats_report())
             elif cmd.startswith('/scorecard'):send(v527_scorecard())
@@ -2539,6 +2558,7 @@ def process_v56(a,new_contract):
     a['v56_signal']=signal
     a['v56_candidate']=('UP' if signal>0 else 'DOWN') if signal is not None and signal!=0 else None
     a['v56_side']=t['side']
+    a['reversal_watch']=bool(t['side'] in ('UP','DOWN') and a['v56_candidate'] in ('UP','DOWN') and a['v56_candidate']!=t['side'] and signal is not None and abs(signal)>=V56_REVERSAL_SIGNAL*0.65)
     if signal is None or a['seconds']<=0:return
     candidate=a['v56_candidate']
     late_cross=late_settlement_cross_evidence(a)
@@ -3110,8 +3130,6 @@ def main():
     exchange_init()
     research_init()
     v527_init()
-    if AI_LAB_ENABLED and ai_lab:
-        ai_lab.start(DB_PATH,send)
     v527_daily_report()
     if os.getenv("KEKE_EXCHANGE_OBSERVER","1")=="1":
         threading.Thread(target=exchange_worker,daemon=True,name="exchange-observer").start()
@@ -3142,8 +3160,6 @@ def main():
                 v527_daily_report()
                 speed['grading_ms']=(time.monotonic()-grade_t0)*1000
             ai_t0=time.monotonic()
-            if AI_LAB_ENABLED and ai_lab:
-                ai_lab.schedule_research()
             speed['ai_schedule_ms']=(time.monotonic()-ai_t0)*1000
             market_t0=time.monotonic()
             market=get_market()
@@ -3240,8 +3256,6 @@ def main():
                 process_v56(a,new)
                 try:
                     v528_shadow_tick(a,candles)
-                    if AI_LAB_ENABLED and ai_lab:
-                        ai_lab.queue_live(a,shadow_view['last'])
                 except Exception:LOG.exception('V5.28 AI/shadow tick failed')
                 lock_forecast(a)
                 v527_checkpoint(a)

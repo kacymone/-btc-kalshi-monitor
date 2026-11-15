@@ -2052,7 +2052,12 @@ def v528_shadow_tick(a,candles):
 # V5.7 observational multi-timeframe and portfolio extension. GET requests only.
 PORTFOLIO_POLL_SECONDS=2
 POSITION_GAP_UPDATE_SECONDS=2
-POSITION_ALERT_COOLDOWN=180
+POSITION_ALERT_COOLDOWN=45
+# V5.47: observational risk controls; never place orders.
+RISK_WARN_LOSS_PCT=0.12
+RISK_CRITICAL_LOSS_PCT=0.20
+RISK_PROTECT_GAIN_PCT=0.20
+RISK_MAX_SPREAD_CENTS=0.08
 portfolio_state={'last_poll':0,'positions':{},'alert_at':{},'error_at':0,'gap_sent_at':{},'live_message_ids':{}}
 
 def authenticated_get(path,params=None):
@@ -2393,31 +2398,61 @@ def entry_opportunity(a,read):
          f'↔ Spread {spread*100:.1f}¢\n\n'
          'Check live Kalshi ask and liquidity before any manual entry.')
 
-def position_exit_alert(position,a,read):
-    """Alert on realizable bid estimates, not on settlement payout or paper gains."""
-    if not state['enabled'] or position is None:return
-    side=position['side']; ticker=position['ticker']
-    qty=position['qty']; avg=position['avg']; bid=position['bid']
-    if avg is None or bid is None or qty<=0:return
-    move=bid-avg
-    against=read.get('settlement_side') in ('UP','DOWN') and read['settlement_side']!=side
-    if move>=TAKE_PROFIT_CENTS:
-        category='TAKE PROFIT WATCH'
-    elif move<=-STOP_WARNING_CENTS or against:
-        category='EXIT WARNING'
+def position_risk_assessment(position,a,read=None):
+    """Bid-based, gross, actionable-risk observations; no implied fills or probabilities."""
+    basis=position.get('basis'); bid=position.get('bid'); qty=position.get('qty') or 0
+    avg=position.get('avg'); ask=position.get('ask')
+    result={'status':'DATA UNAVAILABLE','reason':'Need verified basis and sell bid',
+            'loss_pct':None,'sell_value':None,'pnl':None,'spread':None}
+    if not qty or basis is None or basis<=0 or bid is None or avg is None:
+        return result
+    sell_value=qty*bid
+    pnl=sell_value-basis
+    pct=pnl/basis
+    spread=max(0,ask-bid) if ask is not None else None
+    predicted=(read or {}).get('settlement_side')
+    opposite=predicted in ('UP','DOWN') and predicted!=position['side']
+    seconds=a.get('seconds',900)
+    if pct<=-RISK_CRITICAL_LOSS_PCT:
+        status,reason='EXIT WATCH','Loss threshold exceeded'
+    elif opposite and pct<0:
+        status,reason='EXIT WATCH','Settlement call opposes holding'
+    elif pct<=-RISK_WARN_LOSS_PCT:
+        status,reason='LOSS WATCH','Position drawdown increasing'
+    elif pct>=RISK_PROTECT_GAIN_PCT:
+        status,reason='PROTECT PROFIT','Consider locking in available profit'
+    elif opposite:
+        status,reason='REVERSAL WATCH','Settlement call opposes holding'
     else:
+        status,reason='HOLD WATCH','No risk threshold crossed'
+    if spread is not None and spread>=RISK_MAX_SPREAD_CENTS:
+        reason+='; wide bid/ask spread'
+    if seconds<=60 and status=='HOLD WATCH':
+        status,reason='SETTLEMENT NEAR','Final-minute price can change rapidly'
+    result.update(status=status,reason=reason,loss_pct=pct,sell_value=sell_value,
+                  pnl=pnl,spread=spread)
+    return result
+
+
+def position_exit_alert(position,a,read):
+    """Notify on bid-based risk state transitions; no orders or promised exits."""
+    if not state['enabled'] or position is None:return
+    risk=position_risk_assessment(position,a,read)
+    category=risk['status']
+    if category not in ('EXIT WATCH','LOSS WATCH','PROTECT PROFIT','REVERSAL WATCH'):
         return
+    ticker=position['ticker']; side=position['side']
     key=(ticker,side,category)
     now=time.time()
     if now-trade_alert_state['last_exit'].get(key,0)<POSITION_ALERT_COOLDOWN:return
     trade_alert_state['last_exit'][key]=now
-    gross=position['gross']
-    detail=' • Settlement forecast opposes holding' if against else ''
-    send(f'{"💰 SELL WATCH" if category=="TAKE PROFIT WATCH" else "🚨 EXIT WATCH"} {side} • {ask_text(bid)}\n'
+    pct=risk['loss_pct']
+    send(f'🚨 {category} • {side}\n'
          f'⏱ {a["seconds"]//60}:{a["seconds"]%60:02d} left\n'
-         f'Entry {ask_text(avg)} → Sell bid {ask_text(bid)}\n'
-         f'Gross P/L {tiny_money(gross)} • {qty:g} contracts{detail}\n\n'
-         'Review sell liquidity and fees. No automatic orders.')
+         f'Entry {ask_text(position["avg"])} → Sell bid {ask_text(position["bid"])}\n'
+         f'Gross P/L {tiny_money(risk["pnl"])} ({pct:+.1%} of basis)\n'
+         f'{risk["reason"]}\n'
+         'Check live bid, available size and fees before manually selling. No automatic orders.')
 
 def fill_price(fill,side):
     # Kalshi fills use yes_price/no_price (cents) or *_price_dollars.
@@ -2535,6 +2570,8 @@ def compact_position_gap(a,position):
     def compact_change(period):
         b=movement(period,'BRTI');k=movement(period,'Kalshi')
         return f'{period}: B {fmt(b)} | K {fmt(k)}' if b is not None and k is not None else f'{period}: collecting'
+    risk=position_risk_assessment(position,a,{'settlement_side':(state.get('v56') or {}).get('side') if state.get('v56_ticker')==ticker else None})
+    risk_line=(f'🛡️ {risk["status"]} • {risk["loss_pct"]:+.1%} of cost' if risk['loss_pct'] is not None else '🛡️ Risk: data unavailable')
     result=[f'📍 {position["side"]} • {clock} left • {position["qty"]:g} contracts',
             '',
             f'🎯 Target: {money_text(target)}',
@@ -2544,7 +2581,7 @@ def compact_position_gap(a,position):
             f'↔️ GAP: {fmt(exact_gap) if exact_gap is not None else "unavailable"}',
             '',
             compact_change('5s'),compact_change('15s'),compact_change('30s'),
-            '',label,'',
+            '',label,risk_line,risk['reason'],'',
             f'Bid {ask_text(position["bid"])} | Est. gross {tiny_money(position["gross"])}',
             '',*settlement_hold_lines(position),
             fields.get('Chart age','')]
@@ -2554,7 +2591,7 @@ def compact_position_gap(a,position):
 
 
 def refresh_position_message(ticker,a,position):
-    """One Telegram message per position; edit every ~5s, not chat spam."""
+    """One Telegram message per position; edit on the 2s monitoring cadence."""
     if not state['enabled'] or not TOKEN or not CHAT:return
     message=compact_position_gap(a,position)
     old_id=portfolio_state['live_message_ids'].get(ticker)

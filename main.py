@@ -1900,10 +1900,10 @@ def v528_shadow_tick(a,candles):
         send(v528_shadow_message(r,a.get('v56_side')))
 
 # V5.7 observational multi-timeframe and portfolio extension. GET requests only.
-PORTFOLIO_POLL_SECONDS=8
-POSITION_GAP_UPDATE_SECONDS=25
+PORTFOLIO_POLL_SECONDS=5
+POSITION_GAP_UPDATE_SECONDS=5
 POSITION_ALERT_COOLDOWN=180
-portfolio_state={'last_poll':0,'positions':{},'alert_at':{},'error_at':0,'gap_sent_at':{}}
+portfolio_state={'last_poll':0,'positions':{},'alert_at':{},'error_at':0,'gap_sent_at':{},'live_message_ids':{}}
 
 def authenticated_get(path,params=None):
     key_id=os.getenv('KALSHI_API_KEY_ID','').strip()
@@ -2309,6 +2309,84 @@ def get_open_position(m):
     return {'ticker':ticker,'side':side,'qty':qty,'basis':basis,'avg':avg,
             'bid':bid,'ask':ask,'gross':gross}
 
+def compact_position_gap(a,position):
+    """Fast, number-first position view; no speculative profit or trade advice."""
+    dashboard=live_gap_dashboard(a)
+    lines=dashboard.splitlines()
+    fields={}
+    changes={}
+    for line in lines:
+        if ': ' in line:
+            k,v=line.split(': ',1)
+            fields[k.strip()]=v.strip()
+        for period in ('5s','15s','30s','60s'):
+            if line.startswith(period+': '):
+                changes[period]=line[len(period)+2:].strip()
+    def numeric(field):
+        try:return float(fields[field].replace('$','').replace(',',''))
+        except (ValueError,KeyError):return None
+    gap=numeric('BRTI − Kalshi')
+    # Read movement from paired observations; do not mistake a negative gap
+    # growing more negative for 'narrowing'.
+    def movement(period,kind):
+        import re
+        match=re.search(r'(?:^|\| )'+kind+r' \$([+-]?[\d,]+\.\d+)',changes.get(period,''))
+        return float(match.group(1).replace(',','')) if match else None
+    b5=movement('5s','BRTI');b15=movement('15s','BRTI')
+    k5=movement('5s','Kalshi');k15=movement('15s','Kalshi')
+    g15=movement('15s','gap')
+    label='⚪ Collecting'
+    if b15 is not None and k15 is not None and gap is not None:
+        side=position['side']
+        favorable=b15 if side=='UP' else -b15
+        if favorable>3 and (b5 is None or (b5 if side=='UP' else -b5)>=0):
+            label='🟢 '+side+' strengthening'
+        elif favorable < -3 and (b5 is None or (b5 if side=='UP' else -b5)<=0):
+            label='🔴 '+side+' weakening'
+        elif g15 is not None and abs(gap)<abs(gap-g15)-2 and abs(b15)<abs(k15):
+            label='↔️ Kalshi catching up'
+        else:
+            label='🟡 Mixed momentum'
+    ticker=a.get('ticker','')
+    secs=a.get('seconds')
+    clock=f'{int(secs)//60}:{int(secs)%60:02d}' if secs is not None else '?'
+    result=[f'📍 {position["side"]} • {clock} left • {position["qty"]:g} contracts',
+            f'🎯 Target {money_text(a.get("target"))}',
+            f'BRTI {fields.get("BRTI (aligned)","unavailable")} | Kalshi {fields.get("Kalshi chart","unavailable")}',
+            f'Gap {fields.get("BRTI − Kalshi","unavailable")}',
+            f'vs target: B {fields.get("BRTI vs target","—")} | K {fields.get("Kalshi vs target","—")}',
+            f'5s {changes.get("5s","collecting")}',
+            f'15s {changes.get("15s","collecting")}',
+            f'30s {changes.get("30s","collecting")}',
+            f'60s {changes.get("60s","collecting")}',
+            label,
+            f'Bid {ask_text(position["bid"])} | Est. gross {tiny_money(position["gross"])}',
+            fields.get('Chart age','')]
+    if 'stale' in dashboard.lower() or 'unavailable' in dashboard.lower() or 'collecting timestamped' in dashboard.lower():
+        result[9]='⚠️ Chart data unavailable'
+    return '\n'.join(x for x in result if x)
+
+
+def refresh_position_message(ticker,a,position):
+    """One Telegram message per position; edit every ~5s, not chat spam."""
+    if not state['enabled'] or not TOKEN or not CHAT:return
+    message=compact_position_gap(a,position)
+    old_id=portfolio_state['live_message_ids'].get(ticker)
+    try:
+        if old_id:
+            result=tg('editMessageText',chat_id=CHAT,message_id=old_id,text=message)
+            if result and result.get('ok'):return
+        result=tg('sendMessage',chat_id=CHAT,text=message)
+        if result and result.get('ok'):
+            msg_id=result.get('result',{}).get('message_id')
+            if msg_id:portfolio_state['live_message_ids'][ticker]=msg_id
+    except Exception as exc:
+        # Telegram returns 'message is not modified' when source data has not
+        # advanced; keep the same message instead of sending duplicates.
+        if 'message is not modified' not in str(exc).lower():
+            LOG.warning('Position dashboard update failed: %s',type(exc).__name__)
+
+
 def portfolio_poll(m,a,read):
     """Monitor actual account holdings independently of disabled scalp entries.
     Persist observed position changes across restarts; never claim a sale was filled
@@ -2351,21 +2429,19 @@ def portfolio_poll(m,a,read):
         if position is None:
             send(f'✅ {event} • {ticker}\nPreviously {old["qty"]:g} {old["side"]}; now 0.\nExit detected from holdings, NOT verified realized P/L.')
         else:
-            send(f'💰 {event} • {ticker}\n{position["qty"]:g} {position["side"]} '
-                 f'• bid {ask_text(position["bid"])}\nGross P/L {tiny_money(position["gross"])} '
-                 '(estimated; fees/fills unverified).\n\n'+live_gap_dashboard(a))
+            # Send the position dashboard immediately on detection/change.
+            refresh_position_message(ticker,a,position)
             portfolio_state['gap_sent_at'][ticker]=now
     if not position:
         portfolio_state['positions'].pop(ticker,None)
         portfolio_state['gap_sent_at'].pop(ticker,None)
+        portfolio_state['live_message_ids'].pop(ticker,None)
         return
     portfolio_state['positions'][ticker]=position
     # Keep the trader informed without requiring repeated /live taps.
     # Numbers are observations, not automatic sell/hold instructions.
     if state['enabled'] and now-portfolio_state['gap_sent_at'].get(ticker,0)>=POSITION_GAP_UPDATE_SECONDS:
-        send('📍 POSITION LIVE • {} {}\nSell bid {} • Est. gross P/L {}\n\n{}'.format(
-            position['qty'],position['side'],ask_text(position['bid']),
-            tiny_money(position['gross']),live_gap_dashboard(a)))
+        refresh_position_message(ticker,a,position)
         portfolio_state['gap_sent_at'][ticker]=now
     # Compare the position to the SETTLEMENT prediction, not the disabled scalp model.
     prediction=state.get('v56') or {}
@@ -2417,6 +2493,42 @@ def settlement_candle_evidence(a, candidate):
     return {'aligned':aligned,'opposed':opposed,
             'context':f'1m={one};3m={three};15m={fifteen}'}
 
+def late_settlement_cross_evidence(a):
+    """Observed-price reversal evidence, not an extrapolated future price.
+
+    Requires 60 consecutive BRTI seconds and a rising/falling 15s trend.
+    This intentionally does not treat Kalshi's lagging rolling chart as an
+    independent vote. Returns None if any required data are absent/stale.
+    """
+    if not (0 < a.get('seconds', 999) <= 120) or a.get('target') is None:
+        return None
+    now=int(time.time())
+    try:
+        with connect() as c:
+            rows=c.execute('SELECT timestamp,price FROM keke_brti_ticks WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp',
+                           (now-85,now)).fetchall()
+        prices={int(r['timestamp']):float(r['price']) for r in rows}
+        if not prices:return None
+        last=max(prices)
+        if now-last>4:return None
+        window=[prices.get(t) for t in range(last-59,last+1)]
+        if any(x is None for x in window):return None
+        earlier=prices.get(last-15)
+        if earlier is None:return None
+        current=prices[last]
+        avg=sum(window)/60.0
+        target=float(a['target'])
+        # Both raw price and actual rolling average must clear the target.
+        # Margin prevents flipping on a pennies-wide crossing.
+        margin=max(3.0,min(12.0,0.10*float(a.get('volatility') or 0)))
+        side='UP' if current>target+margin and avg>target+margin else ('DOWN' if current<target-margin and avg<target-margin else None)
+        if side is None:return None
+        delta=current-earlier
+        if (side=='UP' and delta<=0) or (side=='DOWN' and delta>=0):return None
+        return {'side':side,'current':current,'rolling':avg,'delta15':delta,'margin':margin}
+    except (sqlite3.Error,ValueError,TypeError,OverflowError,KeyError):
+        return None
+
 def process_v56(a,new_contract):
     if new_contract or state.get('v56_ticker')!=a['ticker']:
         state['v56_ticker']=a['ticker']
@@ -2429,6 +2541,14 @@ def process_v56(a,new_contract):
     a['v56_side']=t['side']
     if signal is None or a['seconds']<=0:return
     candidate=a['v56_candidate']
+    late_cross=late_settlement_cross_evidence(a)
+    a['late_cross_evidence']=late_cross
+    # When real-time price AND its observed 60s mean cross the target with
+    # 15s momentum, allow a timely reversal assessment rather than forcing
+    # the earlier distance/volatility score to clear its usual threshold.
+    if late_cross and t['side'] is not None and late_cross['side']!=t['side']:
+        candidate=late_cross['side']
+        a['v56_candidate']=candidate
     if t['side'] is None:
         # Make a qualifying early call, but don't force a coin-flip on a flat signal.
         if abs(signal)>=V56_INITIAL_SIGNAL:
@@ -2447,7 +2567,8 @@ def process_v56(a,new_contract):
     opposing_chart=(evidence=='aligned away from target' and movement*cand_sign<0)
     candle_evidence=settlement_candle_evidence(a,candidate)
     a['settlement_candle_context']=candle_evidence['context']
-    if candidate==t['side'] or abs(signal)<V56_REVERSAL_SIGNAL or opposing_chart:
+    late_confirmed=bool(late_cross and late_cross['side']==candidate and candidate!=t['side'])
+    if candidate==t['side'] or (abs(signal)<V56_REVERSAL_SIGNAL and not late_confirmed) or (opposing_chart and not late_confirmed):
         t['opposite']=0
         runtime_set('v56_opposite_'+a['ticker'],0)
         runtime_set('v56_opposite_since_'+a['ticker'],0)
@@ -2473,14 +2594,14 @@ def process_v56(a,new_contract):
     # When both completed short timeframes oppose a proposed reversal, don't
     # accelerate it. Require additional persistence instead; a strong target
     # signal can still reverse rather than being permanently vetoed.
-    min_elapsed=6 if corroborated and abs(signal)>=V56_FAST_REVERSAL_SIGNAL else (30 if candle_evidence['opposed'] else 20)
+    min_elapsed=8 if late_confirmed else (6 if corroborated and abs(signal)>=V56_FAST_REVERSAL_SIGNAL else (30 if candle_evidence['opposed'] else 20))
     if now_epoch-first_seen>=min_elapsed and t['opposite']>=V56_REVERSAL_CONFIRM:
         old=t['side'];t['side']=candidate;t['opposite']=0
         runtime_set('v56_opposite_'+a['ticker'],0)
         runtime_set('v56_opposite_since_'+a['ticker'],0)
         a['v56_side']=candidate
         record_v56(a,'REVERSAL',candidate,old,
-                   'Sustained opposite signal; dual-feed '+str(evidence)+'; candles '+candle_evidence['context'])
+                   ('Observed 60s BRTI cross + 15s momentum' if late_confirmed else 'Sustained opposite signal')+'; dual-feed '+str(evidence)+'; candles '+candle_evidence['context'])
         if state['enabled']:send(format_read(a,f'🎯 SETTLEMENT {candidate} • REVERSED {old}'))
 
 def compact_update(a):

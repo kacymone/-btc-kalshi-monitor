@@ -1496,7 +1496,9 @@ def quick_live_text(a):
         import re
         m=re.search(r'(?:^|\| )'+key+r' \$([+-]?[\d,]+(?:\.\d+)?)',changes.get(period,''))
         return value(m.group(1)) if m else None
-    gap=value(fields.get('BRTI − Kalshi'))
+    aligned_b=value(fields.get('BRTI (aligned)'))
+    kalshi=value(fields.get('Kalshi chart'))
+    gap=(aligned_b-kalshi) if aligned_b is not None and kalshi is not None else None
     b15=change('15s','BRTI');b5=change('5s','BRTI')
     k15=change('15s','Kalshi')
     # This is an observed short-term pressure assessment, NOT a settlement flip.
@@ -1509,17 +1511,22 @@ def quick_live_text(a):
     sec=max(0,int(a.get('seconds') or 0))
     side=a.get('v56_side') or 'WAIT'
     header=('🟢 UP' if side=='UP' else '🔴 DOWN' if side=='DOWN' else '👀 WAIT')
+    target=a.get('target')
+    fmt=lambda n: '${:+,.2f}'.format(n) if n is not None else '—'
     lines=[f'{header} • {sec//60}:{sec%60:02d}',
-           '🎯 '+money_text(a.get('target')),
-           'BRTI '+money_text(a.get('btc'))+' ('+('${:+,.2f}'.format(a['distance']) if a.get('distance') is not None else '—')+')',
-           'Kalshi '+fields.get('Kalshi chart','unavailable'),
-           'GAP '+fields.get('BRTI − Kalshi','unavailable')]
+           '',
+           '🎯 Target: '+money_text(target),
+           '📍 BRTI: '+(money_text(aligned_b) if aligned_b is not None else 'unavailable')+' ('+(fmt(aligned_b-float(target)) if aligned_b is not None and target is not None else '—')+')',
+           '📊 Kalshi: '+(money_text(kalshi) if kalshi is not None else 'unavailable')+' ('+(fmt(kalshi-float(target)) if kalshi is not None and target is not None else '—')+')',
+           '',
+           '↔️ GAP: '+(fmt(gap) if gap is not None else 'unavailable'),
+           '']
     if gap is not None and 'stale' not in dashboard.lower():
-        lines.append('vs target: B '+fields.get('BRTI vs target','—')+' | K '+fields.get('Kalshi vs target','—'))
         for period in ('5s','15s','30s'):
             b=change(period,'BRTI');k=change(period,'Kalshi')
             if b is not None and k is not None:
                 lines.append(f'{period} B {b:+.2f} | K {k:+.2f}')
+        lines.append('')
         lines.append(pressure)
         if (side=='UP' and pressure=='🔴 DOWN PRESSURE') or (side=='DOWN' and pressure=='🟢 UP PRESSURE'):
             lines.append('⚠️ REVERSAL WATCH')
@@ -2401,20 +2408,28 @@ def compact_position_gap(a,position):
     ticker=a.get('ticker','')
     secs=a.get('seconds')
     clock=f'{int(secs)//60}:{int(secs)%60:02d}' if secs is not None else '?'
+    aligned_b=numeric('BRTI (aligned)')
+    kalshi=numeric('Kalshi chart')
+    exact_gap=aligned_b-kalshi if aligned_b is not None and kalshi is not None else None
+    target=a.get('target')
+    fmt=lambda n: '${:+,.2f}'.format(n) if n is not None else '—'
+    def compact_change(period):
+        b=movement(period,'BRTI');k=movement(period,'Kalshi')
+        return f'{period}: B {fmt(b)} | K {fmt(k)}' if b is not None and k is not None else f'{period}: collecting'
     result=[f'📍 {position["side"]} • {clock} left • {position["qty"]:g} contracts',
-            f'🎯 Target {money_text(a.get("target"))}',
-            f'BRTI {fields.get("BRTI (aligned)","unavailable")} | Kalshi {fields.get("Kalshi chart","unavailable")}',
-            f'Gap {fields.get("BRTI − Kalshi","unavailable")}',
-            f'vs target: B {fields.get("BRTI vs target","—")} | K {fields.get("Kalshi vs target","—")}',
-            f'5s {changes.get("5s","collecting")}',
-            f'15s {changes.get("15s","collecting")}',
-            f'30s {changes.get("30s","collecting")}',
-            f'60s {changes.get("60s","collecting")}',
-            label,
+            '',
+            f'🎯 Target: {money_text(target)}',
+            f'📍 BRTI: {money_text(aligned_b) if aligned_b is not None else "unavailable"} ({fmt(aligned_b-float(target)) if aligned_b is not None and target is not None else "—"})',
+            f'📊 Kalshi: {money_text(kalshi) if kalshi is not None else "unavailable"} ({fmt(kalshi-float(target)) if kalshi is not None and target is not None else "—"})',
+            '',
+            f'↔️ GAP: {fmt(exact_gap) if exact_gap is not None else "unavailable"}',
+            '',
+            compact_change('5s'),compact_change('15s'),compact_change('30s'),
+            '',label,'',
             f'Bid {ask_text(position["bid"])} | Est. gross {tiny_money(position["gross"])}',
             fields.get('Chart age','')]
     if 'stale' in dashboard.lower() or 'unavailable' in dashboard.lower() or 'collecting timestamped' in dashboard.lower():
-        result[9]='⚠️ Chart data unavailable'
+        result[6]='⚠️ Chart data unavailable'
     return '\n'.join(x for x in result if x)
 
 

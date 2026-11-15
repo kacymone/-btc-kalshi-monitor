@@ -1521,6 +1521,15 @@ def quick_live_text(a):
            '',
            '↔️ GAP: '+(fmt(gap) if gap is not None else 'unavailable'),
            '']
+    # Preserve the already-computed completed-candle support/resistance.
+    import re as _levels_re
+    raw_levels=a.get('brti_levels') or ''
+    sr=dict((name.lower(), price) for name,price in _levels_re.findall(
+        r'(?:BRTI )?(support|resistance)(?: \([^)]*\))?: \(?(\$[\d,]+(?:\.\d+)?)', raw_levels, _levels_re.I))
+    if sr.get('support'): lines.append('🟢 Support: '+sr['support'])
+    if sr.get('resistance'): lines.append('🔴 Resistance: '+sr['resistance'])
+    if not sr: lines.append('🟡 S/R collecting')
+    lines.append('')
     if gap is not None and 'stale' not in dashboard.lower():
         for period in ('5s','15s','30s'):
             b=change(period,'BRTI');k=change(period,'Kalshi')
@@ -1528,6 +1537,9 @@ def quick_live_text(a):
                 lines.append(f'{period} B {b:+.2f} | K {k:+.2f}')
         lines.append('')
         lines.append(pressure)
+        lev=a.get('live_level_evidence') or {}
+        if lev.get('direction'):
+            lines.append(('🟢 ' if lev['direction']=='UP' else '🔴 ')+lev['label'])
         if (side=='UP' and pressure=='🔴 DOWN PRESSURE') or (side=='DOWN' and pressure=='🟢 UP PRESSURE'):
             lines.append('⚠️ REVERSAL WATCH')
     else:
@@ -1806,6 +1818,78 @@ def settlement_average_evidence(a):
         LOG.debug('Settlement average unavailable: %s',type(exc).__name__)
         return neutral
 
+def live_level_evidence(a):
+    """Observed BRTI level breakout/rejection plus paired Kalshi follow-through.
+
+    Only uses historical ticks, completed candle support/resistance, and the
+    already recorded Kalshi chart. Missing data is neutral, never confirmation.
+    """
+    neutral={'score':0.0,'label':'LEVELS COLLECTING','confirmed':False,'direction':None}
+    try:
+        target=a.get('target')
+        price=a.get('btc')
+        if target is None or price is None:return neutral
+        now=int(time.time())
+        with connect() as c:
+            rows=c.execute('SELECT timestamp,price FROM keke_brti_ticks WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp',(now-100,now)).fetchall()
+        ticks={int(r['timestamp']):float(r['price']) for r in rows}
+        if len(ticks)<12:return neutral
+        latest=max(ticks)
+        if now-latest>5:return neutral
+        current=ticks[latest]
+        def near_ago(age):
+            vals=[(abs(t-(latest-age)),v) for t,v in ticks.items() if abs(t-(latest-age))<=3]
+            return min(vals)[1] if vals else None
+        p5,p15,p30=near_ago(5),near_ago(15),near_ago(30)
+        if p5 is None or p15 is None:return neutral
+        # Completed-candle levels from assessment; do not use future candles.
+        levels=a.get('brti_levels') or ''
+        import re
+        def level(kind):
+            m=re.search(r'(?:BRTI )?'+kind+r'(?: \([^)]*\))?:\s*\$([\d,]+(?:\.\d+)?)',levels,re.I)
+            return float(m.group(1).replace(',','')) if m else None
+        support,resistance=level('support'),level('resistance')
+        # Target itself is a genuine settlement-relevant level.
+        relevant=[('TARGET',float(target))]
+        if support is not None:relevant.append(('SUPPORT',support))
+        if resistance is not None:relevant.append(('RESISTANCE',resistance))
+        tolerance=max(2.0,min(10.0,float(a.get('volatility') or 0)*0.08))
+        # A crossing must persist for >=5 observed seconds and have 15s direction.
+        recent=[v for t,v in ticks.items() if latest-5<=t<=latest]
+        if len(recent)<4:return neutral
+        event=None
+        for name,level in relevant:
+            if p15<=level-tolerance and current>=level+tolerance and min(recent)>level:
+                event=('UP','BREAKOUT '+name,level)
+                break
+            if p15>=level+tolerance and current<=level-tolerance and max(recent)<level:
+                event=('DOWN','BREAKDOWN '+name,level)
+                break
+        if event is None:
+            # Rejection: price approaches a level then retreats, without crossing.
+            for name,level in relevant:
+                if p15<level and max(v for t,v in ticks.items() if latest-15<=t<=latest)>=level-tolerance and current<level-tolerance and current<p5-2:
+                    event=('DOWN','REJECTED '+name,level);break
+                if p15>level and min(v for t,v in ticks.items() if latest-15<=t<=latest)<=level+tolerance and current>level+tolerance and current>p5+2:
+                    event=('UP','BOUNCED '+name,level);break
+        if event is None:return neutral
+        direction,label,level=event
+        sign=1 if direction=='UP' else -1
+        if (current-p15)*sign<max(4.0,tolerance):return neutral
+        # Kalshi movement is a *confirmation*, not an assumption of catch-up.
+        adjustment,condition=movement_confirmation(a)
+        kalshi_confirm=(condition in ('aligned away from target','aligned toward target') and adjustment*sign>0)
+        # Require a BRTI 30s trend when available; no invented confirmation.
+        trend_confirm=p30 is not None and (current-p30)*sign>=max(3.0,tolerance)
+        confirmed=bool(kalshi_confirm and trend_confirm)
+        # Small, capped contribution to settlement signal; never a stand-alone flip.
+        score=sign*(0.18 if confirmed else 0.07)
+        return {'score':score,'label':label,'confirmed':confirmed,
+                'direction':direction,'level':level,'brti15':current-p15,
+                'kalshi_confirm':kalshi_confirm}
+    except (sqlite3.Error,ValueError,TypeError,KeyError,OverflowError):
+        return neutral
+
 def settlement_signal(a):
     if a['source']!='BRTI' or a['distance'] is None:
         return None
@@ -1821,6 +1905,8 @@ def settlement_signal(a):
     a['movement_condition']=condition
     a['movement_adjustment']=adjustment
     a['movement_live']=KEKE_MOVEMENT_LIVE
+    level_ev=live_level_evidence(a)
+    a['live_level_evidence']=level_ev
     # Settlement-average math is LIVE, not shadow. In the final minute the
     # already-observed seconds are locked into the eventual arithmetic mean.
     avg=settlement_average_evidence(a)
@@ -1831,11 +1917,11 @@ def settlement_signal(a):
         projected_distance=avg['distance']
         remaining=max(1,avg['remaining'])
         uncertainty=max(6.0,range1*math.sqrt(remaining/60))
-        return projected_distance/uncertainty + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
+        return projected_distance/uncertainty + (adjustment if KEKE_MOVEMENT_LIVE else 0.0) + level_ev['score']
     # Before the final minute, preserve the original target-distance,
     # momentum and movement engine; do not let speculative price
     # extrapolation influence UP/DOWN calls.
-    return a['distance']/scale + drift + (adjustment if KEKE_MOVEMENT_LIVE else 0.0)
+    return a['distance']/scale + drift + (adjustment if KEKE_MOVEMENT_LIVE else 0.0) + level_ev['score']
 
 # Silent experimental model: NEVER changes the live V5.6 predictions or alerts.
 SHADOW_CHECKPOINTS=(720,540,360)  # 12, 9, and 6 minutes left
@@ -2560,11 +2646,10 @@ def settlement_candle_evidence(a, candidate):
             'context':f'1m={one};3m={three};15m={fifteen}'}
 
 def late_settlement_cross_evidence(a):
-    """Observed-price reversal evidence, not an extrapolated future price.
+    """Fresh observed late reversal evidence, tolerating occasional missing BRTI ticks.
 
-    Requires 60 consecutive BRTI seconds and a rising/falling 15s trend.
-    This intentionally does not treat Kalshi's lagging rolling chart as an
-    independent vote. Returns None if any required data are absent/stale.
+    Never mistake the current rolling chart for the future final-minute average.
+    A final-minute call uses the actual observed final-minute readings where available.
     """
     if not (0 < a.get('seconds', 999) <= 120) or a.get('target') is None:
         return None
@@ -2572,26 +2657,26 @@ def late_settlement_cross_evidence(a):
     try:
         with connect() as c:
             rows=c.execute('SELECT timestamp,price FROM keke_brti_ticks WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp',
-                           (now-85,now)).fetchall()
+                           (now-95,now)).fetchall()
         prices={int(r['timestamp']):float(r['price']) for r in rows}
         if not prices:return None
         last=max(prices)
         if now-last>4:return None
-        window=[prices.get(t) for t in range(last-59,last+1)]
-        if any(x is None for x in window):return None
-        earlier=prices.get(last-15)
-        if earlier is None:return None
+        window=[(t,prices[t]) for t in range(last-59,last+1) if t in prices]
+        # The original code demanded exactly 60/60 ticks; one missed tick
+        # disabled late reversal detection entirely. Require broad coverage.
+        if len(window)<48 or window[-1][0]-window[0][0]<55:return None
+        earlier_candidates=[(abs(t-(last-15)),v) for t,v in prices.items() if abs(t-(last-15))<=3]
+        if not earlier_candidates:return None
         current=prices[last]
-        avg=sum(window)/60.0
+        avg=sum(v for _,v in window)/len(window)
         target=float(a['target'])
-        # Both raw price and actual rolling average must clear the target.
-        # Margin prevents flipping on a pennies-wide crossing.
         margin=max(3.0,min(12.0,0.10*float(a.get('volatility') or 0)))
         side='UP' if current>target+margin and avg>target+margin else ('DOWN' if current<target-margin and avg<target-margin else None)
         if side is None:return None
-        delta=current-earlier
+        delta=current-min(earlier_candidates)[1]
         if (side=='UP' and delta<=0) or (side=='DOWN' and delta>=0):return None
-        return {'side':side,'current':current,'rolling':avg,'delta15':delta,'margin':margin}
+        return {'side':side,'current':current,'rolling':avg,'delta15':delta,'margin':margin,'samples':len(window)}
     except (sqlite3.Error,ValueError,TypeError,OverflowError,KeyError):
         return None
 
@@ -2616,6 +2701,7 @@ def process_v56(a,new_contract):
     if late_cross and t['side'] is not None and late_cross['side']!=t['side']:
         candidate=late_cross['side']
         a['v56_candidate']=candidate
+        a['reversal_watch']=True
     if t['side'] is None:
         # Make a qualifying early call, but don't force a coin-flip on a flat signal.
         if abs(signal)>=V56_INITIAL_SIGNAL:
@@ -2635,6 +2721,10 @@ def process_v56(a,new_contract):
     candle_evidence=settlement_candle_evidence(a,candidate)
     a['settlement_candle_context']=candle_evidence['context']
     late_confirmed=bool(late_cross and late_cross['side']==candidate and candidate!=t['side'])
+    level_ev=a.get('live_level_evidence') or {}
+    level_confirmed=bool(level_ev.get('confirmed') and level_ev.get('direction')==candidate)
+    if candidate!=t['side'] and level_ev.get('direction')==candidate:
+        a['reversal_watch']=True
     if candidate==t['side'] or (abs(signal)<V56_REVERSAL_SIGNAL and not late_confirmed) or (opposing_chart and not late_confirmed):
         t['opposite']=0
         runtime_set('v56_opposite_'+a['ticker'],0)
@@ -2661,7 +2751,7 @@ def process_v56(a,new_contract):
     # When both completed short timeframes oppose a proposed reversal, don't
     # accelerate it. Require additional persistence instead; a strong target
     # signal can still reverse rather than being permanently vetoed.
-    min_elapsed=8 if late_confirmed else (6 if corroborated and abs(signal)>=V56_FAST_REVERSAL_SIGNAL else (30 if candle_evidence['opposed'] else 20))
+    min_elapsed=8 if late_confirmed else (10 if level_confirmed and not candle_evidence['opposed'] and abs(signal)>=V56_REVERSAL_SIGNAL else (6 if corroborated and abs(signal)>=V56_FAST_REVERSAL_SIGNAL else (30 if candle_evidence['opposed'] else 20)))
     if now_epoch-first_seen>=min_elapsed and t['opposite']>=V56_REVERSAL_CONFIRM:
         old=t['side'];t['side']=candidate;t['opposite']=0
         runtime_set('v56_opposite_'+a['ticker'],0)

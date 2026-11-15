@@ -969,6 +969,10 @@ def format_read(a, headline=None):
             f'🎯 Target: {money_text(a.get("target"))}\n'
             f'{price_line}\n📏 ${relation}')
 
+def compact_settlement_with_gap(a):
+    """Settlement prediction plus live price gap; no speculative price target."""
+    return quick_live_text(a)
+
 def settlement_live_text(a):
     """Show the live target comparison and settlement arithmetic on /live."""
     avg=a.get('settlement_average') or settlement_average_evidence(a)
@@ -1474,27 +1478,55 @@ def send_stats():
         send('⚠️ Stats unavailable right now; try again shortly.')
 
 def quick_live_text(a):
-    """One-glance Live: observed prices and gap, not a price forecast."""
-    gap=live_gap_dashboard(a)
+    """One glance: settlement call plus observed BRTI/Kalshi movement decision."""
+    dashboard=live_gap_dashboard(a)
     fields={}
-    for line in gap.splitlines():
+    changes={}
+    for line in dashboard.splitlines():
         if ': ' in line:
-            key,val=line.split(': ',1)
-            fields[key]=val
+            k,v=line.split(': ',1)
+            fields[k.strip()]=v.strip()
+        for period in ('5s','15s','30s','60s'):
+            if line.startswith(period+': '):
+                changes[period]=line[len(period)+2:]
+    def value(s):
+        try:return float(str(s).replace('$','').replace(',',''))
+        except (TypeError,ValueError):return None
+    def change(period,key):
+        import re
+        m=re.search(r'(?:^|\| )'+key+r' \$([+-]?[\d,]+(?:\.\d+)?)',changes.get(period,''))
+        return value(m.group(1)) if m else None
+    gap=value(fields.get('BRTI − Kalshi'))
+    b15=change('15s','BRTI');b5=change('5s','BRTI')
+    k15=change('15s','Kalshi')
+    # This is an observed short-term pressure assessment, NOT a settlement flip.
+    pressure='⚪ PRESSURE UNKNOWN'
+    if b15 is not None and k15 is not None and gap is not None:
+        if b15>=3 and (b5 is None or b5>=-2):pressure='🟢 UP PRESSURE'
+        elif b15<=-3 and (b5 is None or b5<=2):pressure='🔴 DOWN PRESSURE'
+        elif abs(b15)<3 and abs(k15)>3:pressure='↔️ KALSHI CATCHING UP'
+        else:pressure='🟡 MIXED MOMENTUM'
     sec=max(0,int(a.get('seconds') or 0))
     side=a.get('v56_side') or 'WAIT'
     header=('🟢 UP' if side=='UP' else '🔴 DOWN' if side=='DOWN' else '👀 WAIT')
-    target=a.get('target')
     lines=[f'{header} • {sec//60}:{sec%60:02d}',
-           '🎯 '+money_text(target),
+           '🎯 '+money_text(a.get('target')),
            'BRTI '+money_text(a.get('btc'))+' ('+('${:+,.2f}'.format(a['distance']) if a.get('distance') is not None else '—')+')',
            'Kalshi '+fields.get('Kalshi chart','unavailable'),
-           'Gap '+fields.get('BRTI − Kalshi','unavailable')]
-    for p in ('5s','15s','30s','60s'):
-        line=next((x for x in gap.splitlines() if x.startswith(p+': ')),None)
-        if line:lines.append(line)
-    if a.get('reversal_watch'):lines.append('⚠️ REVERSAL WATCH')
-    if 'stale' in gap.lower() or 'unavailable' in gap.lower():lines.append('⚠️ Kalshi data stale/unavailable')
+           'GAP '+fields.get('BRTI − Kalshi','unavailable')]
+    if gap is not None and 'stale' not in dashboard.lower():
+        lines.append('vs target: B '+fields.get('BRTI vs target','—')+' | K '+fields.get('Kalshi vs target','—'))
+        for period in ('5s','15s','30s'):
+            b=change(period,'BRTI');k=change(period,'Kalshi')
+            if b is not None and k is not None:
+                lines.append(f'{period} B {b:+.2f} | K {k:+.2f}')
+        lines.append(pressure)
+        if (side=='UP' and pressure=='🔴 DOWN PRESSURE') or (side=='DOWN' and pressure=='🟢 UP PRESSURE'):
+            lines.append('⚠️ REVERSAL WATCH')
+    else:
+        lines.append('⚠️ KALSHI DATA UNAVAILABLE')
+    if a.get('reversal_watch') and '⚠️ REVERSAL WATCH' not in lines:
+        lines.append('⚠️ REVERSAL WATCH')
     return '\n'.join(lines)
 
 def fresh_status():

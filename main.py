@@ -21,6 +21,13 @@ SERIES='KXBTC15M'
 # BRTI is the sole BTC price source; no exchange-price fallback.
 TOKEN=os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT=os.getenv('TELEGRAM_CHAT_ID')
+# Comma-separated numeric Telegram user IDs for read-only signal recipients.
+SIGNAL_USERS={v.strip() for v in os.getenv('KEKE_SIGNAL_USERS','').split(',') if v.strip().isdigit()}
+_TELEGRAM_RECIPIENT=threading.local()
+SIGNAL_KEYBOARD={'keyboard':[[{'text':'📡 LIVE'},{'text':'📊 STATS'}],
+                            [{'text':'📜 HISTORY'},{'text':'❓ HELP'}]],
+                 'resize_keyboard':True,'is_persistent':True}
+
 DATA_DIR=os.getenv('DATA_DIR','/data')
 DB_NAME='kate_btc_watcher.db'
 CHECK_EVERY=max(1.0,float(os.getenv("KEKE_MAIN_POLL_SECONDS","1")))
@@ -891,18 +898,36 @@ def speed_report_csv(snapshot):
     return '\n'.join(lines)+'\n'
 
 def send(message):
+    """Private commands reply only to their requester; unsolicited messages remain admin-only.
+
+    Signal subscribers get a separately vetted subset of market-only notifications.
+    Never mirror account/position/exports or admin settings to signal subscribers.
+    """
     if not TOKEN or not CHAT:
         LOG.info('Telegram unavailable; %s',message)
         return
+    recipient=getattr(_TELEGRAM_RECIPIENT,'chat_id',None)
+    target=recipient or CHAT
+    is_guest=str(target)!=str(CHAT)
     try:
         t0=time.monotonic()
-        tg('sendMessage',chat_id=CHAT,text=message,reply_markup=json.dumps(KEYBOARD))
+        tg('sendMessage',chat_id=target,text=message,
+           reply_markup=json.dumps(SIGNAL_KEYBOARD if is_guest else KEYBOARD))
         ctx=getattr(_LATENCY_CONTEXT,'current',None)
-        if ctx is not None:
+        if ctx is not None and not is_guest:
             ctx['alert_count']=ctx.get('alert_count',0)+1
             ctx.setdefault('first_alert_api_ms',(time.monotonic()-t0)*1000)
             ctx.setdefault('processing_to_first_call_ms',(t0-ctx['brti_received_mono'])*1000 if 'brti_received_mono' in ctx else None)
             ctx.setdefault('first_alert_send_ms',(t0-ctx['brti_received_mono'])*1000 if 'brti_received_mono' in ctx else None)
+        # Only automatic, explicitly recognized settlement/market notifications.
+        # Command replies never fan out, and position/account messages are excluded.
+        if recipient is None and SIGNAL_USERS and message.startswith((
+            '🎯 SETTLEMENT ', '🆕 NEW CONTRACT', '📡 UP ', '📡 DOWN ',
+            '📡 WAIT ', '⚠️ UP PICK AT RISK', '⚠️ DOWN PICK AT RISK')):
+            for guest_id in SIGNAL_USERS:
+                if guest_id==str(CHAT):continue
+                try:tg('sendMessage',chat_id=guest_id,text=message,reply_markup=json.dumps(SIGNAL_KEYBOARD))
+                except Exception:LOG.warning('Signal delivery failed for authorized subscriber')
     except Exception: LOG.exception('Telegram send failed')
 
 def money_text(x): return f'${x:,.2f}' if x is not None else 'UNKNOWN'
@@ -1652,8 +1677,22 @@ def failed_reversal_report():
             f"Opening patterns observed: {len(rows)}\nCandidates: {len(candidates)}\n"
             f"No graded candidates yet. No trading recommendation.")
 
-def handle_telegram_command(cmd):
+def handle_telegram_command(cmd, requester=None, guest=False):
+    _TELEGRAM_RECIPIENT.chat_id=requester
     try:
+        if cmd.startswith('/id'):
+            send('🆔 Your Telegram ID: '+str(requester))
+            return
+        if guest:
+            allowed={'/start','/help','/market','/live','/stats','/last',
+                     '📡 live','📊 stats','📜 history','❓ help'}
+            if cmd not in allowed:
+                send('🔒 Signal-only access. Available: /live, /stats, /last, /help.')
+                return
+            if cmd=='/start':
+                send('💚 Welcome to KeKe signals! Use /live, /stats, or /last. Alerts are informational, not guaranteed trades.')
+                return
+        
         cmd={'👀 status':'/status','🧠 market read':'/market','📊 stats':'/stats',
              '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop',
              '📡 live':'/market','📍 position':'/position','📜 history':'/last',
@@ -1695,6 +1734,8 @@ def handle_telegram_command(cmd):
     except Exception:
         LOG.exception('Telegram command handler error for %s',cmd)
         send('⚠️ Command failed. Try again; monitoring continues.')
+    finally:
+        _TELEGRAM_RECIPIENT.chat_id=None
 
 _LIVE_REQUEST_LOCK=threading.Lock()
 _LIVE_REQUEST_AT=0.0
@@ -1722,15 +1763,25 @@ def telegram_commands():
         state['offset']=upd['update_id']+1
         runtime_set('telegram_offset',state['offset'])
         msg=upd.get('message') or {}
-        if str((msg.get('chat') or {}).get('id'))!=str(CHAT):continue
+        chat_id=str((msg.get('chat') or {}).get('id'))
+        sender_id=str((msg.get('from') or {}).get('id'))
+        # In private chats, sender and chat ID must match. Never allow group use.
+        if chat_id!=sender_id:continue
+        admin=(chat_id==str(CHAT))
+        guest=(sender_id in SIGNAL_USERS and not admin)
         cmd=str(msg.get('text') or '').strip().lower()
+        if not admin and not guest:
+            if cmd.startswith('/id'):
+                try:tg('sendMessage',chat_id=chat_id,text='🆔 Your Telegram ID: '+sender_id+'\nAsk the owner to authorize this ID.')
+                except Exception:LOG.warning('Could not reply to /id')
+            continue
         if cmd in ('📡 live','/live','/market'):
             # A burst of button taps should get one timely answer, not queue old responses.
             with _LIVE_REQUEST_LOCK:
                 now=time.monotonic()
                 if now-_LIVE_REQUEST_AT<1.5:continue
                 _LIVE_REQUEST_AT=now
-        _COMMAND_POOL.submit(handle_telegram_command,cmd)
+        _COMMAND_POOL.submit(handle_telegram_command,cmd,chat_id,guest)
 
 def telegram_command_worker():
     """Telegram intake stays responsive while individual commands do network/database work."""
@@ -1757,7 +1808,8 @@ def initialize_telegram():
             {'command':'start','description':'Wake: resume alerts'},
             {'command':'settings','description':'Advanced research controls'},
             {'command':'help','description':'KeKe menu help'},
-            {'command':'confidence','description':'Experimental confidence explanation'}]))
+            {'command':'confidence','description':'Experimental confidence explanation'},
+            {'command':'id','description':'Show your Telegram user ID'}]))
     except Exception:LOG.exception('Telegram setup error')
 
 # V5.6 uses BRTI distance relative to volatility and time to settlement.

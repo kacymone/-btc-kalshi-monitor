@@ -50,6 +50,17 @@ def num(x):
         return None
 
 
+def payout_multiplier(ask):
+    """Gross $1 settlement payout / current ask, before fees and slippage."""
+    price = num(ask)
+    return 1 / price if price is not None and 0 < price <= 1 else None
+
+
+def multiplier_label(ask):
+    mult = payout_multiplier(ask)
+    return f'{mult:.2f}×' if mult is not None else '—'
+
+
 def stamp(value):
     try:
         return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
@@ -384,7 +395,7 @@ def decide(ind, market, book, now):
     if ask is None or bid is None or qty is None or qty < 1:
         ind.update(action='WAIT', reason='No confirmed one-contract liquidity')
     elif ask > MAX_ASK:
-        ind.update(action='WATCH ' + side, reason=f'Contract too expensive: {ask:.0%} ask')
+        ind.update(action='WATCH ' + side, reason=f'Payout multiplier {multiplier_label(ask)} below {multiplier_label(MAX_ASK)} minimum')
     elif ask - bid > MAX_SPREAD:
         ind.update(action='WATCH ' + side, reason=f'Wide spread: {ask - bid:.0%}')
     else:
@@ -448,23 +459,60 @@ class Bot:
         s = self.snap()
         m, r = s.get('market'), s.get('read')
         if not m or not r:
-            return '⚪ KEKE BTC 15M • WAIT\nCollecting market and indicator data'
+            return '👁️ KEKE | BTC 15M\n⚪ WAIT\n\n⏳ Collecting fresh market and indicator data'
+
         now = time.time()
         seconds = max(0, int(stamp(m['close_time']) - now))
         stale = now - s['market_at'] > 12 or now - s['brti_at'] > 12
         action = 'WAIT' if stale else r['action']
         book = s.get('book') or {}
         book_ok = book.get('ticker') == m['ticker'] and now - book.get('at', 0) <= 6
-        def usd(x): return '—' if x is None else f'${x:,.2f}'
-        def cent(x): return '—' if x is None else f'{x*100:.0f}¢'
+
+        def usd(x):
+            value = num(x)
+            return f'${value:,.2f}' if value is not None else '—'
+
+        btc, strike = num(r.get('btc')), num(r.get('target'))
+        if btc is None or strike is None:
+            distance = 'Distance unavailable'
+        else:
+            difference = btc - strike
+            direction = 'ABOVE' if difference > 0 else 'BELOW' if difference < 0 else 'AT'
+            symbol = '🔺' if difference > 0 else '🔻' if difference < 0 else '➖'
+            distance = f'{symbol} {usd(abs(difference))} {direction} target'
+
+        up = multiplier_label(book.get('yes_ask')) if book_ok else '—'
+        down = multiplier_label(book.get('no_ask')) if book_ok else '—'
+        state_icon = '🟢' if action == 'ENTER UP' else '🔴' if action == 'ENTER DOWN' else '🟡' if action.startswith('WATCH') else '⚪'
+        verdict = '✅ ENTRY SIGNAL' if action.startswith('ENTER') else '👀 WATCH ONLY' if action.startswith('WATCH') else '⏸️ NO ENTRY'
+        reason = 'Stale feed — no entry' if stale else r.get('reason', 'No confirmed setup')
+
         return '\n'.join([
-            f"{'🟢' if action == 'ENTER UP' else '🔴' if action == 'ENTER DOWN' else '⚪'} KEKE • {action} • {seconds//60}:{seconds%60:02d}",
-            f"15M: {r['trend15']} | 3M: {r['setup3']} | 1M: {r['confirm1']}",
-            f"BRTI {usd(r.get('btc'))} | Target {usd(r.get('target'))}",
-            f"Support {usd(r.get('support'))} | Resistance {usd(r.get('resistance'))}",
-            f"Kalshi UP {cent(book.get('yes_ask') if book_ok else None)} / DOWN {cent(book.get('no_ask') if book_ok else None)}",
-            ('⚠️ Stale feed • no entry' if stale else r['reason']),
-            'Research-stage alerts • no automatic orders'])
+            '👁️ KEKE | BTC 15M',
+            f'{state_icon} {action}  •  ⏳ {seconds//60}:{seconds%60:02d} LEFT',
+            '',
+            '📊 INDICATORS',
+            f"15M Trend: {r['trend15']}",
+            f"3M Setup: {r['setup3']}",
+            f"1M Momentum: {r['confirm1']}",
+            '',
+            '🎯 BTC vs TARGET',
+            f'BTC: {usd(btc)}',
+            f'Target: {usd(strike)}',
+            distance,
+            '',
+            '💰 PAYOUT MULTIPLIERS',
+            f'🟢 UP: {up}',
+            f'🔴 DOWN: {down}',
+            'Gross if correct • before fees',
+            '',
+            '🧱 KEY LEVELS',
+            f"Support: {usd(r.get('support'))}",
+            f"Resistance: {usd(r.get('resistance'))}",
+            '',
+            verdict,
+            reason,
+        ])
 
     def position_text(self):
         s = self.snap()
@@ -559,7 +607,7 @@ class Bot:
                     elif cmd == 'history':
                         self.send(self.history_text())
                     elif cmd == 'settings':
-                        self.send(f'⚙️ Alerts: {"ON" if self.awake else "OFF"}\nMax ask {MAX_ASK:.0%} • Max spread {MAX_SPREAD:.0%}\n15m / 3m / 1m indicator mode')
+                        self.send(f'⚙️ Alerts: {"ON" if self.awake else "OFF"}\nMinimum payout: {multiplier_label(MAX_ASK)} gross • Max spread {MAX_SPREAD:.0%}\n15m / 3m / 1m indicator mode')
                     elif cmd in ('wake', 'sleep'):
                         self.awake = cmd == 'wake'
                         set_setting('awake', self.awake)
@@ -715,4 +763,3 @@ if __name__ == '__main__':
         raise SystemExit('Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway')
     setup()
     Bot().run()
-

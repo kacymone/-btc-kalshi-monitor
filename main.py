@@ -1,4 +1,4 @@
-"""KeKe Stability Window model — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe V5.6 RESTORED (final-five-minute BRTI settlement engine and original reversal rules).
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -25,7 +25,7 @@ CHAT=os.getenv('TELEGRAM_CHAT_ID')
 SIGNAL_USERS={v.strip() for v in os.getenv('KEKE_SIGNAL_USERS','').split(',') if v.strip().isdigit()}
 _TELEGRAM_RECIPIENT=threading.local()
 SIGNAL_KEYBOARD={'keyboard':[[{'text':'📡 LIVE'},{'text':'📊 STATS'}],
-                            [{'text':'📚 BOOK'},{'text':'📜 HISTORY'}]],
+                            [{'text':'📜 HISTORY'},{'text':'❓ HELP'}]],
                  'resize_keyboard':True,'is_persistent':True}
 
 DATA_DIR=os.getenv('DATA_DIR','/data')
@@ -181,6 +181,19 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS keke_position_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL, event TEXT NOT NULL, side TEXT, old_qty REAL, new_qty REAL, recorded_at INTEGER NOT NULL, UNIQUE(ticker,event,recorded_at))')
         c.execute('CREATE TABLE IF NOT EXISTS keke_opening_health (ticker TEXT PRIMARY KEY, first_seen INTEGER, first_seconds INTEGER, had_history INTEGER NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS keke_v518_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL, event TEXT NOT NULL, captured_at INTEGER NOT NULL, detail TEXT)')
+        # A distinct data cohort; never migrate older or experimental model predictions into this table.
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_restored_v56_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL,
+            captured_at INTEGER NOT NULL, seconds_left INTEGER NOT NULL,
+            event TEXT NOT NULL, side TEXT NOT NULL, previous_side TEXT,
+            signal REAL, ask REAL, target REAL, brti REAL, reason TEXT,
+            official_side TEXT, grade TEXT NOT NULL DEFAULT 'PENDING',graded_at INTEGER,
+            model_version TEXT NOT NULL DEFAULT 'V56-5MIN-RESTORED')''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_restored_calls_ticker ON keke_restored_v56_calls(ticker,captured_at,id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_restored_calls_pending ON keke_restored_v56_calls(grade,ticker)')
+        c.execute('''CREATE TABLE IF NOT EXISTS keke_restored_observed (
+            ticker TEXT PRIMARY KEY, first_seen INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL, called INTEGER NOT NULL DEFAULT 0)''')
 
 
 def runtime_get(key, default=None):
@@ -528,13 +541,12 @@ def grade_settlements():
             UNION SELECT ticker FROM v53_opportunities WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_thesis_events WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_v56_forecasts WHERE grade='PENDING'
+            UNION SELECT ticker FROM keke_restored_v56_calls WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_shadow_predictions WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_v527_checkpoints WHERE grade='PENDING'
             UNION SELECT ticker FROM keke_locked_forecasts WHERE grade='PENDING'
-            UNION SELECT ticker FROM keke_stability_calls WHERE grade='PENDING'
-            UNION SELECT ticker FROM keke_stability_markets WHERE status='OBSERVED' AND last_seen<?
             UNION SELECT ticker FROM keke_consensus_predictions WHERE grade='PENDING'
-        ) ORDER BY ticker LIMIT ?''',(int(time.time())-1200,GRADE_BATCH)).fetchall()
+        ) ORDER BY ticker LIMIT ?''',(GRADE_BATCH,)).fetchall()
     verified_now=0
     newly_finalized=[]
     notices=[]
@@ -550,7 +562,6 @@ def grade_settlements():
         now=int(time.time())
         with connect() as c:
             if outcome=='UNGRADABLE':
-                stability_grade(ticker,outcome,now)
                 research_grade(ticker,outcome,now)
                 failed_reversal_grade(ticker,outcome)
                 c.execute("UPDATE keke_v527_checkpoints SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
@@ -559,9 +570,9 @@ def grade_settlements():
                 c.execute("UPDATE v53_opportunities SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE keke_thesis_events SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE keke_v56_forecasts SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
+                c.execute("UPDATE keke_restored_v56_calls SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 c.execute("UPDATE keke_shadow_predictions SET grade='UNGRADABLE',graded_at=? WHERE ticker=? AND grade='PENDING'",(now,ticker))
                 continue
-            stability_grade(ticker,outcome,now)
             research_grade(ticker,outcome,now)
             failed_reversal_grade(ticker,outcome)
             v527_grade(ticker,outcome,now)
@@ -585,6 +596,10 @@ def grade_settlements():
             new_v56=c.execute("SELECT * FROM keke_v56_forecasts WHERE ticker=? AND grade='PENDING' ORDER BY id",(ticker,)).fetchall()
             c.execute('''UPDATE keke_v56_forecasts SET grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
                 official_side=?,graded_at=? WHERE ticker=? AND grade='PENDING' ''',(outcome,outcome,now,ticker))
+            c.execute('''UPDATE keke_restored_v56_calls SET
+                grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
+                official_side=?,graded_at=? WHERE ticker=? AND grade='PENDING' ''',
+                (outcome,outcome,now,ticker))
             c.execute("""UPDATE keke_shadow_predictions
                 SET grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
                     official_side=?,graded_at=? WHERE ticker=? AND grade='PENDING'""",
@@ -835,8 +850,7 @@ def menu_settings():
 
 def menu_help():
     return ('❓ KEKE HELP\n'
-            '📡 Live: current call or WAIT | 📚 /book: Coinbase depth (informational)\n'
-            '📊 Stats: verified new-model results | 📚 /legacy: old model\n'
+            '📡 Live: fresh market read | 📊 Stats: verified results\n'
             '📍 Position: current position | 📜 History: latest settlement pick\n'
             '😴 Sleep / ☀️ Wake: pause or resume alerts\n'
             '⚙️ Settings: advanced research controls\n'
@@ -1485,31 +1499,38 @@ def health_status():
 
 
 def send_stats():
-    """Stats only from the actual active Stability Model, never legacy forecasts."""
+    """Grade initial, last and reversal outcomes independently, once per market for calls."""
     try:
         with connect() as c:
-            markets=c.execute("SELECT ticker,status FROM keke_stability_markets WHERE model_version=?",(STABILITY_VERSION,)).fetchall()
-            rows=c.execute("SELECT checkpoint,side,grade FROM keke_stability_calls WHERE model_version=?",(STABILITY_VERSION,)).fetchall()
-            reversals=c.execute("SELECT COUNT(*) n, SUM(CASE WHEN grade='WIN' THEN 1 ELSE 0 END) wins, SUM(CASE WHEN grade='LOSS' THEN 1 ELSE 0 END) losses FROM keke_stability_calls WHERE model_version=? AND checkpoint LIKE 'REVERSAL%'",(STABILITY_VERSION,)).fetchone()
-        def accuracy(stage):
-            selected=[r for r in rows if r['checkpoint']==stage]
-            w=sum(r['grade']=='WIN' for r in selected); l=sum(r['grade']=='LOSS' for r in selected)
-            pending=sum(r['grade']=='PENDING' for r in selected)
-            return f'{w}/{w+l} ({100*w/(w+l):.1f}%) • {pending} pending' if w+l else f'Pending ({pending} awaiting settlement)' if pending else 'Pending (no graded calls)'
-        up=sum(r['checkpoint'] in ('FIRST','5:00') and r['side']=='UP' and r['grade'] in ('WIN','LOSS') for r in rows)
-        down=sum(r['checkpoint'] in ('FIRST','5:00') and r['side']=='DOWN' and r['grade'] in ('WIN','LOSS') for r in rows)
-        observed=len(markets); called=sum(m['status']=='CALLED' for m in markets); skipped=sum(m['status']=='SKIPPED' for m in markets)
-        send('📊 KEKE | STABILITY MODEL\nNew model • '+STABILITY_VERSION+'\n\n'
-             'First call (7:30–5:00) accuracy\n'+accuracy('FIRST')+'\n\n'
-             '5:00 accuracy\n'+accuracy('5:00')+'\n\n'
-             'Final call accuracy\n'+accuracy('FINAL')+'\n\n'
-             f'Reversal alerts\n{reversals["n"] or 0} recorded • {reversals["wins"] or 0} correct / {reversals["losses"] or 0} incorrect\n\n'
-             f'UP predictions\n{up} graded\n\nDOWN predictions\n{down} graded\n\n'
-             f'Markets observed / called / skipped\n{observed} / {called} / {skipped}\n\n'
-             '/legacy = previous model history. Accuracy ≠ trading profit.')
+            rows=c.execute("SELECT * FROM keke_restored_v56_calls ORDER BY ticker,captured_at,id").fetchall()
+            observed=c.execute('SELECT ticker,called FROM keke_restored_observed').fetchall()
+        grouped={}
+        for row in rows:grouped.setdefault(row['ticker'],[]).append(row)
+        first=[next((r for r in events if r['event']=='INITIAL'),None) for events in grouped.values()]
+        first=[r for r in first if r]
+        final=[events[-1] for events in grouped.values()]
+        reversals=[r for events in grouped.values() for r in events if r['event']=='REVERSAL']
+        def score(items):
+            w=sum(r['grade']=='WIN' for r in items)
+            l=sum(r['grade']=='LOSS' for r in items)
+            pending=sum(r['grade']=='PENDING' for r in items)
+            return (f'{w}W/{l}L ({100*w/(w+l):.1f}%)' if w+l else 'Pending')+f' • {pending} ungraded'
+        observed_count=len(observed)
+        called_count=sum(bool(r['called']) for r in observed)
+        send('📊 KEKE | ORIGINAL 5-MIN MODEL\n\n'
+             'V56-5MIN-RESTORED\n'
+             f'🎯 First call: {score(first)}\n'
+             f'🏁 Final call: {score(final)}\n'
+             f'🔄 Reversal alerts: {len(reversals)} • {score(reversals)}\n'
+             f'📈 UP first calls: {sum(r["side"]=="UP" for r in first)}\n'
+             f'📉 DOWN first calls: {sum(r["side"]=="DOWN" for r in first)}\n'
+             f'👀 Observed / called / skipped-so-far: {observed_count} / {called_count} / {observed_count-called_count}\n\n'
+             'Skipped-so-far includes currently open markets still waiting for a signal. '
+             'Each initial and final call counts once per market. '
+             'Historical stats: /legacy. Accuracy ≠ trading profit.')
     except Exception:
-        LOG.exception('Stability stats failed')
-        send('⚠️ Stability statistics unavailable.')
+        LOG.exception('Restored stats failed')
+        send('⚠️ Restored-model stats unavailable; check logs.')
 
 def quick_live_text(a):
     """One glance: settlement call plus observed BRTI/Kalshi movement decision."""
@@ -1683,18 +1704,18 @@ def handle_telegram_command(cmd, requester=None, guest=False):
             send('🆔 Your Telegram ID: '+str(requester))
             return
         if guest:
-            allowed={'/start','/help','/market','/live','/stats','/last','/book',
-                     '📡 live','📊 stats','📚 book','📜 history','❓ help'}
+            allowed={'/start','/help','/market','/live','/stats','/last',
+                     '📡 live','📊 stats','📜 history','❓ help'}
             if cmd not in allowed:
-                send('🔒 Signal-only access. Available: /live, /book, /stats, /last, /help.')
+                send('🔒 Signal-only access. Available: /live, /stats, /last, /help.')
                 return
             if cmd=='/start':
-                send('💚 Welcome to KeKe signals! Use /live, /book, /stats, or /last. Alerts are informational, not guaranteed trades.')
+                send('💚 Welcome to KeKe signals! Use /live, /stats, or /last. Alerts are informational, not guaranteed trades.')
                 return
         
         cmd={'👀 status':'/status','🧠 market read':'/market','📊 stats':'/stats',
              '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop',
-             '📡 live':'/market','📚 book':'/book','📍 position':'/position','📜 history':'/last',
+             '📡 live':'/market','📍 position':'/position','📜 history':'/last',
              '😴 sleep':'/stop','☀️ wake':'/start','⚙️ settings':'/settings',
              '❓ help':'/help'}.get(cmd,cmd)
         if cmd.startswith('/stop'):
@@ -1709,9 +1730,8 @@ def handle_telegram_command(cmd, requester=None, guest=False):
         elif cmd.startswith('/market') or cmd.startswith('/live'):
             send(responsive_live_status())
         elif cmd.startswith('/stats'):send_stats()
-        elif cmd.startswith('/book'):send(coinbase_book_report())
-        elif cmd.startswith('/exchange'):send(exchange_report())
-        elif cmd.startswith('/lead'):send(exchange_research_report())
+        elif cmd.startswith('/exchange'):send('Coinbase and exchange observers are disabled. KeKe uses BRTI and Kalshi only.')
+        elif cmd.startswith('/lead'):send('Exchange lead/lag observer disabled in this model.')
         elif cmd.startswith('/audit'):send(audit_report())
         elif cmd.startswith('/research'):send(research_stats_report())
         elif cmd.startswith('/earlyresearch'):send(failed_reversal_report())
@@ -1749,12 +1769,9 @@ def responsive_live_status():
     stamp=state.get('current_brti_stamp')
     age=time.time()-float(stamp) if stamp else None
     freshness=('BRTI source age: %.1fs'%age) if age is not None else 'BRTI source age: unknown'
-    features=a.get('stability_features')
     if age is None or age>8:
-        return '⚠️ LIVE DATA STALE • '+freshness+'\nLast forecast is NOT a fresh trading signal.'
-    if features:
-        return stability_format(a,features,a.get('stability_side') or 'WAIT','LIVE')
-    return '📡 LIVE • '+freshness+'\n⚪ WAIT: no qualifying prediction yet (7:30–5:00 window; may skip).\n'+coinbase_summary(coinbase_book())
+        return '⚠️ LIVE DATA STALE • '+freshness+'\nLast forecast is NOT a fresh trading signal.\n'+quick_live_text(a)
+    return '📡 LIVE • '+freshness+'\n'+quick_live_text(a)
 
 def telegram_commands():
     global _LIVE_REQUEST_AT
@@ -1817,7 +1834,7 @@ def initialize_telegram():
 
 # V5.6 uses BRTI distance relative to volatility and time to settlement.
 # This is a directional research signal, NOT a calibrated win probability.
-V56_FIRST_MIN_SECONDS=600
+V56_FIRST_MIN_SECONDS=300
 V56_INITIAL_SIGNAL=0.45
 INITIAL_PICK_MIN_SECONDS=720  # opening three minutes of each 900-second contract
 V527_EARLY_COVERAGE_GOAL=.60
@@ -2811,7 +2828,8 @@ def portfolio_poll(m,a,read):
         refresh_position_message(ticker,a,position)
         portfolio_state['gap_sent_at'][ticker]=now
     # Compare the position to the SETTLEMENT prediction, not the disabled scalp model.
-    predicted=a.get('stability_side') if a.get('ticker')==ticker else None
+    prediction=state.get('v56') or {}
+    predicted=prediction.get('side') if state.get('v56_ticker')==ticker else None
     position_exit_alert(position,a,{'settlement_side':predicted})
 
 
@@ -2836,18 +2854,21 @@ def portfolio_status():
         return '⚠️ Position lookup failed: '+detail+'\nNo orders placed. Check Railway logs.'
 
 def load_v56(ticker):
+    '''Restore only this version's own prior calls, never old or experimental forecasts.'''
     with connect() as c:
-        rows=c.execute("SELECT * FROM keke_v56_forecasts WHERE ticker=? ORDER BY id",(ticker,)).fetchall()
+        rows=c.execute('SELECT side FROM keke_restored_v56_calls WHERE ticker=? ORDER BY id',(ticker,)).fetchall()
     side=rows[-1]['side'] if rows else None
-    return {'side':side,'opposite':runtime_get('v56_opposite_'+ticker,0)}
+    return {'side':side,'opposite':runtime_get('restored_opposite_'+ticker,0)}
 
 def record_v56(a,event,side,previous=None,reason=''):
+    '''Record immutable timestamped checkpoint/reversal events in this model only.'''
     with connect() as c:
-        c.execute('''INSERT INTO keke_v56_forecasts
+        c.execute('''INSERT INTO keke_restored_v56_calls
             (ticker,captured_at,seconds_left,event,side,previous_side,signal,ask,target,brti,reason)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
-            (a['ticker'],a['at'],a['seconds'],event,side,previous,
-             a['v56_signal'],a['asks'].get(side),a['target'],a['btc'],reason))
+            (a['ticker'],int(a['at']),int(a['seconds']),event,side,previous,
+             a.get('v56_signal'),a.get('asks',{}).get(side),a.get('target'),a.get('btc'),reason))
+        c.execute('UPDATE keke_restored_observed SET called=1 WHERE ticker=?',(a['ticker'],))
 
 def settlement_candle_evidence(a, candidate):
     """Completed 1m/3m/15m BRTI structure; no future candles or invented volume.
@@ -2900,17 +2921,25 @@ def late_settlement_cross_evidence(a):
         return None
 
 def process_v56(a,new_contract):
+    now=int(time.time())
+    with connect() as c:
+        c.execute('''INSERT INTO keke_restored_observed(ticker,first_seen,last_seen)
+            VALUES (?,?,?) ON CONFLICT(ticker) DO UPDATE SET last_seen=excluded.last_seen''',
+            (a['ticker'],now,now))
     if new_contract or state.get('v56_ticker')!=a['ticker']:
         state['v56_ticker']=a['ticker']
         state['v56']=load_v56(a['ticker'])
-        runtime_set('v56_opposite_since_'+a['ticker'],0)
+        runtime_set('restored_opposite_since_'+a['ticker'],0)
     t=state['v56']
     signal=settlement_signal(a)
     a['v56_signal']=signal
     a['v56_candidate']=('UP' if signal>0 else 'DOWN') if signal is not None and signal!=0 else None
     a['v56_side']=t['side']
     a['reversal_watch']=bool(t['side'] in ('UP','DOWN') and a['v56_candidate'] in ('UP','DOWN') and a['v56_candidate']!=t['side'] and signal is not None and abs(signal)>=V56_REVERSAL_SIGNAL*0.65)
-    if signal is None or a['seconds']<=0:return
+    # Observe throughout the market, but make NO initial or reversal calls before 5:00.
+    # Keep using the original settlement_signal (distance / time-scaled range,
+    # capped momentum, BRTI levels, observed final-minute averaging).
+    if a['seconds']>V56_FIRST_MIN_SECONDS or signal is None or a['seconds']<=0:return
     candidate=a['v56_candidate']
     late_cross=late_settlement_cross_evidence(a)
     a['late_cross_evidence']=late_cross
@@ -2922,9 +2951,9 @@ def process_v56(a,new_contract):
         a['v56_candidate']=candidate
         a['reversal_watch']=True
     if t['side'] is None:
-        # Make a qualifying early call, but don't force a coin-flip on a flat signal.
+        # First qualifying call anytime in the final 5 minutes. WAIT otherwise.
         if abs(signal)>=V56_INITIAL_SIGNAL:
-            event='INITIAL' if INITIAL_PICK_MIN_SECONDS<=a['seconds']<=900 else 'LATE'
+            event='INITIAL'
             t['side']=candidate
             a['v56_side']=candidate
             record_v56(a,event,candidate,reason='First qualifying settlement signal')
@@ -2954,16 +2983,16 @@ def process_v56(a,new_contract):
         a['reversal_watch']=True
     if candidate==t['side'] or (abs(signal)<V56_REVERSAL_SIGNAL and not late_confirmed and not (late_cross and late_cross['side']==candidate)) or (opposing_chart and not late_confirmed and not (late_cross and late_cross['side']==candidate)):
         t['opposite']=0
-        runtime_set('v56_opposite_'+a['ticker'],0)
-        runtime_set('v56_opposite_since_'+a['ticker'],0)
+        runtime_set('restored_opposite_'+a['ticker'],0)
+        runtime_set('restored_opposite_since_'+a['ticker'],0)
         return
-    first_seen=runtime_get('v56_opposite_since_'+a['ticker'],0)
+    first_seen=runtime_get('restored_opposite_since_'+a['ticker'],0)
     now_epoch=int(time.time())
     if not first_seen or first_seen>now_epoch:
         first_seen=now_epoch
-        runtime_set('v56_opposite_since_'+a['ticker'],first_seen)
+        runtime_set('restored_opposite_since_'+a['ticker'],first_seen)
     t['opposite']+=1
-    runtime_set('v56_opposite_'+a['ticker'],t['opposite'])
+    runtime_set('restored_opposite_'+a['ticker'],t['opposite'])
     corroborated=(
         KEKE_MOVEMENT_LIVE
         and candle_evidence['aligned']
@@ -2981,8 +3010,8 @@ def process_v56(a,new_contract):
     min_elapsed=8 if late_confirmed else (10 if level_confirmed and not candle_evidence['opposed'] and abs(signal)>=V56_REVERSAL_SIGNAL else (6 if corroborated and abs(signal)>=V56_FAST_REVERSAL_SIGNAL else (30 if candle_evidence['opposed'] else 20)))
     if now_epoch-first_seen>=min_elapsed and t['opposite']>=V56_REVERSAL_CONFIRM:
         old=t['side'];t['side']=candidate;t['opposite']=0
-        runtime_set('v56_opposite_'+a['ticker'],0)
-        runtime_set('v56_opposite_since_'+a['ticker'],0)
+        runtime_set('restored_opposite_'+a['ticker'],0)
+        runtime_set('restored_opposite_since_'+a['ticker'],0)
         a['v56_side']=candidate
         record_v56(a,'REVERSAL',candidate,old,
                    ('Observed 60s BRTI cross + 15s momentum' if late_confirmed else 'Sustained opposite signal')+'; dual-feed '+str(evidence)+'; candles '+candle_evidence['context'])
@@ -3006,7 +3035,7 @@ def compact_update(a):
             f'{a.get("brti_levels", "S/R collecting")}')
 
 def proactive_updates(a, new_contract):
-    if not state['enabled'] or a['source']!='BRTI':return
+    if not state['enabled'] or a['source']!='BRTI' or a['seconds']>300:return
     ticker=a['ticker'];now=time.time()
     if new_contract or state.get('heartbeat_ticker')!=ticker:
         state['heartbeat_ticker']=ticker
@@ -3036,20 +3065,18 @@ def proactive_updates(a, new_contract):
 
 def send_last():
     with connect() as c:
-        row=c.execute("""SELECT * FROM keke_stability_calls WHERE model_version=?
-            AND checkpoint!='FINAL' ORDER BY captured_at DESC,id DESC LIMIT 1""",(STABILITY_VERSION,)).fetchone()
-    if row is None:
-        send('🕒 No Stability Model calls recorded yet.');return
-    send(f'🕒 STABILITY MODEL • {row["ticker"]}\n'
-         f'LAST {row["checkpoint"]}: {row["side"]}\n'
-         f'⏱ {row["seconds_left"]}s remaining • Result: {row["grade"]}')
+        row=c.execute("SELECT * FROM keke_restored_v56_calls WHERE event IN ('INITIAL','REVERSAL') ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:send('🕒 No confirmed thesis yet.');return
+    current=state.get('ticker')
+    label='CURRENT' if row['ticker']==current else 'PREVIOUS CONTRACT'
+    send(f'🕒 {label} • {row["ticker"]}\nLAST THESIS: {row["side"]} ({row["event"]})\n🎯 Target: {money_text(row["target"])}\n'
+         f'⏱ At {row["seconds_left"]}s remaining • {ask_text(row["ask"])}\nResult: {row["grade"]}')
 
 # Exchange lead/lag experiment — strictly observational, never used by settlement_signal.
 # The feeds below are public endpoints; access and instrument availability vary.
-EXCHANGE_NAMES=('Coinbase','Kraken','Bitstamp','Gemini','LMAX Digital','Bullish','Crypto.com')
+EXCHANGE_NAMES=('Kraken','Bitstamp','Gemini','LMAX Digital','Bullish','Crypto.com')
 EXCHANGE_POLL_SECONDS=5
 EXCHANGE_URLS={
-    'Coinbase':'https://api.exchange.coinbase.com/products/BTC-USD/ticker',
     'Kraken':'https://api.kraken.com/0/public/Ticker?pair=XBTUSD',
     'Bitstamp':'https://www.bitstamp.net/api/v2/ticker/btcusd/',
     'Gemini':'https://api.gemini.com/v1/pubticker/btcusd',
@@ -3060,7 +3087,6 @@ EXCHANGE_URLS={
 }
 
 def exchange_price(name, data):
-    if name=='Coinbase': return float(data['price'])
     if name=='Kraken': return float(next(iter(data['result'].values()))['c'][0])
     if name=='Bitstamp': return float(data['last'])
     if name=='Gemini': return float(data['last'])
@@ -3487,247 +3513,25 @@ def preview_report():
             f"First API-observed target: {target}\n"
             'Target and tradable quote timing may differ. No automatic orders or changes to settlement picks.')
 
-# ============ 7:30–5:00 STABILITY WINDOW MODEL ============
-# Coinbase spot order-book depth is observational ONLY and never affects settlement scoring.
-# BRTI remains the exclusive source for strike distance, levels and settlement.
-STABILITY_VERSION='STABILITY-WINDOW-730-500-V2'
-_CO_BOOK={'at':0.0,'value':None}
-
-def stability_init():
-    with connect() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS keke_stability_markets (
-            ticker TEXT NOT NULL, model_version TEXT NOT NULL, first_seen INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'OBSERVED', last_seen INTEGER NOT NULL,
-            PRIMARY KEY(ticker,model_version))""")
-        c.execute("""CREATE TABLE IF NOT EXISTS keke_stability_calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL,
-            model_version TEXT NOT NULL, captured_at INTEGER NOT NULL,
-            seconds_left INTEGER, checkpoint TEXT NOT NULL, side TEXT NOT NULL,
-            score REAL NOT NULL, reason TEXT NOT NULL, features TEXT NOT NULL,
-            official_side TEXT, grade TEXT NOT NULL DEFAULT 'PENDING', graded_at INTEGER,
-            UNIQUE(ticker,model_version,checkpoint))""")
-        c.execute('CREATE INDEX IF NOT EXISTS idx_stability_pending ON keke_stability_calls(grade,ticker)')
-
-def coinbase_book():
-    """USD notional at top 10 levels; memoize to avoid hitting public API every second."""
-    now=time.time()
-    if now-_CO_BOOK['at']<8:
-        return _CO_BOOK['value'] if now-_CO_BOOK['at']<=20 else None
-    _CO_BOOK['at']=now
-    try:
-        response=get_session().get('https://api.exchange.coinbase.com/products/BTC-USD/book',params={'level':2},timeout=5,headers={'User-Agent':'KeKe-Stability/1.0'})
-        response.raise_for_status()
-        obj=response.json()
-        def notional(levels):
-            total=0.0;maxlevel=0.0
-            for entry in levels[:10]:
-                amount=float(entry[0])*float(entry[1]);total+=amount;maxlevel=max(maxlevel,amount)
-            return total,maxlevel
-        bids,bid_wall=notional(obj['bids']);asks,ask_wall=notional(obj['asks'])
-        if bids<=0 or asks<=0:raise ValueError('Empty book')
-        # -1 to +1: net buy-side / sell-side displayed liquidity (not executed trades).
-        imbalance=(bids-asks)/(bids+asks)
-        _CO_BOOK['value']={'imbalance':imbalance,'bid_usd':bids,'ask_usd':asks,
-                           'bid_wall_usd':bid_wall,'ask_wall_usd':ask_wall,'at':now}
-        return _CO_BOOK['value']
-    except (requests.RequestException,ValueError,KeyError,IndexError,TypeError) as exc:
-        LOG.warning('Coinbase order book unavailable: %s',type(exc).__name__)
-        _CO_BOOK['value']=None
-        return None
-
-def stability_features(a,candles):
-    if a.get('source')!='BRTI' or a.get('distance') is None or len(candles)<21:
-        return None
-    book=coinbase_book()  # informational, optional; outage must not veto BRTI calls
-    closes=[float(c['close']) for c in candles]
-    recent=candles[-21:]
-    tr=[]
-    for i in range(1,len(candles)):
-        c=candles[i];prev=closes[i-1]
-        tr.append(max(float(c['high'])-float(c['low']),abs(float(c['high'])-prev),abs(float(c['low'])-prev)))
-    if len(tr)<14:return None
-    atr=sum(tr[-14:])/14
-    if atr<=0:return None
-    r=rsi(closes,14)
-    avg=sum(closes[-20:])/20
-    deviation=(sum((x-avg)**2 for x in closes[-20:])/20)**0.5
-    bb_upper=avg+2*deviation;bb_lower=avg-2*deviation
-    # Levels from completed BRTI candles, not Coinbase exchange spot.
-    support=min(float(c['low']) for c in recent[:-1]);resistance=max(float(c['high']) for c in recent[:-1])
-    brti=float(a['btc']);distance=float(a['distance'])
-    base=max(atr,15.0)
-    strike=max(-2.0,min(2.0,distance/base))
-    momentum=max(-1.0,min(1.0,(brti-closes[-4])/base))
-    rsi_component=max(-1.0,min(1.0,(r-50)/25))
-    band_component=max(-1.0,min(1.0,(brti-avg)/max(2*deviation,base)))
-    level_component=(0.6 if brti>resistance else -0.6 if brti<support else
-                     max(-0.4,min(0.4,(brti-(support+resistance)/2)/max(resistance-support,base))))
-    # Explicitly BRTI-only directional scoring; Coinbase is informational ONLY.
-    score=1.2*strike+0.7*momentum+0.5*rsi_component+0.5*band_component+level_component
-    return {'score':score,'rsi':r,'atr':atr,'bb_low':bb_lower,'bb_mid':avg,'bb_high':bb_upper,
-            'support':support,'resistance':resistance,'coinbase':book,'components':{
-              'strike':1.2*strike,'momentum':0.7*momentum,'rsi':0.5*rsi_component,
-              'bollinger':0.5*band_component,'levels':level_component}}
-
-def coinbase_summary(book):
-    """Displayed resting orders, NOT executed buying or selling; never a direction signal."""
-    if not book or time.time()-float(book.get('at',0))>20:
-        return '📚 Coinbase: unavailable/stale (not used in prediction)'
-    bids=float(book['bid_usd']); asks=float(book['ask_usd']); total=bids+asks
-    if total<=0:return '📚 Coinbase: invalid depth (not used in prediction)'
-    bp=100*bids/total; ap=100*asks/total
-    return (f'📚 Coinbase resting bids ${bids:,.0f} ({bp:.1f}%) • '
-            f'asks ${asks:,.0f} ({ap:.1f}%)\n'
-            'Order-book liquidity only, NOT executed trades • informational')
-
-def coinbase_book_report():
-    book=coinbase_book()
-    if not book or time.time()-float(book.get('at',0))>20:
-        return '📚 COINBASE | BOOK\n⚠️ Depth unavailable or stale. Does not affect KeKe predictions.'
-    return ('📚 COINBASE | BTC-USD BOOK\n'
-            +coinbase_summary(book)+'\n'
-            +f'Largest displayed bid ${book["bid_wall_usd"]:,.0f} • '
-            +f'largest ask ${book["ask_wall_usd"]:,.0f}\n'
-            'Top 10 levels/side; orders can change or cancel. /live shows a short summary.')
-
-def stability_format(a,features,side,label):
-    remaining=max(0,int(a['seconds'])); mm,ss=divmod(remaining,60)
-    distance=a.get('distance')
-    dist=f'${distance:+,.2f}' if isinstance(distance,(int,float)) else 'unavailable'
-    return (f'💚 KEKE | {label}\n🎯 {side} • {mm}:{ss:02d} remaining\n'
-            f'BRTI {money_text(a["btc"])} • Strike {money_text(a["target"])}\n'
-            f'Distance {dist}\n'
-            f'Support {money_text(features["support"])} • Resistance {money_text(features["resistance"])}\n'
-            +coinbase_summary(features.get('coinbase'))+'\n'
-            f'📈 RSI {features["rsi"]:.1f} • ATR ${features["atr"]:,.2f} • '
-            f'BB {money_text(features["bb_low"])}–{money_text(features["bb_high"])}\n'
-            'Prediction only • You decide whether to trade')
-
-def stability_save(a,features,checkpoint,side,reason):
-    with connect() as c:
-        cur=c.execute("""INSERT OR IGNORE INTO keke_stability_calls
-            (ticker,model_version,captured_at,seconds_left,checkpoint,side,score,reason,features)
-            VALUES (?,?,?,?,?,?,?,?,?)""",(a['ticker'],STABILITY_VERSION,int(time.time()),a['seconds'],checkpoint,
-                side,features['score'],reason,json.dumps(features)))
-        if cur.rowcount:
-            c.execute("UPDATE keke_stability_markets SET status='CALLED' WHERE ticker=? AND model_version=?",(a['ticker'],STABILITY_VERSION))
-        return bool(cur.rowcount)
-
-def stability_tick(a,candles):
-    ticker=a['ticker'];seconds=int(a['seconds']);now=int(time.time())
-    with connect() as c:
-        c.execute("""INSERT INTO keke_stability_markets(ticker,model_version,first_seen,last_seen)
-          VALUES (?,?,?,?) ON CONFLICT(ticker,model_version) DO UPDATE SET last_seen=excluded.last_seen""",
-          (ticker,STABILITY_VERSION,now,now))
-        calls=c.execute("""SELECT checkpoint,side,captured_at FROM keke_stability_calls
-                   WHERE ticker=? AND model_version=? ORDER BY captured_at,id""",(ticker,STABILITY_VERSION)).fetchall()
-    features=stability_features(a,candles)
-    a['stability_features']=features
-    last=next((r['side'] for r in reversed(calls) if r['checkpoint'] in ('FIRST','5:00') or r['checkpoint'].startswith('REVERSAL')),None)
-    a['stability_side']=last
-    a['v56_side']=last  # compatibility with existing LIVE display
-    a['stability_candidate']=None
-    if features is None:
-        return
-    score=features['score']
-    # Larger margin to avoid low-conviction forced predictions; NOT a calibrated probability.
-    side='UP' if score>=0.90 else 'DOWN' if score<=-0.90 else None
-    a['stability_candidate']=side
-    a['stability_score']=score
-    present={r['checkpoint'] for r in calls}
-    first_exists='FIRST' in present
-
-    # FIRST prediction can happen at ANY qualifying time from 7:30 to 5:00.
-    # A brief persistence requirement avoids acting on a single noisy poll.
-    first_key='stability_first_candidate_'+ticker
-    if 300<=seconds<=450 and not first_exists:
-        if not side:
-            state.pop(first_key,None)
-            return
-        prior=state.get(first_key)
-        if not prior or prior[0]!=side:
-            state[first_key]=(side,now)
-            return
-        if now-prior[1]<10:return
-        if stability_save(a,features,'FIRST',side,'Qualified first call in 7:30–5:00 window; Coinbase informational only'):
-            a['stability_side']=side;a['v56_side']=side
-            state.pop(first_key,None)
-            state.pop('stability_opposite_'+ticker,None)
-            if state['enabled']:send(stability_format(a,features,side,'FIRST PREDICTION'))
-        return
-    if seconds>300 or not first_exists:
-        # The 5:00 reassessment is not a fabricated 'first' prediction.
-        state.pop(first_key,None)
-        return
-
-    # Record an independently scored 5:00 call only if confidence is sufficient.
-    if 285<=seconds<=300 and '5:00' not in present:
-        if side and stability_save(a,features,'5:00',side,'Independent 5:00 reassessment; Coinbase informational only'):
-            a['stability_side']=side;a['v56_side']=side
-            state.pop('stability_opposite_'+ticker,None)
-            if state['enabled']:send(stability_format(a,features,side,'5:00 REASSESSMENT'))
-        return
-    if seconds>=285 or seconds<=0 or not last or not side or side==last:
-        state.pop('stability_opposite_'+ticker,None)
-        return
-    if abs(score)<1.15:
-        state.pop('stability_opposite_'+ticker,None)
-        return
-    key='stability_opposite_'+ticker;prior=state.get(key)
-    if not prior or prior[0]!=side:
-        state[key]=(side,now);return
-    if now-prior[1]<20:return
-    event='REVERSAL' if not any(x.startswith('REVERSAL') for x in present) else 'REVERSAL_'+str(now)
-    if stability_save(a,features,event,side,'Opposing BRTI stability evidence sustained at least 20 seconds'):
-        state.pop(key,None)
-        a['stability_side']=side;a['v56_side']=side
-        if state['enabled']:send(stability_format(a,features,side,'REVERSAL • '+last+' → '+side))
-
-def stability_grade(ticker,outcome,now):
-    with connect() as c:
-        calls=c.execute("""SELECT side,checkpoint,score,reason,features,captured_at,seconds_left
-           FROM keke_stability_calls WHERE ticker=? AND model_version=?
-           AND checkpoint!='FINAL' ORDER BY captured_at,id""",(ticker,STABILITY_VERSION)).fetchall()
-        if calls:
-            last=calls[-1]
-            c.execute("""INSERT OR IGNORE INTO keke_stability_calls
-                (ticker,model_version,captured_at,seconds_left,checkpoint,side,score,reason,features)
-                VALUES (?,?,?,?,?,?,?,?,?)""",
-                (ticker,STABILITY_VERSION,last['captured_at'],last['seconds_left'],'FINAL',last['side'],
-                 last['score'],'Last recorded active-model call before settlement',last['features']))
-        grade="'UNGRADABLE'" if outcome=='UNGRADABLE' else "CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END"
-        if outcome=='UNGRADABLE':
-            c.execute("""UPDATE keke_stability_calls SET grade='UNGRADABLE',official_side=?,graded_at=?
-                WHERE ticker=? AND model_version=? AND grade='PENDING' """,(outcome,now,ticker,STABILITY_VERSION))
-        else:
-            c.execute("""UPDATE keke_stability_calls SET grade=CASE WHEN side=? THEN 'WIN' ELSE 'LOSS' END,
-                official_side=?,graded_at=? WHERE ticker=? AND model_version=? AND grade='PENDING' """,
-                (outcome,outcome,now,ticker,STABILITY_VERSION))
-        c.execute("""UPDATE keke_stability_markets SET status=CASE WHEN EXISTS
-            (SELECT 1 FROM keke_stability_calls WHERE ticker=? AND model_version=? AND checkpoint IN ('FIRST','5:00'))
-            THEN 'CALLED' ELSE 'SKIPPED' END WHERE ticker=? AND model_version=?""",
-            (ticker,STABILITY_VERSION,ticker,STABILITY_VERSION))
-
 def main():
     init_db()
-    stability_init()
     kalshi_live_init()
     latency_init()
     threading.Thread(target=kalshi_live_worker,daemon=True,name='kalshi-chart-observer').start()
-    exchange_init()
+    exchange_init()  # Legacy DB schema only; NO exchange HTTP worker runs.
     research_init()
     failed_reversal_init()
     v527_init()
-    # Legacy daily scorecard disabled for Stability Model.
-    if os.getenv("KEKE_EXCHANGE_OBSERVER","1")=="1":
-        threading.Thread(target=exchange_worker,daemon=True,name="exchange-observer").start()
+    v527_daily_report()
     state['enabled']=runtime_get('alerts_enabled',True)
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
     threading.Thread(target=telegram_command_worker,daemon=True,name='telegram-command-worker').start()
-    LOG.info('KeKe Stability Window model starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe restored original 5-minute BRTI settlement watcher starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    if state['enabled']:send('💚 KeKe STABILITY WINDOW model online. First call can arrive from 7:30 to 5:00 or be skipped. Coinbase book is informational ONLY. /book shows detail; /stats tracks this new model; /legacy retains history. No trades.')
+    if state['enabled']:send('🎯 KeKe ORIGINAL 5-MINUTE BRTI settlement predictions online. '
+         'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
+         'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     previous_loop_started=None
     while True:
         started=time.monotonic()
@@ -3743,6 +3547,7 @@ def main():
                 grade_t0=time.monotonic()
                 state['last_grade']=grade_t0
                 grade_settlements()
+                v527_daily_report()
                 speed['grading_ms']=(time.monotonic()-grade_t0)*1000
             ai_t0=time.monotonic()
             speed['ai_schedule_ms']=(time.monotonic()-ai_t0)*1000
@@ -3784,7 +3589,10 @@ def main():
                         state['ticker']=a['ticker']
                         a['dual_read']={'frames':{1:'COLLECTING',3:'COLLECTING',15:'COLLECTING'},'scalp':'WAIT'}
                         opening_seen(a['ticker'],a['seconds'],True)
-                        stability_tick(a,[])
+                        process_v56(a,new)
+                        failed_reversal_tick(a)
+                        lock_forecast(a)
+                        v527_checkpoint(a)
                         portfolio_poll(market,a,{'scalp':'WAIT'})
                         state['last_read']=a
                         time.sleep(max(0.05,CHECK_EVERY-(time.monotonic()-started)))
@@ -3820,7 +3628,7 @@ def main():
                 quick=dual_read(a,candles) if len(candles)>=15 else {'scalp':'WAIT','frames':{1:'COLLECTING',3:'COLLECTING',15:'COLLECTING'}}
                 a['dual_read']=quick
                 # Independent retest observations remain active in settlement-only mode.
-                # Legacy structure alerts disabled: the Stability Model owns directional calls.
+                # Market-structure alert module disabled: restored 5m thesis only.
                 # Position monitoring runs after settlement forecast updates.
                 # Settlement-only mode: no paper scalp entries, exits, or range-trading alerts.
                 # Legacy scalp history remains untouched in SQLite.
@@ -3833,13 +3641,17 @@ def main():
                     state['ticker']=a['ticker']
                     state['last_alert']=None
                     state['entry_side']=None
-                stability_tick(a,candles)
-                if len(candles)>=15:
-                    record_early_prediction(a)
-                # Legacy shadow alerts disabled; not part of new active model.
-                # Legacy locked forecasts retained as history, but no longer drive alerts.
+                if new:
+                    proactive_updates(a,True)
+                process_v56(a,new)
+                failed_reversal_tick(a)
+                # Opening-window cohorts are legacy-only; do not write them in this restored run.
+                # Shadow update messages disabled in restored version.
+                lock_forecast(a)
+                v527_checkpoint(a)
                 portfolio_poll(market,a,{'scalp':'WAIT'})
-                # Only Stability Model produces proactive directional predictions.
+                if not new:
+                    proactive_updates(a,False)
                 state['last_read']=a
                 # Diagnostic only: source observation time versus local receive/log time.
                 # Does not alter settlement predictions, prices, or Telegram output.
@@ -3847,13 +3659,13 @@ def main():
                 received_ts = time.time()
                 if source_ts is not None:
                     LOG.info('%s settlement %s BRTI %s target %s | brti_source_utc=%s received_utc=%s feed_age_s=%.2f',
-                             a['ticker'], a.get('stability_side'), brti, a['target'],
+                             a['ticker'], a.get('v56_side'), brti, a['target'],
                              datetime.fromtimestamp(float(source_ts), timezone.utc).isoformat(timespec='milliseconds'),
                              datetime.fromtimestamp(received_ts, timezone.utc).isoformat(timespec='milliseconds'),
                              received_ts-float(source_ts))
                 else:
                     LOG.info('%s settlement %s BRTI %s target %s | brti_source_utc=UNKNOWN',
-                             a['ticker'], a.get('stability_side'), brti, a['target'])
+                             a['ticker'], a.get('v56_side'), brti, a['target'])
             else:LOG.info('No active BTC 15m contract')
         except Exception:LOG.exception('Monitor loop error; will retry')
         finally:

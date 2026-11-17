@@ -1176,7 +1176,8 @@ def export_research():
             'settlement_predictions','v53_opportunities','keke_thesis_events','keke_v56_forecasts',
             'keke_v527_checkpoints','keke_v527_warnings',
             'keke_exchange_samples','keke_contract_transitions','keke_transition_snapshots',
-            'keke_locked_forecasts','keke_consensus_predictions')
+            'keke_locked_forecasts','keke_consensus_predictions',
+            'keke_restored_v56_calls','keke_restored_observed')
     try:
         # SQLite online backup takes a consistent snapshot, including WAL changes.
         snapshot=sqlite3.connect(':memory:')

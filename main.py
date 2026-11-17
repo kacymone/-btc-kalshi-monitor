@@ -1203,17 +1203,93 @@ def cleanup_old_research():
     return removed,before,after,free_pages*page_size,free_disk
 
 def compact_database_if_space():
+    """Queue safe offline compaction. Do not replace a live SQLite/WAL database."""
+    marker=os.path.join(DATA_DIR,'.keke_compact_on_restart')
+    with open(marker,'w',encoding='utf-8') as f:
+        f.write('requested\n')
+        f.flush()
+        os.fsync(f.fileno())
+    return ('🧹 Low-space compact requested. Restart/redeploy KeKe ONCE in Railway. '
+            'She will compact before monitoring and Telegram workers start. '
+            'Check Railway deployment logs for "KeKe compact finished". '
+            'No need to enlarge your volume. Do not delete the database or volume.')
+
+
+def run_offline_compaction_if_requested():
+    """One-time SQLite VACUUM INTO at startup, before any background writers.
+
+    VACUUM INTO copies *live rows*, not freelist pages. Operate while the bot
+    is stopped, verify retained rows and integrity, and atomically replace the
+    db. A hard-link to the original lets us roll back a failed verification.
+    """
     import shutil
-    db_size=os.path.getsize(DB_PATH)
-    free=shutil.disk_usage(DATA_DIR).free
-    # VACUUM requires an additional copy of the live database.
-    if free < int(db_size*1.2)+16*1024*1024:
-        return f'⚠️ Not enough free disk space to compact safely. DB {db_size/1048576:.0f} MB, free {free/1048576:.0f} MB. Temporarily increase Railway volume capacity, then retry /compact.'
-    with connect() as c:
-        c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        c.execute('VACUUM')
-    after=os.path.getsize(DB_PATH)
-    return f'✅ SQLite compacted to {after/1048576:.1f} MB. No prediction history deleted.'
+    from contextlib import closing
+    marker=os.path.join(DATA_DIR,'.keke_compact_on_restart')
+    if not os.path.isfile(marker):
+        return
+    source=DB_PATH
+    target=source+'.compact-new'
+    backup=source+'.compact-original'
+    if os.path.lexists(target):
+        os.remove(target)  # an interrupted earlier attempt; live DB is intact
+    if os.path.lexists(backup):
+        # Do not overwrite a possible recovery copy.
+        LOG.error('Compact recovery copy exists at %s; remove only after manual verification.',backup)
+        return
+    def inventory(conn):
+        names=[r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        return {name:conn.execute('SELECT COUNT(*) FROM "'+name.replace('"','""')+'"').fetchone()[0] for name in names}
+    before_size=os.path.getsize(source)
+    try:
+        with closing(sqlite3.connect(source,timeout=30)) as conn:
+            conn.execute('PRAGMA busy_timeout=30000')
+            result=conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+            if result[0]:
+                raise RuntimeError('WAL has active readers; not safe to compact')
+            if conn.execute('PRAGMA quick_check').fetchone()[0]!='ok':
+                raise RuntimeError('Source database failed integrity check')
+            before=inventory(conn)
+            page_size=conn.execute('PRAGMA page_size').fetchone()[0]
+            live_pages=conn.execute('PRAGMA page_count').fetchone()[0]-conn.execute('PRAGMA freelist_count').fetchone()[0]
+            estimated=max(page_size*live_pages,1024*1024)
+            available=shutil.disk_usage(DATA_DIR).free
+            if available < estimated+32*1024*1024:
+                raise RuntimeError(f'Not enough space for compacted rows (~{estimated/1048576:.0f} MB live, {available/1048576:.0f} MB free)')
+            # Parameterized VACUUM INTO uses no duplicate 255MB source copy.
+            conn.execute('VACUUM INTO ?', (target,))
+        with closing(sqlite3.connect(target)) as check:
+            if check.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
+                raise RuntimeError('Compacted database failed integrity check')
+            if inventory(check)!=before:
+                raise RuntimeError('Row count mismatch after compact')
+        # All connections are closed and no KeKe workers have started.
+        # Remove only checkpointed, inactive journal sidecars.
+        for suffix in ('-wal','-shm'):
+            old_sidecar=source+suffix
+            if os.path.isfile(old_sidecar):
+                if suffix=='-wal' and os.path.getsize(old_sidecar)>0:
+                    raise RuntimeError('WAL not empty after checkpoint')
+                os.remove(old_sidecar)
+        os.link(source,backup)  # zero-extra-space rollback copy, same filesystem
+        os.replace(target,source)  # atomic swap
+        try:
+            with closing(sqlite3.connect(source)) as final:
+                if final.execute('PRAGMA quick_check').fetchone()[0]!='ok' or inventory(final)!=before:
+                    raise RuntimeError('Post-swap integrity mismatch')
+                final.execute('PRAGMA journal_mode=WAL')
+        except Exception:
+            os.replace(backup,source)
+            raise
+        os.remove(backup)  # release original 255MB inode to Railway
+        os.remove(marker)
+        LOG.info('KeKe compact finished: %.1f MB -> %.1f MB; all %d tables preserved',
+                 before_size/1048576,os.path.getsize(source)/1048576,len(before))
+    except Exception as exc:
+        LOG.exception('KeKe compact skipped/failed; original data preserved: %s',exc)
+        if os.path.exists(target):
+            os.remove(target)
+        # Marker remains for one retry on next restart. If it fails twice,
+        # inspect deployment logs before attempting more restarts.
 
 def trim_optional_chart_research():
     # Keep 24 hours for optional BRTI vs Kalshi movement comparisons.
@@ -3577,6 +3653,7 @@ def preview_report():
 
 def main():
     init_db()
+    run_offline_compaction_if_requested()
     kalshi_live_init()
     latency_init()
     threading.Thread(target=kalshi_live_worker,daemon=True,name='kalshi-chart-observer').start()

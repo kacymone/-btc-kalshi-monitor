@@ -1,4 +1,4 @@
-"""KeKe Stability 7:30 model — settlement-first, observation-only Kalshi BTC 15m watcher.
+"""KeKe Stability Window model — settlement-first, observation-only Kalshi BTC 15m watcher.
 Requires: requests. Existing SQLite tables are preserved; new tables are additive.
 """
 import os, time, json, sqlite3, re, logging, base64, math
@@ -25,7 +25,7 @@ CHAT=os.getenv('TELEGRAM_CHAT_ID')
 SIGNAL_USERS={v.strip() for v in os.getenv('KEKE_SIGNAL_USERS','').split(',') if v.strip().isdigit()}
 _TELEGRAM_RECIPIENT=threading.local()
 SIGNAL_KEYBOARD={'keyboard':[[{'text':'📡 LIVE'},{'text':'📊 STATS'}],
-                            [{'text':'📜 HISTORY'},{'text':'❓ HELP'}]],
+                            [{'text':'📚 BOOK'},{'text':'📜 HISTORY'}]],
                  'resize_keyboard':True,'is_persistent':True}
 
 DATA_DIR=os.getenv('DATA_DIR','/data')
@@ -835,7 +835,8 @@ def menu_settings():
 
 def menu_help():
     return ('❓ KEKE HELP\n'
-            '📡 Live: fresh market read | 📊 Stats: verified results\n'
+            '📡 Live: current call or WAIT | 📚 /book: Coinbase depth (informational)\n'
+            '📊 Stats: verified new-model results | 📚 /legacy: old model\n'
             '📍 Position: current position | 📜 History: latest settlement pick\n'
             '😴 Sleep / ☀️ Wake: pause or resume alerts\n'
             '⚙️ Settings: advanced research controls\n'
@@ -1495,11 +1496,11 @@ def send_stats():
             w=sum(r['grade']=='WIN' for r in selected); l=sum(r['grade']=='LOSS' for r in selected)
             pending=sum(r['grade']=='PENDING' for r in selected)
             return f'{w}/{w+l} ({100*w/(w+l):.1f}%) • {pending} pending' if w+l else f'Pending ({pending} awaiting settlement)' if pending else 'Pending (no graded calls)'
-        up=sum(r['checkpoint'] in ('7:30','5:00') and r['side']=='UP' and r['grade'] in ('WIN','LOSS') for r in rows)
-        down=sum(r['checkpoint'] in ('7:30','5:00') and r['side']=='DOWN' and r['grade'] in ('WIN','LOSS') for r in rows)
+        up=sum(r['checkpoint'] in ('FIRST','5:00') and r['side']=='UP' and r['grade'] in ('WIN','LOSS') for r in rows)
+        down=sum(r['checkpoint'] in ('FIRST','5:00') and r['side']=='DOWN' and r['grade'] in ('WIN','LOSS') for r in rows)
         observed=len(markets); called=sum(m['status']=='CALLED' for m in markets); skipped=sum(m['status']=='SKIPPED' for m in markets)
         send('📊 KEKE | STABILITY MODEL\nNew model • '+STABILITY_VERSION+'\n\n'
-             '7:30 accuracy\n'+accuracy('7:30')+'\n\n'
+             'First call (7:30–5:00) accuracy\n'+accuracy('FIRST')+'\n\n'
              '5:00 accuracy\n'+accuracy('5:00')+'\n\n'
              'Final call accuracy\n'+accuracy('FINAL')+'\n\n'
              f'Reversal alerts\n{reversals["n"] or 0} recorded • {reversals["wins"] or 0} correct / {reversals["losses"] or 0} incorrect\n\n'
@@ -1682,18 +1683,18 @@ def handle_telegram_command(cmd, requester=None, guest=False):
             send('🆔 Your Telegram ID: '+str(requester))
             return
         if guest:
-            allowed={'/start','/help','/market','/live','/stats','/last',
-                     '📡 live','📊 stats','📜 history','❓ help'}
+            allowed={'/start','/help','/market','/live','/stats','/last','/book',
+                     '📡 live','📊 stats','📚 book','📜 history','❓ help'}
             if cmd not in allowed:
-                send('🔒 Signal-only access. Available: /live, /stats, /last, /help.')
+                send('🔒 Signal-only access. Available: /live, /book, /stats, /last, /help.')
                 return
             if cmd=='/start':
-                send('💚 Welcome to KeKe signals! Use /live, /stats, or /last. Alerts are informational, not guaranteed trades.')
+                send('💚 Welcome to KeKe signals! Use /live, /book, /stats, or /last. Alerts are informational, not guaranteed trades.')
                 return
         
         cmd={'👀 status':'/status','🧠 market read':'/market','📊 stats':'/stats',
              '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop',
-             '📡 live':'/market','📍 position':'/position','📜 history':'/last',
+             '📡 live':'/market','📚 book':'/book','📍 position':'/position','📜 history':'/last',
              '😴 sleep':'/stop','☀️ wake':'/start','⚙️ settings':'/settings',
              '❓ help':'/help'}.get(cmd,cmd)
         if cmd.startswith('/stop'):
@@ -1708,6 +1709,7 @@ def handle_telegram_command(cmd, requester=None, guest=False):
         elif cmd.startswith('/market') or cmd.startswith('/live'):
             send(responsive_live_status())
         elif cmd.startswith('/stats'):send_stats()
+        elif cmd.startswith('/book'):send(coinbase_book_report())
         elif cmd.startswith('/exchange'):send(exchange_report())
         elif cmd.startswith('/lead'):send(exchange_research_report())
         elif cmd.startswith('/audit'):send(audit_report())
@@ -1752,7 +1754,7 @@ def responsive_live_status():
         return '⚠️ LIVE DATA STALE • '+freshness+'\nLast forecast is NOT a fresh trading signal.'
     if features:
         return stability_format(a,features,a.get('stability_side') or 'WAIT','LIVE')
-    return '📡 LIVE • '+freshness+'\n⚪ Stability indicators collecting; no qualifying prediction yet.'
+    return '📡 LIVE • '+freshness+'\n⚪ WAIT: no qualifying prediction yet (7:30–5:00 window; may skip).\n'+coinbase_summary(coinbase_book())
 
 def telegram_commands():
     global _LIVE_REQUEST_AT
@@ -3485,10 +3487,10 @@ def preview_report():
             f"First API-observed target: {target}\n"
             'Target and tradable quote timing may differ. No automatic orders or changes to settlement picks.')
 
-# ============ 7:30 STABILITY MODEL ============
-# Coinbase spot order-book pressure is an actual signed scoring input.
+# ============ 7:30–5:00 STABILITY WINDOW MODEL ============
+# Coinbase spot order-book depth is observational ONLY and never affects settlement scoring.
 # BRTI remains the exclusive source for strike distance, levels and settlement.
-STABILITY_VERSION='STABILITY-7M30-V1'
+STABILITY_VERSION='STABILITY-WINDOW-730-500-V2'
 _CO_BOOK={'at':0.0,'value':None}
 
 def stability_init():
@@ -3536,8 +3538,7 @@ def coinbase_book():
 def stability_features(a,candles):
     if a.get('source')!='BRTI' or a.get('distance') is None or len(candles)<21:
         return None
-    book=coinbase_book()
-    if not book or time.time()-book['at']>20:return None
+    book=coinbase_book()  # informational, optional; outage must not veto BRTI calls
     closes=[float(c['close']) for c in candles]
     recent=candles[-21:]
     tr=[]
@@ -3561,27 +3562,46 @@ def stability_features(a,candles):
     band_component=max(-1.0,min(1.0,(brti-avg)/max(2*deviation,base)))
     level_component=(0.6 if brti>resistance else -0.6 if brti<support else
                      max(-0.4,min(0.4,(brti-(support+resistance)/2)/max(resistance-support,base))))
-    # A substantial active weight: a strong opposite Coinbase imbalance can veto
-    # an otherwise marginal BRTI directional call; no probability calibration implied.
-    coinbase_component=2.0*book['imbalance']
-    score=1.2*strike+0.7*momentum+0.5*rsi_component+0.5*band_component+level_component+coinbase_component
+    # Explicitly BRTI-only directional scoring; Coinbase is informational ONLY.
+    score=1.2*strike+0.7*momentum+0.5*rsi_component+0.5*band_component+level_component
     return {'score':score,'rsi':r,'atr':atr,'bb_low':bb_lower,'bb_mid':avg,'bb_high':bb_upper,
             'support':support,'resistance':resistance,'coinbase':book,'components':{
               'strike':1.2*strike,'momentum':0.7*momentum,'rsi':0.5*rsi_component,
-              'bollinger':0.5*band_component,'levels':level_component,'coinbase':coinbase_component}}
+              'bollinger':0.5*band_component,'levels':level_component}}
+
+def coinbase_summary(book):
+    """Displayed resting orders, NOT executed buying or selling; never a direction signal."""
+    if not book or time.time()-float(book.get('at',0))>20:
+        return '📚 Coinbase: unavailable/stale (not used in prediction)'
+    bids=float(book['bid_usd']); asks=float(book['ask_usd']); total=bids+asks
+    if total<=0:return '📚 Coinbase: invalid depth (not used in prediction)'
+    bp=100*bids/total; ap=100*asks/total
+    return (f'📚 Coinbase resting bids ${bids:,.0f} ({bp:.1f}%) • '
+            f'asks ${asks:,.0f} ({ap:.1f}%)\n'
+            'Order-book liquidity only, NOT executed trades • informational')
+
+def coinbase_book_report():
+    book=coinbase_book()
+    if not book or time.time()-float(book.get('at',0))>20:
+        return '📚 COINBASE | BOOK\n⚠️ Depth unavailable or stale. Does not affect KeKe predictions.'
+    return ('📚 COINBASE | BTC-USD BOOK\n'
+            +coinbase_summary(book)+'\n'
+            +f'Largest displayed bid ${book["bid_wall_usd"]:,.0f} • '
+            +f'largest ask ${book["ask_wall_usd"]:,.0f}\n'
+            'Top 10 levels/side; orders can change or cancel. /live shows a short summary.')
 
 def stability_format(a,features,side,label):
-    book=features['coinbase'];imbalance=book['imbalance']
-    pressure='BUY' if imbalance>0.10 else 'SELL' if imbalance< -0.10 else 'BALANCED'
     remaining=max(0,int(a['seconds'])); mm,ss=divmod(remaining,60)
+    distance=a.get('distance')
+    dist=f'${distance:+,.2f}' if isinstance(distance,(int,float)) else 'unavailable'
     return (f'💚 KEKE | {label}\n🎯 {side} • {mm}:{ss:02d} remaining\n'
             f'BRTI {money_text(a["btc"])} • Strike {money_text(a["target"])}\n'
-            f'Strike distance ${a["distance"]:+,.2f}\n'
+            f'Distance {dist}\n'
             f'Support {money_text(features["support"])} • Resistance {money_text(features["resistance"])}\n'
-            f'Coinbase pressure {pressure} ({imbalance:+.0%} displayed depth)\n'
-            f'Market stability ATR14 ${features["atr"]:,.2f} • RSI14 {features["rsi"]:.1f}\n'
-            f'Bollinger 20,2 {money_text(features["bb_low"])}–{money_text(features["bb_high"])}\n'
-            'Prediction only • no trade execution')
+            +coinbase_summary(features.get('coinbase'))+'\n'
+            f'📈 RSI {features["rsi"]:.1f} • ATR ${features["atr"]:,.2f} • '
+            f'BB {money_text(features["bb_low"])}–{money_text(features["bb_high"])}\n'
+            'Prediction only • You decide whether to trade')
 
 def stability_save(a,features,checkpoint,side,reason):
     with connect() as c:
@@ -3594,7 +3614,7 @@ def stability_save(a,features,checkpoint,side,reason):
         return bool(cur.rowcount)
 
 def stability_tick(a,candles):
-    ticker=a['ticker'];seconds=a['seconds'];now=int(time.time())
+    ticker=a['ticker'];seconds=int(a['seconds']);now=int(time.time())
     with connect() as c:
         c.execute("""INSERT INTO keke_stability_markets(ticker,model_version,first_seen,last_seen)
           VALUES (?,?,?,?) ON CONFLICT(ticker,model_version) DO UPDATE SET last_seen=excluded.last_seen""",
@@ -3603,38 +3623,62 @@ def stability_tick(a,candles):
                    WHERE ticker=? AND model_version=? ORDER BY captured_at,id""",(ticker,STABILITY_VERSION)).fetchall()
     features=stability_features(a,candles)
     a['stability_features']=features
-    last=next((r['side'] for r in reversed(calls) if r['checkpoint'] in ('7:30','5:00') or r['checkpoint'].startswith('REVERSAL')),None)
+    last=next((r['side'] for r in reversed(calls) if r['checkpoint'] in ('FIRST','5:00') or r['checkpoint'].startswith('REVERSAL')),None)
     a['stability_side']=last
-    a['v56_side']=last  # compatibility for the existing LIVE display
+    a['v56_side']=last  # compatibility with existing LIVE display
+    a['stability_candidate']=None
     if features is None:
-        # Missing critical inputs means no made-up or partial-model calls.
         return
-    score=features['score'];side='UP' if score>=0.65 else 'DOWN' if score<=-0.65 else None
+    score=features['score']
+    # Larger margin to avoid low-conviction forced predictions; NOT a calibrated probability.
+    side='UP' if score>=0.90 else 'DOWN' if score<=-0.90 else None
     a['stability_candidate']=side
     a['stability_score']=score
     present={r['checkpoint'] for r in calls}
-    # The checkpoint can only be issued after its clock time, never backfilled.
-    checkpoint='7:30' if 435<=seconds<=450 else '5:00' if 285<=seconds<=300 else None
-    if checkpoint and checkpoint not in present and side:
-        if stability_save(a,features,checkpoint,side,'Full stability score including Coinbase order book'):
+    first_exists='FIRST' in present
+
+    # FIRST prediction can happen at ANY qualifying time from 7:30 to 5:00.
+    # A brief persistence requirement avoids acting on a single noisy poll.
+    first_key='stability_first_candidate_'+ticker
+    if 300<=seconds<=450 and not first_exists:
+        if not side:
+            state.pop(first_key,None)
+            return
+        prior=state.get(first_key)
+        if not prior or prior[0]!=side:
+            state[first_key]=(side,now)
+            return
+        if now-prior[1]<10:return
+        if stability_save(a,features,'FIRST',side,'Qualified first call in 7:30–5:00 window; Coinbase informational only'):
+            a['stability_side']=side;a['v56_side']=side
+            state.pop(first_key,None)
+            state.pop('stability_opposite_'+ticker,None)
+            if state['enabled']:send(stability_format(a,features,side,'FIRST PREDICTION'))
+        return
+    if seconds>300 or not first_exists:
+        # The 5:00 reassessment is not a fabricated 'first' prediction.
+        state.pop(first_key,None)
+        return
+
+    # Record an independently scored 5:00 call only if confidence is sufficient.
+    if 285<=seconds<=300 and '5:00' not in present:
+        if side and stability_save(a,features,'5:00',side,'Independent 5:00 reassessment; Coinbase informational only'):
             a['stability_side']=side;a['v56_side']=side
             state.pop('stability_opposite_'+ticker,None)
-            if state['enabled']:send(stability_format(a,features,side,checkpoint+' PREDICTION'))
+            if state['enabled']:send(stability_format(a,features,side,'5:00 REASSESSMENT'))
         return
-    if seconds>=300 or seconds<=0 or not last or not side or side==last:
+    if seconds>=285 or seconds<=0 or not last or not side or side==last:
         state.pop('stability_opposite_'+ticker,None)
         return
-    # Reversals require >=20 seconds of opposing, sufficiently strong evidence;
-    # a single transient book imbalance cannot flip the prediction.
     if abs(score)<1.15:
-        state.pop('stability_opposite_'+ticker,None);return
-    key='stability_opposite_'+ticker; prior=state.get(key)
+        state.pop('stability_opposite_'+ticker,None)
+        return
+    key='stability_opposite_'+ticker;prior=state.get(key)
     if not prior or prior[0]!=side:
         state[key]=(side,now);return
     if now-prior[1]<20:return
-    # Multiple reversal events may occur; unique checkpoint names keep each immutable.
-    event='REVERSAL' if 'REVERSAL' not in present else 'REVERSAL_'+str(now)
-    if stability_save(a,features,event,side,'Opposing stability evidence sustained at least 20s'):
+    event='REVERSAL' if not any(x.startswith('REVERSAL') for x in present) else 'REVERSAL_'+str(now)
+    if stability_save(a,features,event,side,'Opposing BRTI stability evidence sustained at least 20 seconds'):
         state.pop(key,None)
         a['stability_side']=side;a['v56_side']=side
         if state['enabled']:send(stability_format(a,features,side,'REVERSAL • '+last+' → '+side))
@@ -3660,7 +3704,7 @@ def stability_grade(ticker,outcome,now):
                 official_side=?,graded_at=? WHERE ticker=? AND model_version=? AND grade='PENDING' """,
                 (outcome,outcome,now,ticker,STABILITY_VERSION))
         c.execute("""UPDATE keke_stability_markets SET status=CASE WHEN EXISTS
-            (SELECT 1 FROM keke_stability_calls WHERE ticker=? AND model_version=? AND checkpoint IN ('7:30','5:00'))
+            (SELECT 1 FROM keke_stability_calls WHERE ticker=? AND model_version=? AND checkpoint IN ('FIRST','5:00'))
             THEN 'CALLED' ELSE 'SKIPPED' END WHERE ticker=? AND model_version=?""",
             (ticker,STABILITY_VERSION,ticker,STABILITY_VERSION))
 
@@ -3681,9 +3725,9 @@ def main():
     state['offset']=runtime_get('telegram_offset',None)
     initialize_telegram()
     threading.Thread(target=telegram_command_worker,daemon=True,name='telegram-command-worker').start()
-    LOG.info('KeKe Stability 7:30 model starting; Stats database: %s',DB_PATH)
+    LOG.info('KeKe Stability Window model starting; Stats database: %s',DB_PATH)
     run_brti_test()
-    if state['enabled']:send('💚 KeKe STABILITY 7:30 model online. Coinbase order book is active in predictions. /stats shows new model only; /legacy shows history. No trades.')
+    if state['enabled']:send('💚 KeKe STABILITY WINDOW model online. First call can arrive from 7:30 to 5:00 or be skipped. Coinbase book is informational ONLY. /book shows detail; /stats tracks this new model; /legacy retains history. No trades.')
     previous_loop_started=None
     while True:
         started=time.monotonic()

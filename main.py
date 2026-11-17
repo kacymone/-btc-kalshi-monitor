@@ -474,6 +474,8 @@ def record_v53(a):
            a['score'],a['btc'],a['target'],a['distance'],json.dumps(a['indicators'])))
 
 def record(a):
+    # Legacy high-frequency observation collector disabled in restored 5-minute mode.
+    return
     with connect() as c:
         c.execute('''INSERT INTO settlement_observations
           (captured_at,ticker,seconds_left,btc_price,target,distance,yes_bid,yes_ask,no_bid,no_ask,
@@ -882,6 +884,8 @@ def latency_init():
                 c.execute(f'ALTER TABLE keke_speed_diagnostics ADD COLUMN {column} {kind}')
 
 def latency_log(row):
+    # Continuous 1-second diagnostics disabled to prevent unbounded disk growth.
+    return
     try:
         with connect() as c:
             fields=list(row)
@@ -1167,6 +1171,56 @@ def run_brti_test():
             send('🔎 BRTI RECORD FIELDS (names/types only):\n'+shape[:1600]+'\n⚪ Settlement ENTER remains disabled.')
         except Exception as diag_exc:
             send(f'🔴 BRTI TEST FAILED: {type(exc).__name__}\nDiagnostic fetch: {type(diag_exc).__name__}\nNo settlement ENTER.')
+
+# Owner-only storage housekeeping. Restored predictions/official settlement outcomes are untouched.
+# The large, superseded research datasets have already been backed up by /export.
+BULK_RESEARCH_TABLES = ('settlement_observations','keke_exchange_samples',
+                        'keke_transition_snapshots','keke_speed_diagnostics')
+
+def cleanup_old_research():
+    import shutil
+    before = os.path.getsize(DB_PATH)
+    removed = []
+    with connect() as c:
+        # Discard only superseded bulk observations. Save table definitions to
+        # recreate empty tables, so old /legacy queries don't fail.
+        for table in BULK_RESEARCH_TABLES:
+            defs = c.execute("SELECT type,name,sql FROM sqlite_master WHERE tbl_name=? AND sql IS NOT NULL ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END",(table,)).fetchall()
+            if not defs: continue
+            num = c.execute('SELECT COUNT(*) FROM "'+table+'"').fetchone()[0]
+            c.execute('DROP TABLE "'+table+'"')
+            for definition in defs:
+                if definition['sql']:
+                    c.execute(definition['sql'])
+            removed.append((table,num))
+    # Release WAL pages. This does not rebuild the database file itself.
+    with connect() as c:
+        c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        free_pages = c.execute('PRAGMA freelist_count').fetchone()[0]
+        page_size = c.execute('PRAGMA page_size').fetchone()[0]
+    after = os.path.getsize(DB_PATH)
+    free_disk = shutil.disk_usage(DATA_DIR).free
+    return removed,before,after,free_pages*page_size,free_disk
+
+def compact_database_if_space():
+    import shutil
+    db_size=os.path.getsize(DB_PATH)
+    free=shutil.disk_usage(DATA_DIR).free
+    # VACUUM requires an additional copy of the live database.
+    if free < int(db_size*1.2)+16*1024*1024:
+        return f'⚠️ Not enough free disk space to compact safely. DB {db_size/1048576:.0f} MB, free {free/1048576:.0f} MB. Temporarily increase Railway volume capacity, then retry /compact.'
+    with connect() as c:
+        c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        c.execute('VACUUM')
+    after=os.path.getsize(DB_PATH)
+    return f'✅ SQLite compacted to {after/1048576:.1f} MB. No prediction history deleted.'
+
+def trim_optional_chart_research():
+    # Keep 24 hours for optional BRTI vs Kalshi movement comparisons.
+    cutoff=datetime.fromtimestamp(time.time()-86400,timezone.utc).isoformat(timespec='milliseconds')
+    with connect() as c:
+        c.execute('DELETE FROM keke_kalshi_live_observations WHERE received_utc<?',(cutoff,))
+        c.execute('DELETE FROM keke_kalshi_live_raw_samples WHERE captured_utc<?',(cutoff,))
 
 def export_research():
     """Send a consistent, read-only CSV archive; never alter the live database."""
@@ -1750,6 +1804,11 @@ def handle_telegram_command(cmd, requester=None, guest=False):
         elif cmd.startswith('/position'):send(portfolio_status())
         elif cmd.startswith('/last'):send_last()
         elif cmd.startswith('/brti'):run_brti_test()
+        elif cmd == '/cleanup':
+            removed,before,after,reclaim,free=cleanup_old_research()
+            details=', '.join(f'{name}: {n:,}' for name,n in removed) or 'no old tables'
+            send(f'🧹 Old research removed: {details}\nDatabase: {after/1048576:.1f} MB; reusable empty pages: {reclaim/1048576:.1f} MB.\n⚠️ File may not shrink until /compact; preserved restored calls and official results.')
+        elif cmd == '/compact':send(compact_database_if_space())
         elif cmd == '/export':export_research()
         elif cmd == '/kalshiexport':export_kalshi_research()
     except Exception:
@@ -3399,6 +3458,8 @@ def exchange_consensus(now_ms=None, lookback_s=30):
             'direction':direction,'venues':available}
 
 def observe_transition(m, brti=None, brti_stamp=None):
+    # Legacy multi-exchange transition research disabled; predictions do not use it.
+    return
     ticker=m.get('ticker')
     if not ticker:return
     now_ms=int(time.time()*1000)
@@ -3534,6 +3595,7 @@ def main():
          'BRTI-only price/candles; no Kraken fallback. Persistent /data database. '
          'Official-result grading active. Scalp signals disabled. No trades. /stats for BRTI-only, /legacy for history' )
     previous_loop_started=None
+    last_storage_trim=0
     while True:
         started=time.monotonic()
         actual_interval_ms=(started-previous_loop_started)*1000 if previous_loop_started is not None else None
@@ -3544,6 +3606,9 @@ def main():
                'alert_count':0,'configured_poll_seconds':CHECK_EVERY,
                'telegram_poll_mode':'background-thread'}
         try:
+            if time.monotonic()-last_storage_trim>=86400:
+                trim_optional_chart_research()
+                last_storage_trim=time.monotonic()
             if time.monotonic()-state['last_grade']>=GRADE_EVERY:
                 grade_t0=time.monotonic()
                 state['last_grade']=grade_t0

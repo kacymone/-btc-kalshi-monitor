@@ -821,9 +821,55 @@ def tg(method,**data):
 # V5.30: compact user-facing keyboard; legacy slash commands remain available.
 KEYBOARD={'keyboard':[[{'text':'📡 LIVE'},{'text':'📊 STATS'}],
                       [{'text':'📍 POSITION'},{'text':'📜 HISTORY'}],
+                      [{'text':'📈 LONG / SHORT'}],
                       [{'text':'😴 SLEEP'},{'text':'☀️ WAKE'}],
                       [{'text':'⚙️ SETTINGS'},{'text':'❓ HELP'}]],
           'resize_keyboard':True,'is_persistent':True}
+
+def long_short_levels_report():
+    """On-demand BRTI structure report; never changes settlement calls or alerts."""
+    candles=brti_candles()
+    if len(candles)<20:
+        return '📈 LONG / SHORT • Waiting for at least 20 completed BRTI 1m candles.'
+    latest=candles[-1]
+    age=time.time()-(latest['time']+60)
+    if age>180:
+        return f'⚠️ LONG / SHORT • BRTI candle data stale ({age:.0f}s). No current setup.'
+    # Require contiguous completed observations; gaps can fabricate breakouts.
+    recent=candles[-20:]
+    if any(recent[i]['time']-recent[i-1]['time']!=60 for i in range(1,len(recent))):
+        return '⚠️ LONG / SHORT • Gaps in recent BRTI candles. Levels withheld.'
+    price=float(latest['close'])
+    lines=['📈 KEKE | LONG / SHORT LEVELS',
+           f'BRTI index: ${price:,.2f} • last complete minute',
+           'Reference levels only — exchange prices may differ.']
+    for minutes in (1,3,15):
+        rows=completed_timeframes(recent,minutes)
+        direction,_=timeframe_signal(rows,price)
+        lines.append(f'{minutes}m structure: {direction}')
+    # Exclude most recent candle from level construction to avoid self-referencing.
+    base=recent[-16:-1]
+    support=min(float(c['low']) for c in base)
+    resistance=max(float(c['high']) for c in base)
+    width=resistance-support
+    if width<=0:
+        return '\n'.join(lines+['No usable range yet.'])
+    position=(price-support)/width
+    lines.extend([f'🟢 Support: ${support:,.2f}',f'🔴 Resistance: ${resistance:,.2f}',
+                  f'Range position: {position:.0%} (0%=support, 100%=resistance)'])
+    if price>resistance:
+        lines.append('👀 Above prior resistance: watch for a successful retest before considering LONG.')
+    elif price<support:
+        lines.append('👀 Below prior support: watch for a failed retest before considering SHORT.')
+    elif position<=0.25:
+        lines.append('👀 Near support: watch for bullish rejection; breakdown invalidates bounce thesis.')
+    elif position>=0.75:
+        lines.append('👀 Near resistance: watch for bearish rejection; breakout invalidates rejection thesis.')
+    else:
+        lines.append('⏳ Mid-range: WAIT for a level test or confirmed break.')
+    lines.append('Not an entry signal • no exchange spread, fees, or leverage included.')
+    return '\n'.join(lines)
+
 
 def confidence_report():
     """Explain experimental directional strength without claiming win probability."""
@@ -853,6 +899,7 @@ def menu_settings():
 def menu_help():
     return ('❓ KEKE HELP\n'
             '📡 Live: fresh market read | 📊 Stats: verified results\n'
+            '📈 Long / Short: separate on-demand BRTI structure levels\n'
             '📍 Position: current position | 📜 History: latest settlement pick\n'
             '😴 Sleep / ☀️ Wake: pause or resume alerts\n'
             '⚙️ Settings: advanced research controls\n'
@@ -1848,7 +1895,7 @@ def handle_telegram_command(cmd, requester=None, guest=False):
              '💰 position':'/position','🕒 last':'/last','🟢 start':'/start','🔴 stop':'/stop',
              '📡 live':'/market','📍 position':'/position','📜 history':'/last',
              '😴 sleep':'/stop','☀️ wake':'/start','⚙️ settings':'/settings',
-             '❓ help':'/help'}.get(cmd,cmd)
+             '❓ help':'/help','📈 long / short':'/levels'}.get(cmd,cmd)
         if cmd.startswith('/stop'):
             state['enabled']=False;runtime_set('alerts_enabled',False);send('🔴 Alerts paused. Data collection continues. /start resumes alerts.')
         elif cmd.startswith('/start'):
@@ -1856,6 +1903,7 @@ def handle_telegram_command(cmd, requester=None, guest=False):
         elif cmd.startswith('/status'):
             send(health_status())
         elif cmd=='/confidence':send(confidence_report())
+        elif cmd=='/levels':send(long_short_levels_report())
         elif cmd=='/settings':send(menu_settings())
         elif cmd=='/help':send(menu_help())
         elif cmd.startswith('/market') or cmd.startswith('/live'):
@@ -1957,6 +2005,7 @@ def initialize_telegram():
             runtime_set('telegram_offset',state['offset'])
         tg('setMyCommands',commands=json.dumps([
             {'command':'market','description':'Live BTC settlement read'},
+            {'command':'levels','description':'BRTI long/short support and resistance'},
             {'command':'stats','description':'Verified prediction statistics'},
             {'command':'position','description':'Current Kalshi position'},
             {'command':'last','description':'Latest settlement pick'},
